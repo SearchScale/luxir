@@ -346,6 +346,8 @@ private:
   const char* leafZoneMeta = nullptr;
   const char* leavesByMin = nullptr;  // uint32 leaf ids, unaligned
   const char* leavesByMax = nullptr;
+  const char* sketchPoints = nullptr;  // SketchPoints, unaligned
+  int64_t sketchCount = 0;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
@@ -353,12 +355,23 @@ private:
   int64_t columnMax = 0;
 
   // Zone metadata follows the block descriptors: block zones, leaf zones,
-  // then the two leaf visit orders (NumColumnWriter::finish).
-  void locateZoneMeta(const char* blockMeta) {
+  // the two leaf visit orders, then the value sketch (NumColumnWriter::
+  // finish). Returns where the bounds trailer starts.
+  const char* locateZoneMeta(const char* blockMeta) {
     zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
     leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
     leavesByMin = leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
     leavesByMax = leavesByMin + numLeafZones() * sizeof(uint32_t);
+    const char* trailer = leavesByMax + numLeafZones() * sizeof(uint32_t);
+    if (numLeafZones() > 0) {
+      uint32_t count;
+      memcpy(&count, trailer, sizeof(count));
+      sketchCount = count;
+      sketchPoints = trailer + sizeof(count);
+      trailer = sketchPoints
+          + sketchCount * (int64_t)sizeof(NumColumnFormat::SketchPoint);
+    }
+    return trailer;
   }
 
 public:
@@ -372,11 +385,10 @@ public:
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + fieldInfo.columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
-    locateZoneMeta(blockMeta);
+    const char* minMaxPtr = locateZoneMeta(blockMeta);
 
     // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr = leavesByMax + numLeafZones() * sizeof(uint32_t);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -404,11 +416,10 @@ public:
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
-    locateZoneMeta(blockMeta);
+    const char* minMaxPtr = locateZoneMeta(blockMeta);
 
     // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr = leavesByMax + numLeafZones() * sizeof(uint32_t);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -494,6 +505,13 @@ public:
     uint32_t leaf;
     memcpy(&leaf, leavesByMax + rank * sizeof(leaf), sizeof(leaf));
     return leaf;
+  }
+
+  // The persisted value sketch (NumColumnFormat::ValueSketcher); empty for
+  // a column without values or written without a sketch.
+  NumColumnFormat::ValueSketch valueSketch() const {
+    if (sketchCount == 0) return {};
+    return {sketchPoints, sketchCount, nvals};
   }
 
   int32_t valuesInBlock(int64_t blockNum) const {

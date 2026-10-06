@@ -97,19 +97,17 @@ public:
     
     std::unique_ptr<FieldComparator> createComparator(IndexReader* reader = nullptr) const {
         // Handle regular field types based on FieldType
-        switch (const_cast<FieldType*>(fieldType)->type()) {
-            case FieldType::Type::INT:
-            case FieldType::Type::DATE:
-            case FieldType::Type::FLOAT:
-            case FieldType::Type::DOUBLE:
-                // INT and DATE (epoch millis) sort on the raw column values.
-                // FLOAT/DOUBLE columns store sortable bits whose int64 order
-                // matches the floating point order, so the int comparator
-                // works on the encoded values as-is for all four.
-                return std::make_unique<SimpleNumericFieldComparator>(
-                    fieldName, isReversed(), missingValue
-                );
-
+        FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
+        if (FieldType::sortsByIntColumn(type)) {
+            // INT and DATE (epoch millis) sort on the raw column values.
+            // FLOAT/DOUBLE columns store sortable bits whose int64 order
+            // matches the floating point order, so the int comparator
+            // works on the encoded values as-is for all four.
+            return std::make_unique<SimpleNumericFieldComparator>(
+                fieldName, isReversed(), missingValue
+            );
+        }
+        switch (type) {
             case FieldType::Type::ID:
             case FieldType::Type::STRING: {
                 // Use FieldType information to determine if this is an indexed string field

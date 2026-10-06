@@ -235,10 +235,8 @@ public:
         || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
       return false;
     }
-    auto type = const_cast<FieldType&>(
-        sortPlan.clauses[0].getSortField().getFieldType()).type();
-    return type == FieldType::INT || type == FieldType::DATE
-        || type == FieldType::FLOAT || type == FieldType::DOUBLE;
+    return FieldType::sortsByIntColumn(const_cast<FieldType&>(
+        sortPlan.clauses[0].getSortField().getFieldType()).type());
   }
 
   // Pre-Weight FIELD_SORT planning. A complete resident whole membership
