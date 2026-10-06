@@ -421,6 +421,7 @@ struct NumColumnFormat {
     // Expected number of values strictly below v.
     double countBelow(int64_t v) const {
       assert(!empty());
+      if (v <= point(0).value) return 0;
       // The first point at or above v.
       int64_t lo = 0;
       int64_t hi = count;
@@ -463,6 +464,64 @@ struct NumColumnFormat {
           (uint64_t)offset, (uint64_t)b.value - (uint64_t)a.value);
       return (int64_t)((uint64_t)a.value + step);
     }
+  };
+
+  // Read view of a column's leaf metadata as NumColumnWriter::finish lays
+  // it out after the block zones: the leaf zones, the two leaf visit orders
+  // (leafVisitOrder), and the value sketch. Copyable, so a planner can keep
+  // one per segment; valid while the column's bytes are.
+  class LeafMeta {
+    const char* zones = nullptr;  // NumBlockZones, then the uint32 orders
+    int64_t count = 0;
+    ValueSketch sketch;
+
+    int64_t orderAt(int64_t order, int64_t rank) const {
+      assert(rank >= 0 && rank < count);
+      uint32_t leaf;
+      memcpy(&leaf,
+             zones + count * (int64_t)sizeof(NumBlockZone)
+                 + (order * count + rank) * (int64_t)sizeof(leaf),
+             sizeof(leaf));
+      return leaf;
+    }
+
+  public:
+    LeafMeta() = default;
+
+    // `leafZones` points at the first leaf zone of a column of numValues
+    // values; `end` receives the first byte past the sketch.
+    LeafMeta(const char* leafZones, int64_t numValues, const char*& end)
+        : zones(leafZones),
+          count((numValues + LEAF_ZONE_SIZE - 1) / LEAF_ZONE_SIZE) {
+      end = zones + count * (int64_t)(sizeof(NumBlockZone)
+                                      + 2 * sizeof(uint32_t));
+      if (count == 0) return;
+      uint32_t points;
+      memcpy(&points, end, sizeof(points));
+      if (points > 0) {
+        sketch = ValueSketch(end + sizeof(points), points, numValues);
+      }
+      end += sizeof(points) + points * (int64_t)sizeof(SketchPoint);
+    }
+
+    int64_t numLeafZones() const { return count; }
+
+    NumBlockZone leafZone(int64_t leaf) const {
+      assert(leaf >= 0 && leaf < count);
+      NumBlockZone zone;
+      memcpy(&zone, zones + leaf * (int64_t)sizeof(zone), sizeof(zone));
+      return zone;
+    }
+
+    // The leaf at `rank` ascending by (zone.min, leaf), and descending by
+    // zone.max with ties by ascending leaf.
+    int64_t leafByMinAscending(int64_t rank) const { return orderAt(0, rank); }
+    int64_t leafByMaxDescending(int64_t rank) const {
+      return orderAt(1, rank);
+    }
+
+    // Empty for a column without values or written without a sketch.
+    const ValueSketch& valueSketch() const { return sketch; }
   };
 
   static uint64_t residual(const BlockPlan& plan, uint64_t rank,

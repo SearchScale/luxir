@@ -27,6 +27,132 @@ namespace luxir {
 
 class FieldComparator {
 public:
+  struct RankedLeaf {
+    int64_t leaf;
+    int64_t bound;
+  };
+
+  // One segment's primary sort keys as a planner sees them, in a
+  // comparator's transformed key space (smaller is better; descending keys
+  // are ~value): the leaves in bound order, and how the keys of the
+  // column's values inside a value envelope are distributed (the column's
+  // value sketch, NumColumnFormat::ValueSketch). A view over the mapped
+  // column, so a planner can hold one per segment.
+  class SegmentKeys {
+    NumColumnFormat::LeafMeta leaves;
+    bool descending = false;
+    // The envelope, in values, and the sketch's count of values below it
+    // and inside it.
+    int64_t lo = std::numeric_limits<int64_t>::min();
+    int64_t hi = std::numeric_limits<int64_t>::max();
+    double below = 0;
+    double inside = 0;
+
+    const NumColumnFormat::ValueSketch& sketch() const {
+      return leaves.valueSketch();
+    }
+
+    double atOrBelow(int64_t v) const {
+      return v == std::numeric_limits<int64_t>::max()
+          ? (double)sketch().values() : sketch().countBelow(v + 1);
+    }
+
+  public:
+    SegmentKeys(const NumColumnFormat::LeafMeta& leaves, bool descending,
+                std::optional<Query::ValueEnvelope> envelope)
+        : leaves(leaves), descending(descending) {
+      if (envelope.has_value()) {
+        lo = envelope->lo;
+        hi = envelope->hi;
+      }
+      if (sketch().empty() || lo > hi) return;
+      below = sketch().countBelow(lo);
+      inside = std::max(0.0, atOrBelow(hi) - below);
+    }
+
+    int64_t leafCount() const { return leaves.numLeafZones(); }
+
+    int64_t leafBestKey(int64_t leaf) const {
+      NumBlockZone zone = leaves.leafZone(leaf);
+      return descending ? ~zone.max : zone.min;
+    }
+
+    // The leaf at `rank` of bound order (boundOrderLeaf), without its bound.
+    int64_t leafAt(int64_t rank) const {
+      return descending ? leaves.leafByMaxDescending(rank)
+                        : leaves.leafByMinAscending(rank);
+    }
+
+    // The leaf at `rank` ascending by (leafBestKey, leaf), with that bound:
+    // the column persists both directions' orders, and descending zone.max
+    // with ties by leaf is ascending (~max, leaf).
+    RankedLeaf boundOrderLeaf(int64_t rank) const {
+      int64_t leaf = leafAt(rank);
+      return {leaf, leafBestKey(leaf)};
+    }
+
+    // Leaves bounded strictly before `key`: a prefix of bound order,
+    // galloped from its head (most prefixes a top-k asks about are short).
+    int64_t leavesBoundedBefore(int64_t key) const {
+      int64_t n = leafCount();
+      int64_t lo = 0;
+      int64_t probe = 0;
+      while (probe < n && boundOrderLeaf(probe).bound < key) {
+        lo = probe + 1;
+        probe = 2 * probe + 1;
+      }
+      int64_t hi = std::min(probe, n);
+      while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (boundOrderLeaf(mid).bound < key) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    }
+
+    // Leaves bounded at or before `key`.
+    int64_t leavesBoundedAtOrBefore(int64_t key) const {
+      return key == std::numeric_limits<int64_t>::max()
+          ? leafCount() : leavesBoundedBefore(key + 1);
+    }
+
+    // The envelope's best edge as a key: every value inside the envelope
+    // keys at or past it, so no leaf bounded before it can be proven out.
+    int64_t keyFloor() const { return descending ? ~hi : lo; }
+
+    // Expected number of the segment's values inside the envelope.
+    double values() const { return inside; }
+
+    // Expected fraction of the in-envelope values keyed strictly before
+    // `key`.
+    double fractionBefore(int64_t key) const {
+      if (inside <= 0) return 0;
+      double before;
+      if (!descending) {
+        if (key <= lo) return 0;
+        before = key > hi ? inside : sketch().countBelow(key) - below;
+      } else {
+        // key < x for value v means v > ~x.
+        int64_t value = ~key;
+        if (value >= hi) return 0;
+        before = value < lo ? inside : below + inside - atOrBelow(value);
+      }
+      return std::clamp(before / inside, 0.0, 1.0);
+    }
+
+    // The key of the in-envelope value ranked `fraction` of the way from
+    // the best: the last of the best fraction * values() (the best one when
+    // that is under one value). Requires values() > 0.
+    int64_t keyAt(double fraction) const {
+      assert(inside > 0);
+      double offset = std::max(0.0, std::clamp(fraction, 0.0, 1.0) * inside - 1);
+      if (!descending) {
+        return std::clamp(sketch().valueAt(below + offset), lo, hi);
+      }
+      return ~std::clamp(sketch().valueAt(below + inside - 1 - offset), lo, hi);
+    }
+  };
+
   // Optional batch sort-key capability for comparators whose complete sort
   // order is an ascending transformed int64 key. Valid for the current segment
   // only; setSegment resets its cursors. Implementations must not depend on
@@ -52,10 +178,7 @@ public:
     // proves every child skips. With leaves comes their bound order:
     // boundOrderLeaf(r) is the leaf at rank r ascending by (leafBestKey,
     // leaf), with that bound - for every r < leafBlockCount().
-    struct RankedLeaf {
-      int64_t leaf;
-      int64_t bound;
-    };
+    using RankedLeaf = FieldComparator::RankedLeaf;
     virtual int32_t keyBlockSize() const { return 0; }
     virtual int64_t keyBlockCount() const { return 0; }
     virtual int64_t blockBestKey(int64_t block) const {
@@ -76,14 +199,13 @@ public:
       return {0, std::numeric_limits<int64_t>::min()};
     }
 
-    // Key floor of a value envelope: when every eligible doc has a value
-    // inside `values` (Query::requiredValueEnvelope), every eligible doc in
-    // this segment has a transformed key at or past the result - the
-    // envelope's best-side edge, transformed. nullopt when a doc's key need
-    // not come from a value inside the envelope (a multi-valued column keys
-    // on its first stored value while a predicate matches any value).
-    virtual std::optional<int64_t> keyFloor(
-        Query::ValueEnvelope values) const {
+    // The segment's keys (SegmentKeys) for docs whose values lie inside
+    // `values` (Query::requiredValueEnvelope; none: every value), offered
+    // with the leaf bounds. nullopt when there are none, or when a doc's key
+    // need not come from a value inside the envelope (a multi-valued column
+    // keys on its first stored value while a predicate matches any value).
+    virtual std::optional<SegmentKeys> segmentKeys(
+        std::optional<Query::ValueEnvelope> values) const {
       unused(values);
       return std::nullopt;
     }
@@ -195,6 +317,14 @@ class SimpleNumericFieldComparator : public FieldComparator,
   int32_t landedDoc = -1;
   int32_t landedRank = -1;
   bool multiValued = false;
+  // Bound order and leaf bounds (no envelope), when keyBlockSize() offers
+  // leaves.
+  std::optional<SegmentKeys> leaves;
+
+  const SegmentKeys& leafKeys() const {
+    assert(leaves.has_value());
+    return *leaves;
+  }
 
   int64_t transformPresent(int64_t value) const {
     return sortMultiplier < 0 ? ~value : value;
@@ -290,6 +420,7 @@ public:
     pointValues.reset();
     docsIter.reset();
     reader.reset();
+    leaves.reset();
     multiValued = false;
     decodedStart = -1;
     decodedEnd = -1;
@@ -310,6 +441,9 @@ public:
         multiValued = reader->multiValued();
         if (!reader->denseDocsWithValue()) {
           docsIter.emplace(reader->docsWithValueBitSet());
+        }
+        if (keyBlockSize() != 0) {
+          leaves.emplace(reader->leafMeta(), sortMultiplier < 0, std::nullopt);
         }
       }
     }
@@ -365,29 +499,20 @@ public:
   }
 
   int64_t leafBestKey(int64_t leaf) const override {
-    NumBlockZone zone = reader->leafZone(leaf);
-    return sortMultiplier < 0 ? ~zone.max : zone.min;
+    return leafKeys().leafBestKey(leaf);
   }
 
-  // The column persists both directions' leaf orders, so bound order is a
-  // lookup: ascending (zone.min, leaf) is ascending (leafBestKey, leaf), and
-  // descending zone.max with ties by leaf is ascending (~max, leaf).
-  RankedLeaf boundOrderLeaf(int64_t rank) const override {
-    if (sortMultiplier < 0) {
-      int64_t leaf = reader->leafByMaxDescending(rank);
-      return {leaf, ~reader->leafZone(leaf).max};
-    }
-    int64_t leaf = reader->leafByMinAscending(rank);
-    return {leaf, reader->leafZone(leaf).min};
+  FieldComparator::RankedLeaf boundOrderLeaf(int64_t rank) const override {
+    return leafKeys().boundOrderLeaf(rank);
   }
 
   // Envelope bounds are inclusive encoded values, the same encoding the
-  // column stores (FLOAT/DOUBLE sortable bits included), so the best edge
-  // is lo ascending and hi descending. A missing value never satisfies an
-  // envelope, so the missing substitute plays no part.
-  std::optional<int64_t> keyFloor(Query::ValueEnvelope values) const override {
-    if (!reader.has_value() || multiValued) return std::nullopt;
-    return transformPresent(sortMultiplier < 0 ? values.hi : values.lo);
+  // column stores (FLOAT/DOUBLE sortable bits included). A missing value
+  // never satisfies an envelope, so the missing substitute plays no part.
+  std::optional<SegmentKeys> segmentKeys(
+      std::optional<Query::ValueEnvelope> values) const override {
+    if (keyBlockSize() == 0) return std::nullopt;
+    return SegmentKeys(reader->leafMeta(), sortMultiplier < 0, values);
   }
 
   // Dense single-valued only: doc == value rank and no forward-only landing

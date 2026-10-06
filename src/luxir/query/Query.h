@@ -755,9 +755,13 @@ public:
       // identical context may coexist with this plan: neither call
       // invalidates the other, their build states are disjoint, each plan is
       // built at most once, and both products enumerate the same exact
-      // matches under the same filter contract. Consumers that need two
-      // independent forward executions (the seeded field-sort driver) require
-      // YES and build both products before either runs.
+      // matches under the same filter contract. That holds whenever the
+      // plans are made and built, also after an earlier product has run:
+      // no product's progress touches the supplier. Consumers that need
+      // several independent forward executions require YES; the seeded
+      // field-sort driver builds its first seed and sweep products before
+      // either runs, and each further seeding round's product after the
+      // earlier ones have advanced.
       BulkAnswer independentReplan = BulkAnswer::NO;
 
       bool hasConstantCount() const noexcept {

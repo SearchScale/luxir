@@ -183,20 +183,23 @@ public:
   int64_t candidateHi = -1;
   int64_t segmentSourceCost = 0;
   int32_t segmentMaxDoc = 0;
-  // Key floor of the domain: every doc this collector will see has a value
-  // of the primary sort column inside primaryValues (a request fact, from
-  // the query and filters; see TopDocsReq::sortValueEnvelope), so its
-  // primary key is at or past the comparator's KeyBatch::keyFloor of it.
-  // Per segment that clips the leaf bounds: leavesBeforeKeyFloor counts the
-  // leaves whose bound lies strictly before the floor. The heap bottom is
-  // always at or past the floor, so no bound-driven traversal can prove one
-  // of those leaves out: whatever the domain's density, each is visited.
-  // The clip only ever widens what is collected (visit-floor estimates, and
-  // one competitive range over a segment whose every leaf is clipped); it is
-  // never a skip rule, so an envelope can cost time but never results.
+  // The values every doc this collector will see holds in the primary sort
+  // column (a request fact, from the query and filters; see
+  // TopDocsReq::sortValueEnvelope). Per segment it shapes primaryKeys: the
+  // domain's keys follow the column's in-envelope values, and none lies
+  // before the envelope's best edge (SegmentKeys::keyFloor), so no
+  // bound-driven traversal can prove out a leaf bounded before that edge
+  // (leavesBeforeKeyFloor). Either only ever widens what is collected; an
+  // envelope can cost time but never results.
   std::optional<Query::ValueEnvelope> primaryValues;
+  // The current segment's primary keys, when its column offers leaf
+  // bounds.
+  std::optional<FieldComparator::SegmentKeys> primaryKeys;
   int64_t leavesBeforeKeyFloor = 0;
-  bool leafDescentEnabled = false;
+  // Whether nextCompetitiveRange descends to leaves (descendsToLeaves),
+  // decided at its first full-heap consult of a segment.
+  enum class LeafDescent : uint8_t { UNDECIDED, ON, OFF };
+  LeafDescent leafDescent = LeafDescent::UNDECIDED;
   int32_t nextProbeDoc = 0;
   bool candidatesDisabled = false;
 
@@ -290,63 +293,93 @@ public:
         clause.comparator->setSegment(segment, reader);
       }
     }
-    // Leaf descent in nextCompetitiveRange only pays when the expected leaf
-    // visit floor (ceil(k * maxDoc / sourceCost) leaves) is MATERIALLY
-    // sub-saturating. At saturation every leaf classifies COLLECT under the
-    // final bottom, so descending would only split producer calls eight ways
-    // and classify eight bounds per block for nothing - and near saturation
-    // (measured at floor/leafCount ~0.99: a reproducible ~30% regression)
-    // the few skippable leaves fragment producer ranges without paying for
-    // the classifications. The 2x margin keeps the whole win at 1% and off
-    // through the boundary band. Leaves before the key floor are visited
-    // whatever the density, so they floor the estimate.
-    leafDescentEnabled = false;
+    leafDescent = LeafDescent::UNDECIDED;
     leavesBeforeKeyFloor = 0;
+    primaryKeys.reset();
     FieldComparator::KeyBatch* batch;
     if (topCount > 0 && clauses[0].comparator != nullptr
         && (batch = clauses[0].comparator->keyBatch()) != nullptr
         && batch->leafBlockSize() != 0) {
-      leavesBeforeKeyFloor = countLeavesBeforeKeyFloor(*batch);
-      if (sourceCost > 0) {
-        int64_t depth = (topCount * (int64_t)segmentMaxDoc + sourceCost - 1)
-            / sourceCost;
-        leafDescentEnabled = 2 * std::max(depth, leavesBeforeKeyFloor)
-            < batch->leafBlockCount();
-      }
+      primaryKeys = batch->segmentKeys(primaryValues);
+    }
+    if (primaryKeys.has_value() && primaryValues.has_value()) {
+      leavesBeforeKeyFloor =
+          primaryKeys->leavesBoundedBefore(primaryKeys->keyFloor());
     }
     if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
   }
 
-  // The primary key every doc of the current segment is at or past, in the
-  // comparator's transformed key space. Any other floor source (a key the
-  // request itself starts after) would combine here by max.
-  std::optional<int64_t> domainKeyFloor(
-      const FieldComparator::KeyBatch& batch) const {
-    if (!primaryValues.has_value()) return std::nullopt;
-    return batch.keyFloor(*primaryValues);
-  }
-
-  // Bound order ascends by bound, so the leaves bounded strictly before a
-  // key are a prefix of it: binary-search its length.
-  static int64_t leavesBoundedBefore(const FieldComparator::KeyBatch& batch,
-                                     int64_t key) {
-    int64_t lo = 0;
-    int64_t hi = batch.leafBlockCount();
-    while (lo < hi) {
-      int64_t mid = lo + (hi - lo) / 2;
-      if (batch.boundOrderLeaf(mid).bound < key) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
+  // The predicted heap bottom once a segment's domain - `card` docs whose
+  // keys follow `segment`'s in-envelope values - is collected
+  // into a heap of `heapSize` of topCount entries (bottomKey: the bottom of
+  // a full one): the topCount-th best key of the heap's and the domain's,
+  // estimated from the value sketch with the domain independent of the key
+  // within the envelope. nullopt when the heap does not fill. The heap's
+  // entries are read as following the segment's distribution: a heap that
+  // is not full holds heapSize more docs drawn from it, and a full one with
+  // e domain docs before its bottom (fraction f_b of the domain) keeps the
+  // entries the merge leaves it as its own f_b-quantile does, which puts
+  // the new bottom at fraction f_b * k / (k + e). Both are exact for
+  // segments drawn alike, and a domain wholly past a full bottom leaves it.
+  // This is the one prior every field-sort decision prices: the leaves
+  // bounded at or before the predicted bottom are the visit floor
+  // (predictedVisitFloor), whatever the leaf geometry - wide zones give the
+  // density floor k * maxDoc / card, tight (doc-order correlated) zones
+  // about k / m leaves in either direction, and a range on the sort field
+  // itself puts the bottom inside it.
+  static std::optional<int64_t> predictBottom(
+      const FieldComparator::SegmentKeys& segment, int64_t card,
+      int64_t topCount, int64_t heapSize, int64_t bottomKey) {
+    assert(topCount > 0 && card > 0 && segment.values() > 0);
+    double k = (double)topCount;
+    if (heapSize < topCount) {
+      double fraction = k / ((double)heapSize + (double)card);
+      if (fraction >= 1) return std::nullopt;
+      return segment.keyAt(fraction);
     }
-    return lo;
+    double before = segment.fractionBefore(bottomKey);
+    if (before <= 0) return bottomKey;
+    double entering = (double)card * before;
+    return std::min(bottomKey, segment.keyAt(before * k / (k + entering)));
   }
 
-  int64_t countLeavesBeforeKeyFloor(
-      const FieldComparator::KeyBatch& batch) const {
-    std::optional<int64_t> floor = domainKeyFloor(batch);
-    return floor.has_value() ? leavesBoundedBefore(batch, *floor) : 0;
+  // Leaves of the current segment bounded at or before the predicted
+  // bottom (predictBottom) once its `card` domain docs are collected into
+  // the heap as it stands: the leaves a bound-driven traversal is expected
+  // to visit. Every leaf when the heap does not fill; none for an empty
+  // domain. A `depth` past topCount predicts that deeper key instead, the
+  // heap read as holding the same share of it.
+  int64_t predictedVisitFloor(int64_t card, int64_t depth = 0) const {
+    assert(primaryKeys.has_value());
+    if (card <= 0 || primaryKeys->values() <= 0) return 0;
+    if (depth <= 0) depth = topCount;
+    int64_t bottomKey = heapFull() ? bottomPrimaryKey() : 0;
+    int64_t heapSize = (int64_t)pq.size() * depth / topCount;
+    auto bottom = predictBottom(*primaryKeys, card, depth, heapSize,
+                                bottomKey);
+    return bottom.has_value() ? primaryKeys->leavesBoundedAtOrBefore(*bottom)
+                              : primaryKeys->leafCount();
+  }
+
+  // Whether a doc-order walk of the current segment meets its best keys
+  // only at the end: every one of the floor's best-bounded leaves (the head
+  // of the persisted bound order, up to kHeadLeaves of them) lies in the
+  // second half of the segment, as for keys that improve with doc order
+  // sorted newest first. Such a walk matures its bottom only as it
+  // finishes. The column's bound order announces it; no traversal does.
+  static constexpr int64_t kHeadLeaves = 64;
+  bool bestLeavesLate(int64_t floor) const {
+    assert(primaryKeys.has_value());
+    int64_t leaves = primaryKeys->leafCount();
+    for (int64_t rank = 0; rank < std::min(floor, kHeadLeaves); rank++) {
+      if (2 * primaryKeys->leafAt(rank) < leaves) return false;
+    }
+    return floor > 0;
+  }
+
+  int64_t bottomPrimaryKey() const {
+    assert(heapFull());
+    return clauses[0].comparator->keyBatch()->slotKeys[pq.top().slot];
   }
 
   // Leaves bounded at or before the heap bottom's key (a tie may still win
@@ -354,14 +387,11 @@ public:
   // current segment can enter it, and the bottom only improves, so no
   // traversal from here on visits more leaves. Every leaf while the heap is
   // not full. A heap filled by earlier segments makes this the visit
-  // bound a per-segment density estimate cannot see.
-  int64_t leavesWithinBottom(const FieldComparator::KeyBatch& batch) const {
-    if (!heapFull()) return batch.leafBlockCount();
-    int64_t bottomKey = batch.slotKeys[pq.top().slot];
-    if (bottomKey == std::numeric_limits<int64_t>::max()) {
-      return batch.leafBlockCount();
-    }
-    return leavesBoundedBefore(batch, bottomKey + 1);
+  // bound a per-segment estimate cannot see.
+  int64_t leavesWithinBottom() const {
+    assert(primaryKeys.has_value());
+    if (!heapFull()) return primaryKeys->leafCount();
+    return primaryKeys->leavesBoundedAtOrBefore(bottomPrimaryKey());
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
@@ -574,7 +604,7 @@ public:
     int64_t bottomKey = batch->slotKeys[pq.top().slot];
     segdoc bottomDoc = pq.top().doc;
     bool soleSort = clauses.size() == 1;
-    int32_t leafSize = leafDescentEnabled ? batch->leafBlockSize() : 0;
+    int32_t leafSize = descendsToLeaves() ? batch->leafBlockSize() : 0;
     int32_t doc = from;
     for (; block < blockCount; block++) {
       if (classifyKeyBlock(segment, doc, batch->blockBestKey(block),
@@ -759,6 +789,31 @@ private:
       SkipStats::fieldSortGatherAtLastAdmission =
           SkipStats::fieldSortDocsGathered - (int64_t)(windowSize - i) + 1;
     }
+  }
+
+  // Leaf descent in nextCompetitiveRange pays only when the walk's bottom
+  // lets it skip MATERIALLY many leaves. At saturation every leaf
+  // classifies COLLECT, so descending would only split producer calls
+  // eight ways and classify eight bounds per block for nothing - and near
+  // saturation (measured at floor/leafCount ~0.99: a reproducible ~30%
+  // regression) the few skippable leaves fragment producer ranges without
+  // paying for the classifications. The 2x margin on the predicted visit
+  // floor keeps the whole win at 1% and off through the boundary band. The
+  // walk runs in doc order, so it skips nothing before its bottom matures,
+  // which is never when the best keys come last (bestLeavesLate). Decided
+  // once per segment, against the heap at the first consult that can
+  // prune.
+  bool descendsToLeaves() {
+    if (leafDescent == LeafDescent::UNDECIDED) {
+      leafDescent = LeafDescent::OFF;
+      if (primaryKeys.has_value() && segmentSourceCost > 0) {
+        int64_t floor = predictedVisitFloor(segmentSourceCost);
+        if (2 * floor < primaryKeys->leafCount() && !bestLeavesLate(floor)) {
+          leafDescent = LeafDescent::ON;
+        }
+      }
+    }
+    return leafDescent == LeafDescent::ON;
   }
 
   static int32_t blockEnd(int64_t block, int32_t blockSize) {

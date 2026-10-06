@@ -1605,7 +1605,7 @@ void scanInDocOrder(int32_t segnum, Collector& collector,
     if (leaf >= plan.leafCount) return;
     if (collector.heapFull()) {
       auto rest = ExactDomainSortCosts::scanCheckpoint(
-          collector.leavesWithinBottom(*plan.batch),
+          collector.leavesWithinBottom(),
           std::max<int64_t>(1, restCard - scanned), plan.leafCount - leaf);
       if (rest != ExactDomainSortPhase::SCAN) {
         skipCount(SkipStats::fieldSortScanHandOffs);
@@ -1719,7 +1719,7 @@ std::optional<ExactDomainSortPhase> collectTopKBoundOrder(
       if (probing) return handOff(route.phase);
       auto restCosts = Costs::boundOrderRest(
           ExactDomainSortPhase::BOUND_ORDER, walked, 0, topCount,
-          route.clipLeaves, collector.leavesWithinBottom(*plan.batch),
+          route.clipLeaves, collector.leavesWithinBottom(),
           restCard(), plan.leafCount);
       return handOff(restCosts.cheaperInDocOrder());
     }
@@ -1729,7 +1729,7 @@ std::optional<ExactDomainSortPhase> collectTopKBoundOrder(
       auto rest = Costs::boundOrderCheckpoint(
           probing ? route.phase : ExactDomainSortPhase::BOUND_ORDER, walked,
           proofs, topCount, route.clipLeaves,
-          collector.leavesWithinBottom(*plan.batch), restCard(),
+          collector.leavesWithinBottom(), restCard(),
           plan.leafCount);
       if (rest != ExactDomainSortPhase::BOUND_ORDER) return handOff(rest);
       checkpoint = 2 * walked;
@@ -1802,79 +1802,171 @@ void collectTopKArrayDomain(int32_t segnum,
 
 // Seeded two-pass query-driven field-sort driver. The domain is reachable
 // only through forward scorers (streaming postings, no rewind), so
-// bound-ordered visiting is reformulated as two monotone passes: select the
+// bound-ordered visiting is reformulated as monotone passes: select the
 // seedCount best-bounded LEAVES, walk them in doc order with one bulk
 // scorer so the heap bottom matures to near-final, then sweep from doc 0
 // with a second, independent bulk scorer whose competitive-range walk now
-// skips essentially everything. Both products must exist before pass 1 runs:
-// a pass-2 scorer cannot be recovered after pass 1 advanced a shared one.
-// Leaves pass 1 actually enumerated are recorded in a visited mask the sweep
-// jumps over, so every match reaches the collector at most once and hitCount
-// keeps pruned-path semantics. Once the heap fills, each remaining seed is
-// classified against the maturing bottom before any postings work. Two abort
-// rules bound an anti-correlated query (its matches only in high-key leaves,
-// so seed probes come back empty): a heap still underfull after
-// fillAbortBudget enumerated seeds abandons the schedule, and so does a
-// consecutive run of fillAbortBudget matchless enumerated seeds - the
-// latter also fires when a warm heap (filled by earlier segments) lets
-// low-bound leaves classify competitive without the underfull test ever
-// engaging. Either way the sweep completes correctness, inheriting whatever
+// skips essentially everything. Both products are built before pass 1 runs,
+// from plans whose independentReplan contract (Query.h) keeps each
+// product's enumeration independent of the others' progress. Leaves pass 1
+// actually enumerated are recorded in a visited mask the sweep jumps over,
+// so every match reaches the collector at most once and hitCount keeps
+// pruned-path semantics. Once the heap fills, each remaining seed is
+// classified against the maturing bottom before any postings work; one
+// classified out stays out (the bottom only improves), so it is marked
+// visited too.
+//
+// Seeds that come back with too few matches (the query's matches are not
+// spread over the keys the way the prior assumed) leave the heap underfull,
+// and what then serves the rest depends on where the sweep finds the best
+// keys. When the bound order's head lies early in doc order (or across it),
+// the sweep reaches good keys early, so the schedule is abandoned for it:
+// after fillAbortBudget enumerated seeds with the heap still underfull, or
+// a consecutive run of fillAbortBudget matchless ones - the latter also
+// fires when a warm heap (filled by earlier segments) lets low-bound leaves
+// classify competitive without the underfull test ever engaging.
+//
+// When the head lies late (keys that improve with doc order, newest
+// first), the sweep would gather every match before its bottom matured, so
+// seeding goes on down the bound order instead while the heap is
+// underfull, in rounds, each with a fresh scorer from nextSeedBulk. A round
+// is walked in doc order, so the round that first reaches the matches fills
+// the heap from its oldest leaf and gathers the rest of the round: rounds
+// are short (kSeedRoundLeaves) after one that emitted, and double while
+// they come back empty, so keys anti-correlated with the query reach the
+// matches in logarithmically many scorer builds. A grown round is cut at
+// its first emitting leaf (its earliest leaves are its worst), and its
+// unvisited leaves are taken again from the best in short rounds, even once
+// the heap is full: the sweep would meet them only after the worse leaves
+// before them, gathering those first. That goes on while the best unvisited
+// leaf can still enter the heap. At most kMaxSeedRounds rounds follow the
+// first. Either way the sweep completes correctness, inheriting whatever
 // bottom the seeds bought.
-template <typename Collector>
+inline constexpr int64_t kSeedRoundLeaves = 16;
+// Doubling reaches any leaf of a 2^20-leaf segment within 16 rounds, and a
+// cut halves the distance from the best unvisited leaf to the matches, so
+// this bounds the scorer builds of pathological schedules (matches thinner
+// than one per round, re-cut rounds) well past what reaching them needs.
+inline constexpr int64_t kMaxSeedRounds = 64;
+
+template <typename Collector, typename NextSeedBulk>
 void collectTopKMatchWindowedSeeded(
-    int32_t segnum, BulkScorer* seedBulk, BulkScorer* sweepBulk,
-    DocSet* filter, Collector& collector, MemPool& pool, int32_t maxDoc,
-    int64_t seedCount, int64_t fillAbortBudget) {
+    int32_t segnum, BulkScorer* seedBulk, NextSeedBulk&& nextSeedBulk,
+    BulkScorer* sweepBulk, DocSet* filter, Collector& collector,
+    MemPool& pool, int32_t maxDoc, int64_t seedCount,
+    int64_t fillAbortBudget, bool lateHead) {
   auto plan = collector.maskedKeyBlockPlan();
   assert(plan.batch != nullptr && plan.leafSize != 0);
   assert(seedBulk != nullptr && sweepBulk != nullptr);
   using BC = typename Collector::BlockClass;
   skipCount(SkipStats::fieldSortSeededActivations);
 
-  // Select the seedCount globally best-bounded leaves - the head of the
-  // column's persisted bound order, the same order the exact-domain driver
-  // walks - then visit the selection in ascending doc order so the seed
-  // scorer only moves forward. Selection is metadata-only: no
-  // classification, no postings work.
-  seedCount = std::min<int64_t>(seedCount, plan.leafCount);
-  std::span<int64_t> seeds = pool.make_span<int64_t>((size_t)seedCount);
-  for (int64_t rank = 0; rank < seedCount; rank++) {
-    seeds[(size_t)rank] = plan.batch->boundOrderLeaf(rank).leaf;
-  }
-  std::sort(seeds.begin(), seeds.end());
-
   std::span<uint64_t> visited =
       pool.make_span<uint64_t>((size_t)((plan.leafCount + 63) >> 6));
   std::fill(visited.begin(), visited.end(), 0);
+  auto isVisited = [&](int64_t leaf) {
+    return (visited[(size_t)(leaf >> 6)] >> (leaf & 63)) & 1;
+  };
+  auto markVisited = [&](int64_t leaf) {
+    visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
+  };
+  std::span<int64_t> seeds = pool.make_span<int64_t>((size_t)plan.leafCount);
 
   int64_t enumerated = 0;
   int64_t consecutiveEmpty = 0;
-  for (int64_t leaf : seeds) {
-    if (collector.heapFull()) {
-      if (collector.classifyBlock(
-              segnum, (int32_t)(leaf * (int64_t)plan.leafSize),
-              plan.batch->leafBestKey(leaf), plan.batch) != BC::COLLECT) {
-        skipCount(SkipStats::fieldSortSeedClassifiedOut);
-        continue;
+  // Every leaf ranked before `rank` in bound order is visited; a cut round
+  // leaves unvisited ones between it and `cutEnd`.
+  int64_t rank = 0;
+  int64_t cutEnd = 0;
+  int64_t round = std::max<int64_t>(1, seedCount);
+  int64_t rounds = 0;
+  BulkScorer* bulk = seedBulk;
+  for (;;) {
+    // Select the round's best-bounded unvisited leaves - the next stretch
+    // of the column's persisted bound order, the order the exact-domain
+    // driver walks - then visit them in ascending doc order so the seed
+    // scorer only moves forward. Selection is metadata-only: no
+    // classification, no postings work.
+    int64_t selected = 0;
+    int64_t next = rank;
+    for (; next < plan.leafCount && selected < round; next++) {
+      int64_t leaf = plan.batch->boundOrderLeaf(next).leaf;
+      if (!isVisited(leaf)) seeds[(size_t)selected++] = leaf;
+    }
+    std::span<int64_t> roundSeeds = seeds.first((size_t)selected);
+    std::sort(roundSeeds.begin(), roundSeeds.end());
+    bool cuttable = rounds > 0 && round > kSeedRoundLeaves;
+    bool emitted = false;
+    bool cut = false;
+    bool abandoned = false;
+    for (int64_t leaf : roundSeeds) {
+      if (collector.heapFull()) {
+        if (collector.classifyBlock(
+                segnum, (int32_t)(leaf * (int64_t)plan.leafSize),
+                plan.batch->leafBestKey(leaf), plan.batch) != BC::COLLECT) {
+          markVisited(leaf);
+          skipCount(SkipStats::fieldSortSeedClassifiedOut);
+          continue;
+        }
+      } else if (!lateHead && enumerated >= fillAbortBudget) {
+        abandoned = true;
+        break;
       }
-    } else if (enumerated >= fillAbortBudget) {
+      int32_t begin = (int32_t)(leaf * (int64_t)plan.leafSize);
+      int32_t leafEnd = (int32_t)std::min<int64_t>(
+          (leaf + 1) * (int64_t)plan.leafSize, (int64_t)maxDoc);
+      int64_t emittedHere = feedMatchWindows(segnum, bulk, filter, nullptr,
+                                             collector, begin, leafEnd);
+      markVisited(leaf);
+      enumerated++;
+      skipCount(SkipStats::fieldSortSeedLeaves);
+      if (emittedHere != 0) {
+        consecutiveEmpty = 0;
+        emitted = true;
+        if (cuttable) {
+          cut = true;
+          break;
+        }
+      } else if (!lateHead && ++consecutiveEmpty >= fillAbortBudget) {
+        abandoned = true;
+        break;
+      }
+    }
+    if (abandoned) {
       skipCount(SkipStats::fieldSortSeedFillAborts);
       break;
     }
-    int32_t begin = (int32_t)(leaf * (int64_t)plan.leafSize);
-    int32_t end = (int32_t)std::min<int64_t>(
-        (leaf + 1) * (int64_t)plan.leafSize, (int64_t)maxDoc);
-    int64_t emitted = feedMatchWindows(segnum, seedBulk, filter, nullptr,
-                                       collector, begin, end);
-    visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
-    enumerated++;
-    skipCount(SkipStats::fieldSortSeedLeaves);
-    if (emitted != 0) {
-      consecutiveEmpty = 0;
-    } else if (++consecutiveEmpty >= fillAbortBudget) {
+    if (cut) {
+      cutEnd = std::max(cutEnd, next);
+    } else {
+      rank = next;
+    }
+    if (!lateHead) break;
+    while (rank < plan.leafCount
+           && isVisited(plan.batch->boundOrderLeaf(rank).leaf)) {
+      rank++;
+    }
+    if (rank >= plan.leafCount) break;
+    if (collector.heapFull()) {
+      // Past a cut round's leaves, the sweep serves the rest; within them,
+      // only while the best unvisited leaf can still enter the heap.
+      auto head = plan.batch->boundOrderLeaf(rank);
+      if (rank >= cutEnd
+          || collector.classifyBlock(
+                 segnum, (int32_t)(head.leaf * (int64_t)plan.leafSize),
+                 head.bound, plan.batch) == BC::SKIP_STRICT) {
+        break;
+      }
+    }
+    if (++rounds > kMaxSeedRounds) {
       skipCount(SkipStats::fieldSortSeedFillAborts);
       break;
     }
+    round = emitted ? kSeedRoundLeaves
+                    : 2 * std::max(round, kSeedRoundLeaves / 2);
+    bulk = nextSeedBulk();
+    if (bulk == nullptr) break;
+    skipCount(SkipStats::fieldSortSeedRounds);
   }
 
   collectTopKMatchWindowed(segnum, sweepBulk, filter, nullptr, collector,

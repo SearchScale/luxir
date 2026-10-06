@@ -289,6 +289,7 @@ struct SkipStats {
   static inline int64_t fieldSortSeedLeaves = 0;
   static inline int64_t fieldSortSeedClassifiedOut = 0;
   static inline int64_t fieldSortSeedFillAborts = 0;
+  static inline int64_t fieldSortSeedRounds = 0;
   static inline int64_t fieldSortSeedPass2Skips = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
@@ -576,6 +577,7 @@ struct SkipStats {
     fieldSortSeedLeaves = 0;
     fieldSortSeedClassifiedOut = 0;
     fieldSortSeedFillAborts = 0;
+    fieldSortSeedRounds = 0;
     fieldSortSeedPass2Skips = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;

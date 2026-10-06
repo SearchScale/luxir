@@ -22,18 +22,19 @@ using namespace luxir::test;
 // sort of leaf ids by zone.min ascending, and by zone.max descending, so ties
 // keep ascending leaf order.
 static void expectLeafVisitOrders(const IntColReader& reader) {
-  int64_t leaves = reader.numLeafZones();
+  const auto& meta = reader.leafMeta();
+  int64_t leaves = meta.numLeafZones();
   for (bool byMax : {false, true}) {
     std::vector<int64_t> oracle((size_t)leaves);
     std::iota(oracle.begin(), oracle.end(), 0);
     std::stable_sort(oracle.begin(), oracle.end(), [&](int64_t a, int64_t b) {
-      NumBlockZone za = reader.leafZone(a);
-      NumBlockZone zb = reader.leafZone(b);
+      NumBlockZone za = meta.leafZone(a);
+      NumBlockZone zb = meta.leafZone(b);
       return byMax ? za.max > zb.max : za.min < zb.min;
     });
     for (int64_t rank = 0; rank < leaves; rank++) {
-      int64_t leaf = byMax ? reader.leafByMaxDescending(rank)
-                           : reader.leafByMinAscending(rank);
+      int64_t leaf = byMax ? meta.leafByMaxDescending(rank)
+                           : meta.leafByMinAscending(rank);
       EXPECT_EQ(oracle[(size_t)rank], leaf) << "byMax=" << byMax
                                             << " rank=" << rank;
     }
@@ -51,7 +52,7 @@ static std::vector<int64_t> expectValueSketch(
   std::vector<int64_t> sorted(values.begin(), values.end());
   std::sort(sorted.begin(), sorted.end());
   int64_t n = (int64_t)sorted.size();
-  auto sketch = reader.valueSketch();
+  auto sketch = reader.leafMeta().valueSketch();
   EXPECT_EQ(n, sketch.values());
   if (n == 0) {
     EXPECT_TRUE(sketch.empty());
@@ -340,7 +341,7 @@ TEST_F(IntColTest, linearPackFormatCorners) {
       int64_t end = std::min<int64_t>(start + kLeaf, expected.size());
       auto [minIt, maxIt] = std::minmax_element(
           expected.begin() + start, expected.begin() + end);
-      NumBlockZone zone = reader.leafZone(leaf);
+      NumBlockZone zone = reader.leafMeta().leafZone(leaf);
       EXPECT_EQ(zone.min, *minIt) << "leaf=" << leaf;
       EXPECT_EQ(zone.max, *maxIt) << "leaf=" << leaf;
     }
@@ -452,10 +453,11 @@ TEST_F(IntColTest, leafVisitOrders) {
   std::vector<int64_t> ascending;
   std::vector<int64_t> descending;
   for (int64_t rank = 0; rank < reader.numLeafZones(); rank++) {
-    EXPECT_EQ(zones[(size_t)rank].min, reader.leafZone(rank).min);
-    EXPECT_EQ(zones[(size_t)rank].max, reader.leafZone(rank).max);
-    ascending.push_back(reader.leafByMinAscending(rank));
-    descending.push_back(reader.leafByMaxDescending(rank));
+    const auto& meta = reader.leafMeta();
+    EXPECT_EQ(zones[(size_t)rank].min, meta.leafZone(rank).min);
+    EXPECT_EQ(zones[(size_t)rank].max, meta.leafZone(rank).max);
+    ascending.push_back(meta.leafByMinAscending(rank));
+    descending.push_back(meta.leafByMaxDescending(rank));
   }
   EXPECT_EQ((std::vector<int64_t>{6, 4, 1, 3, 8, 0, 2, 5, 9, 7}), ascending);
   EXPECT_EQ((std::vector<int64_t>{3, 5, 8, 0, 1, 9, 7, 2, 4, 6}), descending);
@@ -511,7 +513,7 @@ TEST_F(IntColTest, valueSketchEstimates) {
     IntColReader reader(input, data.columnLoc, data.columnMetaOff,
                         data.numValues);
     auto sorted = expectValueSketch(reader, values);
-    auto sketch = reader.valueSketch();
+    auto sketch = reader.leafMeta().valueSketch();
     int64_t n = (int64_t)sorted.size();
     auto trueBelow = [&](int64_t v) {
       return (double)(std::lower_bound(sorted.begin(), sorted.end(), v)
@@ -607,7 +609,7 @@ TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
         SegFieldInfo fieldInfo;
         fieldReader.readFieldInfo(fieldInfo);
         IntColReader column(segment.postingsReader(), fieldInfo);
-        const auto& sketch = column.valueSketch();
+        const auto& sketch = column.leafMeta().valueSketch();
         EXPECT_EQ(field == "one_i", !sketch.empty()) << field;
         if (field == "one_i") {
           EXPECT_EQ(column.numValues(), sketch.values());

@@ -7515,20 +7515,25 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
   helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
   std::vector<Doc> docs;
+  std::vector<std::pair<int64_t, std::string>> members;
   for (int i = 0; i < 4096; i++) {
-    docs.push_back(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i,
+    int64_t rank = (int64_t)(((uint32_t)i * 2654435761u) % 100003);
+    docs.push_back(flatdoc("id", std::to_string(i), "rank_i", rank,
                            "body_w", i % 2 == 0 ? "apple pear" : "other"));
+    if (i % 2 == 0) members.push_back({rank, std::to_string(i)});
   }
+  std::sort(members.begin(), members.end());
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  // Eight numeric leaf zones: depth 1 builds the membership, whose floor
-  // of two leaves the exact-domain driver serves in bound order; at depth 6
-  // the floor saturates all eight and the driver sweeps, so its plan must use
-  // offset + limit even though limit stays 1.
+  // Eight numeric leaf zones, uniform keys: depth 1 builds the membership,
+  // whose predicted floor of two leaves the exact-domain driver serves in
+  // bound order; at depth 50 the floor covers all eight and the driver
+  // sweeps, so its plan must use offset + limit even though limit stays 1.
   BestFirstGuard bestFirst(false, false);
   for (int round = 0; round < 3; round++) {
+    int32_t offset = round == 2 ? 49 : 0;
     auto req = localReq(helper.getSearchEngine());
     auto& q = req->collection("main").topDocs("q").fields({"id"})
-        .limit(1).offset(round == 2 ? 5 : 0).getNumber();
+        .limit(1).offset(offset).getNumber();
     q.rawQuery() = qb::boolean(q.mr(), {},
         {qb::match(q.mr(), "body_w", "apple"), qb::match(q.mr(), "body_w", "pear")});
     qb::sort(q, "rank_i", qb::ASC);
@@ -7536,7 +7541,8 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
     req->execute(false);
     ASSERT_OK(req);
     EXPECT_EQ(2048, req->docList()->found.value_or(-1));
-    EXPECT_EQ((std::vector<std::string>{round == 2 ? "10" : "0"}), resultIds(*req, "q"));
+    EXPECT_EQ((std::vector<std::string>{members[(size_t)offset].second}),
+              resultIds(*req, "q"));
     if (round > 0) {
       EXPECT_EQ(1, SkipStats::cacheFirstFieldSortWeightSkips);
       EXPECT_EQ(1, SkipStats::wholeFieldSortHits);

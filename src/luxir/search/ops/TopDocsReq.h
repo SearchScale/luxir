@@ -119,14 +119,14 @@ public:
   // Every materialized domain whose sole numeric key offers masked leaf
   // bounds takes the exact-domain driver, whatever its cardinality or
   // representation: the driver picks its phase by cost
-  // (ExactDomainSortCosts::choosePhase) from the expected bound-order visit
-  // floor, ceil(k * maxDoc / card) leaves; the leaves bounded before the
-  // domain's key floor (a range on the sort field itself;
-  // FieldSortCollector::leavesBeforeKeyFloor), which are visited whatever
-  // the density; and the leaves a heap filled by earlier segments still
-  // admits (FieldSortCollector::leavesWithinBottom). A sweep or scan at a
-  // sub-saturating floor starts with a short bound-order probe when it can
-  // afford one (ExactDomainSortCosts::probeLeaves).
+  // (ExactDomainSortCosts::choosePhase) from the predicted visit floor
+  // (FieldSortCollector::predictedVisitFloor: the leaves bounded at or
+  // before the bottom the heap is predicted to reach), the leaves bounded
+  // before the domain's key floor (a range on the sort field itself;
+  // FieldSortCollector::leavesBeforeKeyFloor), and the leaves the heap as it
+  // stands still admits (FieldSortCollector::leavesWithinBottom). A sweep or
+  // scan at a sub-saturating floor starts with a short bound-order probe
+  // when it can afford one (ExactDomainSortCosts::probeLeaves).
   struct ExactDomainSortPlan {
     FieldSortCollector::KeyBlockPlan keys;
     ExactDomainSortRoute route;
@@ -144,14 +144,8 @@ public:
     bool omitsWeight() const noexcept { return acceptedUse != nullptr; }
   };
 
-  static int64_t expectedVisitFloor(int64_t topCount, int64_t card,
-                                    int32_t maxDoc, int64_t leafCount) {
-    return std::min<int64_t>(leafCount,
-                             (topCount * (int64_t)maxDoc + card - 1) / card);
-  }
-
   static ExactDomainSortPlan planExactDomainSort(
-      FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
+      FieldSortCollector& collector, int64_t card) {
     if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
       return {};
     }
@@ -159,10 +153,9 @@ public:
     if (keys.batch == nullptr) return {};
     ExactDomainSortRoute route;
     route.card = card;
-    route.expectedFloor =
-        expectedVisitFloor(collector.topCount, card, maxDoc, keys.leafCount);
+    route.expectedFloor = collector.predictedVisitFloor(card);
     route.clipLeaves = collector.leavesBeforeKeyFloor;
-    int64_t withinBottom = collector.leavesWithinBottom(*keys.batch);
+    int64_t withinBottom = collector.leavesWithinBottom();
     route.phase = forceFieldSortBestFirst
         ? ExactDomainSortPhase::BOUND_ORDER
         : ExactDomainSortCosts::choosePhase(route.expectedFloor,
@@ -176,29 +169,22 @@ public:
     return {keys, route};
   }
 
-  // Whole-membership build policy for a FIELD_SORT segment: build when the
-  // exact-domain driver could then bound its visits - the expected visit
-  // floor sub-saturating (2 * floor < leafCount), with the key-floor clip
-  // counted only for a membership that would materialize as an ARRAY. This
-  // was the driver's availability gate while saturating domains went to the
-  // ladder (the clip counted for ARRAY only because the ladder then walked a
-  // fully clipped array faster than the driver's sweep, while a bitset's
-  // fused masked sweep beat the ladder); it stays the build rule until
-  // builds are priced with the driver's cost model.
-  static bool wholeMembershipBoundsFieldSort(
-      FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
-    if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
-      return false;
-    }
-    auto keys = collector.maskedKeyBlockPlan();
-    if (keys.batch == nullptr) return false;
-    if (forceFieldSortBestFirst) return true;
-    int64_t floor =
-        expectedVisitFloor(collector.topCount, card, maxDoc, keys.leafCount);
-    if (card <= (int64_t)DocSetBuilder::arrayLimitFor(maxDoc)) {
-      floor = std::max(floor, collector.leavesBeforeKeyFloor);
-    }
-    return 2 * floor < keys.leafCount;
+  // Seeded collection fixes its first pass before it sees a key, so it
+  // seeds the leaves bounded before the bottom predicted somewhat past k:
+  // the count of domain docs before the true k-th key varies by about
+  // sqrt(k), and when the seeds hold too few of them the second pass gathers
+  // what the first missed under a bottom worse than the final one.
+  // Measured by instruction counts (5M docs, uniform keys, hugin
+  // 2026-10-06): on 'the' TOP_1000_FF seeding 0.94, 1.00, 1.06, 1.2 and 1.5
+  // times the depth-k floor cost 1.81, 1.67, 1.48, 1.58 and 1.78 G; over
+  // 0, 0.5, 1, 1.5 and 2 sigmas it cost 1.13, 0.98, 0.98, 0.99 and 1.00 of
+  // the earlier linear density floor, and 'medical +devices' TOP_10_FF (a
+  // sparse domain: 1,756 floor leaves at k = 10) 1.14, 1.07, 1.13, 1.16 and
+  // 1.20; 450 sampled field-sort requests move under 0.1% across them.
+  static constexpr double kSeedDepthSigmas = 0.5;
+  static int64_t seedDepth(int64_t topCount) {
+    return topCount
+        + (int64_t)std::ceil(kSeedDepthSigmas * std::sqrt((double)topCount));
   }
 
   // The values every collected doc holds in the primary sort column: what
@@ -209,7 +195,7 @@ public:
   // parent domain only narrows that, so the envelope holds for whatever
   // domain source a route reads: a resident whole membership, a cached exact
   // set, a collector filter, or the query's own matches. The comparator
-  // decides whether its key follows from it (KeyBatch::keyFloor).
+  // decides whether its key follows from it (KeyBatch::segmentKeys).
   static std::optional<Query::ValueEnvelope> sortValueEnvelope(
       const SortPlan& sortPlan, const Query* query,
       std::span<const ParsedFilter> filters) {
@@ -237,6 +223,137 @@ public:
     }
     return FieldType::sortsByIntColumn(const_cast<FieldType&>(
         sortPlan.clauses[0].getSortField().getFieldType()).type());
+  }
+
+  using SegmentKeys = FieldComparator::SegmentKeys;
+
+  // The primary sort column's keys in every segment, by segment ord, for a
+  // sort the exact-domain driver can serve; empty otherwise.
+  static std::vector<std::optional<SegmentKeys>> fieldSortSegmentKeys(
+      IndexReader& reader, const SortPlan& sortPlan,
+      std::optional<Query::ValueEnvelope> envelope) {
+    std::vector<std::optional<SegmentKeys>> keys;
+    if (!fieldSortCanUseMaskedBestFirst(sortPlan)) return keys;
+    auto comparator =
+        sortPlan.clauses[0].getSortField().createComparator(&reader);
+    keys.reserve(reader.segments().size());
+    for (auto& segment : reader.segments()) {
+      comparator->setSegment(segment.ord, &segment.postingsReader());
+      auto* batch = comparator->keyBatch();
+      keys.push_back(batch == nullptr ? std::nullopt
+                                      : batch->segmentKeys(envelope));
+    }
+    return keys;
+  }
+
+  // Whether a segment without keys may hold docs that beat every key: under
+  // MISSING_FIRST a doc without a value sorts first, and it is collected
+  // unless an envelope, which no missing value satisfies, keeps it out.
+  static bool fieldSortMissingFirst(
+      const SortPlan& sortPlan,
+      const std::optional<Query::ValueEnvelope>& envelope) {
+    return !envelope.has_value() && !sortPlan.clauses.empty()
+        && sortPlan.clauses[0].getKind() == SortClause::COLUMN
+        && sortPlan.clauses[0].getSortField().getMissingValue()
+            == FieldComparator::MISSING_FIRST;
+  }
+
+  // Field-sort segment visit order: best first by each segment's
+  // topCount-th best in-envelope key (its worst when it holds fewer
+  // values), ties in segment order. A segment without keys (its column
+  // absent, sparse, or multi-valued there) ranks at the missing value's
+  // edge: first when `missingFirst` (fieldSortMissingFirst), as its docs
+  // without a value beat every key, and last otherwise. The heap then
+  // fills from the segments holding the best keys, so later segments
+  // settle at their first bounds: newest first for a descending sort on a
+  // time-ordered key. The kept top K is order-independent (segdoc breaks
+  // ties), so the order only moves work.
+  static std::vector<int32_t> fieldSortVisitOrder(
+      std::span<const std::optional<SegmentKeys>> keys, int64_t topCount,
+      bool missingFirst) {
+    std::vector<std::pair<int64_t, int32_t>> ranked;
+    ranked.reserve(keys.size());
+    for (size_t s = 0; s < keys.size(); s++) {
+      int64_t key = !keys[s].has_value() && missingFirst
+          ? std::numeric_limits<int64_t>::min()
+          : std::numeric_limits<int64_t>::max();
+      if (keys[s].has_value() && keys[s]->values() > 0) {
+        key = keys[s]->keyAt(
+            std::min(1.0, (double)topCount / keys[s]->values()));
+      }
+      ranked.push_back({key, (int32_t)s});
+    }
+    std::sort(ranked.begin(), ranked.end());
+    std::vector<int32_t> order;
+    order.reserve(ranked.size());
+    for (auto [key, s] : ranked) order.push_back(s);
+    return order;
+  }
+
+  // The visit floors a request is predicted to need, segment by segment in
+  // visit order from an empty heap: each segment's cards[s] domain docs
+  // collected into the heap the earlier ones are predicted to have left
+  // (FieldSortCollector::predictBottom). This is the index-wide view a
+  // decision taken before any heap exists needs: a small segment saturates
+  // on its own, yet past the first few segments a good bottom bounds every
+  // segment, and only a whole-index prediction sees it.
+  static void plannedVisitFloors(
+      std::span<const std::optional<SegmentKeys>> keys,
+      std::span<const int32_t> order, std::span<const int64_t> cards,
+      int64_t topCount, std::span<int64_t> floors) {
+    int64_t heapSize = 0;
+    int64_t bottom = 0;
+    for (int32_t s : order) {
+      const auto& segmentKeys = keys[(size_t)s];
+      int64_t card = cards[(size_t)s];
+      floors[(size_t)s] = 0;
+      if (!segmentKeys.has_value() || card <= 0
+          || segmentKeys->values() <= 0) {
+        continue;
+      }
+      auto predicted = FieldSortCollector::predictBottom(
+          *segmentKeys, card, topCount, heapSize, bottom);
+      floors[(size_t)s] = predicted.has_value()
+          ? segmentKeys->leavesBoundedAtOrBefore(*predicted)
+          : segmentKeys->leafCount();
+      if (heapSize + card >= topCount) {
+        bottom = predicted.value_or(segmentKeys->keyAt(1));
+      }
+      heapSize = std::min(topCount, heapSize + card);
+    }
+  }
+
+  // Whether the exact-domain driver could bound its visits over a whole
+  // membership of the estimated per-segment cards: the planned visit
+  // floors (plannedVisitFloors) cover under half the leaves of the segments
+  // holding domain docs. The build pays per later request through the
+  // leaves the bounds skip; at saturation the driver would only trade
+  // query evaluation for gathers, which does not repay the cache space.
+  static bool fieldSortVisitsBounded(
+      IndexReader& reader, const SortPlan& sortPlan,
+      std::optional<Query::ValueEnvelope> envelope,
+      std::span<const int64_t> cards, int64_t topCount) {
+    if (disableFieldSortPruning || disableFieldSortBestFirst) return false;
+    auto keys = fieldSortSegmentKeys(reader, sortPlan, envelope);
+    if (std::none_of(keys.begin(), keys.end(),
+                     [](const auto& k) { return k.has_value(); })) {
+      return false;
+    }
+    if (forceFieldSortBestFirst) return true;
+    std::vector<int64_t> floors(keys.size());
+    plannedVisitFloors(
+        keys,
+        fieldSortVisitOrder(keys, topCount,
+                            fieldSortMissingFirst(sortPlan, envelope)),
+        cards, topCount, floors);
+    int64_t visited = 0;
+    int64_t leaves = 0;
+    for (size_t s = 0; s < keys.size(); s++) {
+      if (!keys[s].has_value() || cards[s] <= 0) continue;
+      visited += floors[s];
+      leaves += keys[s]->leafCount();
+    }
+    return 2 * visited < leaves;
   }
 
   // Pre-Weight FIELD_SORT planning. A complete resident whole membership
@@ -277,11 +394,12 @@ public:
   }
 
   // Building membership pays for FIELD_SORT when it removes verification
-  // work from the query-driven ladder, or when its estimated cardinality
-  // lets the exact-domain driver bound its visits
-  // (wholeMembershipBoundsFieldSort). Flat term conjunction cost is only
-  // the cheapest posting list, not a useful estimate of intersection
-  // membership, so it cannot establish that by itself.
+  // work from the query-driven ladder, or when the estimated cardinalities
+  // let the exact-domain driver bound its visits across the whole index
+  // (fieldSortVisitsBounded) - one decision for every segment, so a
+  // membership a later request finds is complete. Flat term conjunction
+  // cost is only the cheapest posting list, not a useful estimate of
+  // intersection membership, so it cannot establish that by itself.
   // VerificationWork includes nested two-phase children hidden behind a
   // single-phase compound protocol. Serving an already resident value is not
   // decided here: the pre-Weight planner accepts it for every shape. Plan
@@ -299,43 +417,43 @@ public:
       std::fill(routes.begin(), routes.end(), (uint8_t)routed);
       return routed;
     }
-    FieldSortCollector collector(
-        topCount, sortPlan.clauses, &reader, false);
-    // Whole membership is planned only with every filter folded into the
-    // query, so the query alone carries the envelope.
-    collector.primaryValues = sortValueEnvelope(sortPlan, &query, {});
+    size_t segments = reader.segments().size();
+    std::vector<int64_t> cards(segments, 0);
+    std::vector<uint8_t> boundable(segments, 0);
     MemPool pool;
-    bool anyRouted = false;
     for (auto& segment : reader.segments()) {
       auto savepoint = pool.getSavePoint();
       auto* supplier = weight.scorerSupplier(pool, segment);
-      int64_t estimatedCard = supplier == nullptr ? 0 : supplier->cost();
-      if (segment.liveDocs() != nullptr) {
-        estimatedCard = std::min(
-            estimatedCard,
-            (int64_t)segment.liveDocs()->docset().card());
-      }
-      bool routed = false;
+      size_t s = (size_t)segment.ord;
+      routes[s] = 0;
       if (supplier != nullptr) {
+        int64_t estimatedCard = supplier->cost();
+        if (segment.liveDocs() != nullptr) {
+          estimatedCard = std::min(
+              estimatedCard,
+              (int64_t)segment.liveDocs()->docset().card());
+        }
+        cards[s] = estimatedCard;
         auto context = supplier->makePlanContext(
             Query::Demand::fromLeadCost(
                 estimatedCard, Query::ExecutionUse::MATCH_WINDOWS));
-        routed = supplier->verificationWork(context)
+        routes[s] = supplier->verificationWork(context)
             == Query::VerificationWork::PRESENT;
-        if (!routed && canUseBestFirst
+        boundable[s] = !routes[s]
             && supplier->describeScorer(context).termConjunctionClause
-                != Query::ClauseShape::FLAT_CONJUNCTION) {
-          collector.setSegment(
-              segment.ord, &segment.postingsReader(), &pool, estimatedCard);
-          routed = wholeMembershipBoundsFieldSort(
-              collector, estimatedCard, segment.maxDoc());
-        }
+                != Query::ClauseShape::FLAT_CONJUNCTION;
       }
-      routes[(size_t)segment.ord] = (uint8_t)routed;
-      anyRouted |= routed;
       pool.rewind(savepoint);
     }
-    return anyRouted;
+    // Whole membership is planned only with every filter folded into the
+    // query, so the query alone carries the envelope.
+    if (std::find(boundable.begin(), boundable.end(), 1) != boundable.end()
+        && fieldSortVisitsBounded(reader, sortPlan,
+                                  sortValueEnvelope(sortPlan, &query, {}),
+                                  cards, topCount)) {
+      for (size_t s = 0; s < segments; s++) routes[s] |= boundable[s];
+    }
+    return std::find(routes.begin(), routes.end(), 1) != routes.end();
   }
 
   static int32_t sparseFilteredTopKDensityInverse(
@@ -1263,8 +1381,27 @@ public:
         oneapi::tbb::task_group* tg,
         std::span<const DomainHandle> domains) {
       assert(domains.size() == thisOp().req.reader->segments().size());
-      // Keep the same task-stack ordering as Calculator::calcAll.
-      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
+      // Keep the same task-stack ordering as Calculator::calcAll, except
+      // that a field sort visits segments in its visit order
+      // (fieldSortVisitOrder). Sequentially, one collector then carries its
+      // heap from segment to segment, so the segments holding the best keys
+      // go first. In parallel the segments are spawned in reverse:
+      // task_group::run pushes onto this thread's deque, which it pops
+      // LIFO, so this thread collects best first and its heap fills with
+      // good keys early. Thieves steal from the other end, the worst
+      // segments, with heaps of their own.
+      auto& op = thisOp();
+      std::vector<int32_t> order;
+      if (domains.size() > 1 && subCalcs.empty()
+          && op.sortPlan.useFieldSort && op.topCount > 0
+          && !disableFieldSortPruning) {
+        order = fieldSortVisitOrder(
+            fieldSortSegmentKeys(*op.req.reader, op.sortPlan, op.sortValues),
+            op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
+      }
+      for (size_t i = 0; i < domains.size(); i++) {
+        size_t at = tg == nullptr ? i : domains.size() - 1 - i;
+        int32_t segnum = order.empty() ? (int32_t)i : order[at];
         DomainHandle domain = domains[(size_t)segnum];
         assert(domain.isDeliverable());
         task_group_run(tg, [this, tg, segnum, domain]() {
@@ -1926,7 +2063,7 @@ public:
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
                 auto exactDomain = planExactDomainSort(
-                    *data->fieldCollector, card, seg.maxDoc());
+                    *data->fieldCollector, card);
                 if (exactDomain.available()) {
                   if (!allDocs && domainSet->type == DocSet::ARRAY) {
                     collectTopKArrayDomain(
@@ -1979,11 +2116,12 @@ public:
             // of the persisted bound order) via one bulk scorer and sweeps
             // the complement with a second, independent one. Needs a
             // supplier whose bulk plans declare independentReplan (both
-            // products are built before pass 1), a sub-saturating expected
-            // floor with material headroom (4*floor+64 < blockCount), and
-            // at least one expected match per key block. forceFieldSortSeeding
-            // bypasses only the two economic gates, never correctness or
-            // capability.
+            // products are built before pass 1, and each further seeding
+            // round's after earlier products ran), a nonzero sub-saturating
+            // predicted visit floor with material headroom (4*floor+64 <
+            // leafCount), and at least one expected match per leaf.
+            // forceFieldSortSeeding bypasses only the two economic gates,
+            // never correctness or capability.
             if (!usedBulk && supplier != nullptr && !captureSharedRaw
                 && maySkipNoncompetitiveDocs && !disableFieldSortSeeding
                 && !disableFieldSortBulk && !requiresWholeIndexPrepare
@@ -1993,22 +2131,19 @@ public:
               auto plan = data->fieldCollector->maskedKeyBlockPlan();
               if (plan.batch != nullptr && plan.blockCount > 0
                   && sortSourceCost > 0) {
-                int64_t expectedDepth =
-                    (data->fieldCollector->topCount * (int64_t)seg.maxDoc()
-                     + sortSourceCost - 1) / sortSourceCost;
                 // Budget and materiality are both in leaf units (pass 1
                 // enumerates leaves). Leaf-normalized materiality measured
                 // BETTER than preserving the coarse-era activation envelope:
                 // it admits the 1% band, where seeding takes the walk from
                 // 1.66x the leaf floor to floor+O(1) and the second scorer
-                // costs far less than the excess it removes. Leaves before
-                // the key floor are enumerated whatever the density.
-                int64_t leafFloor = std::min<int64_t>(
-                    plan.leafCount,
-                    std::max(expectedDepth,
-                             data->fieldCollector->leavesBeforeKeyFloor));
-                bool material =
-                    4 * leafFloor + 64 < plan.leafCount
+                // costs far less than the excess it removes. Seeding is
+                // decided at the depth-k floor and sized at seedDepth's. A
+                // floor of zero (a full heap no leaf can beat) leaves the
+                // single competitive walk nothing to skip past.
+                int64_t leafFloor = data->fieldCollector->predictedVisitFloor(
+                    sortSourceCost);
+                bool material = leafFloor > 0
+                    && 4 * leafFloor + 64 < plan.leafCount
                     && sortSourceCost >= plan.leafCount;
                 if (material || forceFieldSortSeeding) {
                   matchWindowsPlan = supplier->planBulk(
@@ -2031,10 +2166,13 @@ public:
                     auto* sweepBulk = seedBulk == nullptr ? nullptr
                         : supplier->buildBulk(poolGuard.pool(), sweepPlan);
                     if (seedBulk != nullptr && sweepBulk != nullptr) {
-                      int64_t seedBudget = leafFloor;
+                      int64_t seedBudget =
+                          data->fieldCollector->predictedVisitFloor(
+                              sortSourceCost,
+                              seedDepth(data->fieldCollector->topCount));
                       if (fieldSortSeedBudgetPerMilleForTests > 0) {
                         seedBudget = std::max<int64_t>(
-                            1, leafFloor
+                            1, seedBudget
                                 * fieldSortSeedBudgetPerMilleForTests / 1000);
                       }
                       int64_t lambda = std::max<int64_t>(
@@ -2042,10 +2180,25 @@ public:
                       int64_t fillAbortBudget = std::max<int64_t>(
                           8, 4 * ((data->fieldCollector->topCount + lambda - 1)
                                   / lambda));
+                      // Further seeding rounds take fresh products of the
+                      // same independently re-plannable plan.
+                      auto nextSeedBulk = [&]() -> BulkScorer* {
+                        auto roundPlan = supplier->planBulk(
+                            Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                            matchWindowsContext);
+                        return roundPlan.available
+                                    == Query::ScorerSupplier::BulkAnswer::YES
+                                && roundPlan.supportsMatchWindows
+                                    == Query::ScorerSupplier::BulkAnswer::YES
+                            ? supplier->buildBulk(poolGuard.pool(), roundPlan)
+                            : nullptr;
+                      };
                       collectTopKMatchWindowedSeeded(
-                          segnum, seedBulk, sweepBulk, collectorFilter,
-                          *data->fieldCollector, poolGuard.pool(),
-                          seg.maxDoc(), seedBudget, fillAbortBudget);
+                          segnum, seedBulk, nextSeedBulk, sweepBulk,
+                          collectorFilter, *data->fieldCollector,
+                          poolGuard.pool(), seg.maxDoc(), seedBudget,
+                          fillAbortBudget,
+                          data->fieldCollector->bestLeavesLate(leafFloor));
                       data->fieldCollector->recordSegmentSkipStats(segnum);
                       usedBulk = true;
                     } else if (seedBulk != nullptr) {

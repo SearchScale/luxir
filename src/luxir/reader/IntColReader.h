@@ -343,34 +343,21 @@ private:
   InputStream columnIS;
   NumColumn values;
   const char* zoneMeta = nullptr;
-  const char* leafZoneMeta = nullptr;
-  const char* leavesByMin = nullptr;  // uint32 leaf ids, unaligned
-  const char* leavesByMax = nullptr;
-  const char* sketchPoints = nullptr;  // SketchPoints, unaligned
-  int64_t sketchCount = 0;
+  NumColumnFormat::LeafMeta leaves;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
 
-  // Zone metadata follows the block descriptors: block zones, leaf zones,
-  // the two leaf visit orders, then the value sketch (NumColumnWriter::
-  // finish). Returns where the bounds trailer starts.
+  // Zone metadata follows the block descriptors: block zones, then the leaf
+  // metadata (NumColumnFormat::LeafMeta). Returns where the bounds trailer
+  // starts.
   const char* locateZoneMeta(const char* blockMeta) {
     zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
-    leavesByMin = leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
-    leavesByMax = leavesByMin + numLeafZones() * sizeof(uint32_t);
-    const char* trailer = leavesByMax + numLeafZones() * sizeof(uint32_t);
-    if (numLeafZones() > 0) {
-      uint32_t count;
-      memcpy(&count, trailer, sizeof(count));
-      sketchCount = count;
-      sketchPoints = trailer + sizeof(count);
-      trailer = sketchPoints
-          + sketchCount * (int64_t)sizeof(NumColumnFormat::SketchPoint);
-    }
+    const char* trailer = nullptr;
+    leaves = NumColumnFormat::LeafMeta(
+        zoneMeta + numBlocks() * sizeof(NumBlockZone), nvals, trailer);
     return trailer;
   }
 
@@ -479,40 +466,12 @@ public:
   // Leaf `l` covers value ranks [l * LEAF_ZONE_SIZE,
   // min((l + 1) * LEAF_ZONE_SIZE, numValues)).
   int64_t numLeafZones() const {
-    return (nvals + NumColumnFormat::LEAF_ZONE_SIZE - 1)
-        / NumColumnFormat::LEAF_ZONE_SIZE;
+    return leaves.numLeafZones();
   }
 
-  NumBlockZone leafZone(int64_t leaf) const {
-    assert(leaf >= 0 && leaf < numLeafZones());
-    NumBlockZone zone;
-    memcpy(&zone, leafZoneMeta + leaf * sizeof(zone), sizeof(zone));
-    return zone;
-  }
-
-  // The persisted leaf visit orders (NumColumnFormat::leafVisitOrder): the
-  // leaf at `rank` ascending by (zone.min, leaf), and descending by zone.max
-  // with ties by ascending leaf.
-  int64_t leafByMinAscending(int64_t rank) const {
-    assert(rank >= 0 && rank < numLeafZones());
-    uint32_t leaf;
-    memcpy(&leaf, leavesByMin + rank * sizeof(leaf), sizeof(leaf));
-    return leaf;
-  }
-
-  int64_t leafByMaxDescending(int64_t rank) const {
-    assert(rank >= 0 && rank < numLeafZones());
-    uint32_t leaf;
-    memcpy(&leaf, leavesByMax + rank * sizeof(leaf), sizeof(leaf));
-    return leaf;
-  }
-
-  // The persisted value sketch (NumColumnFormat::ValueSketcher); empty for
-  // a column without values or written without a sketch.
-  NumColumnFormat::ValueSketch valueSketch() const {
-    if (sketchCount == 0) return {};
-    return {sketchPoints, sketchCount, nvals};
-  }
+  // The leaf zones, the persisted leaf visit orders and the value sketch
+  // as one copyable view (NumColumnFormat::LeafMeta).
+  const NumColumnFormat::LeafMeta& leafMeta() const { return leaves; }
 
   int32_t valuesInBlock(int64_t blockNum) const {
     return values.valuesInBlock(blockNum);
