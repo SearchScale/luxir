@@ -517,7 +517,7 @@ public:
   // zone maps are exact per-doc-block key bounds. Sparse and multi-valued
   // columns mix ranks and docs, so no bounds are offered there.
   int32_t keyBlockSize() const override {
-    if (!reader.has_value() || multiValued || docsIter.has_value()) return 0;
+    if (!reader.has_value() || !reader->leafBounded()) return 0;
     return (int32_t)NumColumnFormat::BLOCK_SIZE;
   }
 

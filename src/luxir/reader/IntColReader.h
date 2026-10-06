@@ -473,6 +473,10 @@ public:
   // as one copyable view (NumColumnFormat::LeafMeta).
   const NumColumnFormat::LeafMeta& leafMeta() const { return leaves; }
 
+  // Whether the leaf zones bound docs' keys: a dense single-valued column,
+  // where doc == value rank.
+  bool leafBounded() const { return !multiValued() && denseDocsWithValue(); }
+
   int32_t valuesInBlock(int64_t blockNum) const {
     return values.valuesInBlock(blockNum);
   }

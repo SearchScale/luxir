@@ -152,6 +152,13 @@ public:
     if (keys.batch == nullptr) return {};
     ExactDomainSortRoute route;
     route.card = card;
+    route.checkProgress = !forceFieldSortBestFirst;
+    route.gatherCapForTests = forceFieldSortWorkCapForTests;
+    if (!forceFieldSortBestFirst && ExactDomainSortCosts::scansOutright(card)) {
+      route.floor = keys.leafCount;
+      route.phase = ExactDomainSortPhase::SCAN;
+      return {keys, route};
+    }
     route.floor = collector.predictedVisitFloor(card);
     auto outside = collector.leavesOutsideValues;
     route.empty = outside.best;
@@ -176,8 +183,6 @@ public:
                keys.leafCount - route.outside, route.lead,
                collector.topCount},
               collector.leavesBeforeKeyFloor >= keys.leafCount);
-    route.checkProgress = !forceFieldSortBestFirst;
-    route.gatherCapForTests = forceFieldSortWorkCapForTests;
     return {keys, route};
   }
 
@@ -261,20 +266,24 @@ public:
   using SegmentKeys = FieldComparator::SegmentKeys;
 
   // The primary sort column's keys in every segment, by segment ord, for a
-  // sort the exact-domain driver can serve; empty otherwise.
+  // sort the exact-domain driver can serve; empty otherwise. Read from the
+  // reader's per-core leaf metadata (IndexReader::numericLeafMetas), the
+  // keys the collector's comparator offers once on the segment.
   static std::vector<std::optional<SegmentKeys>> fieldSortSegmentKeys(
       IndexReader& reader, const SortPlan& sortPlan,
       std::optional<Query::ValueEnvelope> envelope) {
     std::vector<std::optional<SegmentKeys>> keys;
     if (!fieldSortCanUseMaskedBestFirst(sortPlan)) return keys;
-    auto comparator =
-        sortPlan.clauses[0].getSortField().createComparator(&reader);
-    keys.reserve(reader.segments().size());
-    for (auto& segment : reader.segments()) {
-      comparator->setSegment(segment.ord, &segment.postingsReader());
-      auto* batch = comparator->keyBatch();
-      keys.push_back(batch == nullptr ? std::nullopt
-                                      : batch->segmentKeys(envelope));
+    const SortField& sortField = sortPlan.clauses[0].getSortField();
+    auto metas = reader.numericLeafMetas(sortField.getFieldName());
+    keys.reserve(metas->size());
+    for (const auto& meta : *metas) {
+      if (meta.has_value()) {
+        keys.emplace_back(std::in_place, *meta, sortField.isReversed(),
+                          envelope);
+      } else {
+        keys.emplace_back();
+      }
     }
     return keys;
   }

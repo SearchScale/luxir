@@ -1174,6 +1174,12 @@ struct ExactDomainSortCosts {
     return costs;
   }
 
+  // Whether a domain of `card` docs is scanned without planning: bound order
+  // visits at least one leaf, which costs more than scanning it.
+  static bool scansOutright(int64_t card) {
+    return (double)card <= kBoundOrderLeafCost;
+  }
+
   // A whole segment's plan: the cheapest phase, or the scan when no bound
   // can skip a leaf (`unskippable`).
   static ExactDomainSortPhase plan(const Rest& whole, bool unskippable) {

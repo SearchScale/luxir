@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
@@ -13,6 +14,7 @@
 #include "luxir/search/SortField.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
@@ -20,6 +22,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -394,6 +397,102 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
       }
     }
   }
+
+  // Field-sort planning reads the same leaf metadata from the reader's core,
+  // once: the dense single-valued column offers it in every segment, the
+  // sparse and multi-valued ones in none.
+  for (std::string_view field :
+       {"dense_i", "sparse_i", "dense_is", "sparse_is"}) {
+    auto metas = reader->numericLeafMetas(field);
+    ASSERT_EQ(2u, metas->size());
+    EXPECT_EQ(metas, reader->numericLeafMetas(field));
+    SimpleNumericFieldComparator comparator(std::string(field), true,
+                                            FieldComparator::MISSING_LAST);
+    for (auto& segment : reader->segments()) {
+      comparator.setSegment(segment.ord, &segment.postingsReader());
+      auto keys = comparator.keyBatch()->segmentKeys(std::nullopt);
+      const auto& meta = (*metas)[(size_t)segment.ord];
+      EXPECT_EQ(field == "dense_i", meta.has_value()) << field;
+      ASSERT_EQ(keys.has_value(), meta.has_value()) << field;
+      if (!meta.has_value()) continue;
+      FieldComparator::SegmentKeys cached(*meta, true, std::nullopt);
+      ASSERT_EQ(keys->leafCount(), cached.leafCount());
+      for (int64_t rank = 0; rank < cached.leafCount(); rank++) {
+        EXPECT_EQ(keys->boundOrderLeaf(rank).leaf,
+                  cached.boundOrderLeaf(rank).leaf);
+        EXPECT_EQ(keys->boundOrderLeaf(rank).bound,
+                  cached.boundOrderLeaf(rank).bound);
+      }
+    }
+  }
+}
+
+// A delete-only or an overlay-only commit opens a new snapshot core under
+// the same core generation, with fresh PostingsReaders. The cached leaf
+// metadata points into the mapped column bytes, so a multi-segment field
+// sort on the new core after the old reader is released must read only
+// mappings the new core holds. A file-backed directory unmaps on release;
+// RAMDir buffers would outlive the old core and hide a stale view.
+TEST_F(SortCollectorTest, fieldSortReadsLeafMetaFromItsOwnCore) {
+  bool savedOverlays = TestOverlayAuxReader::enabledForTests;
+  TestOverlayAuxReader::enabledForTests = true;
+  auto path = std::filesystem::temp_directory_path() / "luxir-fieldsort-reopen";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] {
+    TestOverlayAuxReader::enabledForTests = savedOverlays;
+    std::filesystem::remove_all(path);
+  });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  LuxirNode node(config);
+  CollectionHelper helper(node, "reopen");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  int32_t docId = 0;
+  for (int32_t docs : {3 * 512 + 17, 2 * 512, 700}) {
+    std::vector<Doc> batch;
+    for (int32_t i = 0; i < docs; i++, docId++) {
+      batch.push_back(flatdoc("id", std::to_string(docId), "id_s",
+                              std::to_string(docId), "time_i",
+                              (int64_t)docId));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT).success);
+  }
+  auto newest = [&] {
+    auto req = localReq(node.getSearchEngine());
+    req->collection("reopen");
+    auto& cur = req->topDocs("q").limit(5).fields({"id_s"});
+    cur.allQuery();
+    qb::sort(cur, "time_i", qb::DESC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
+  std::vector<std::string> expected;
+  for (int32_t doc = docId - 1; doc >= docId - 5; doc--) {
+    expected.push_back(std::to_string(doc));
+  }
+  auto reopen = [&](auto&& commit) {
+    std::weak_ptr<IndexReader> old = writer->snapshots.readers.getReader();
+    ASSERT_EQ(3u, old.lock()->segments().size());
+    uint64_t coreGen = old.lock()->coreGen();
+    EXPECT_EQ(expected, newest());  // caches the old core's leaf metadata
+    commit();
+    auto current = writer->snapshots.readers.getReader();
+    EXPECT_EQ(coreGen, current->coreGen());
+    EXPECT_TRUE(old.expired());  // its PostingsReaders unmapped the files
+    current.reset();
+    EXPECT_EQ(expected, newest());
+  };
+  reopen([&] {
+    ASSERT_TRUE(helper.deleteById("1", UpdateMessage::COMMIT).success);
+  });
+  reopen([&] {
+    helper.commit({std::string(TestOverlayAuxReader::NAME)});
+    ASSERT_FALSE(readDurableIndexInfo(writer->dir)->segments[0]
+                     .overlays.empty());
+  });
 }
 
 TEST_F(SortCollectorTest, keyGatherTieBreaksAcrossReversedSegments) {
