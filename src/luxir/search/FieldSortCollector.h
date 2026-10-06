@@ -196,6 +196,8 @@ public:
   // bounds.
   std::optional<FieldComparator::SegmentKeys> primaryKeys;
   int64_t leavesBeforeKeyFloor = 0;
+  // Leaves holding no value inside primaryValues (SegmentKeys::leavesOutside).
+  FieldComparator::SegmentKeys::Outside leavesOutsideValues;
   // Whether nextCompetitiveRange descends to leaves (descendsToLeaves),
   // decided at its first full-heap consult of a segment.
   enum class LeafDescent : uint8_t { UNDECIDED, ON, OFF };
@@ -302,9 +304,11 @@ public:
         && batch->leafBlockSize() != 0) {
       primaryKeys = batch->segmentKeys(primaryValues);
     }
+    leavesOutsideValues = {};
     if (primaryKeys.has_value() && primaryValues.has_value()) {
       leavesBeforeKeyFloor =
           primaryKeys->leavesBoundedBefore(primaryKeys->keyFloor());
+      leavesOutsideValues = primaryKeys->leavesOutside();
     }
     if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
   }
@@ -343,6 +347,29 @@ public:
     return std::min(bottomKey, segment.keyAt(before * k / (k + entering)));
   }
 
+  // The leaves a bound-driven traversal visits when the bottom settles at
+  // `bottom` over a domain of `card` docs: those bounded strictly before it,
+  // and of those bounded exactly at it only enough to hold the domain docs
+  // still needed at that key - the tie rule skips a leaf whose best key ties
+  // the bottom once the heap's tied entries come first in segdoc order, so
+  // a heavily tied bottom needs its first few tied leaves, not all of them.
+  static int64_t visitFloorAt(const FieldComparator::SegmentKeys& segment,
+                              int64_t bottom, int64_t card, int64_t topCount) {
+    int64_t strict = segment.leavesBoundedBefore(bottom);
+    int64_t tied = segment.leavesBoundedAtOrBefore(bottom) - strict;
+    if (tied <= 1) return strict + tied;
+    double before = segment.fractionBefore(bottom);
+    double through = bottom == std::numeric_limits<int64_t>::max()
+        ? 1.0 : segment.fractionBefore(bottom + 1);
+    double needed = std::max(1.0, (double)topCount - (double)card * before);
+    double perLeaf = (double)card * (through - before) / (double)tied;
+    if (perLeaf <= 0) return strict + tied;
+    // Clamped before the cast: a vanishing perLeaf sends the quotient past
+    // int64's range.
+    return strict
+        + (int64_t)std::clamp(std::ceil(needed / perLeaf), 1.0, (double)tied);
+  }
+
   // Leaves of the current segment bounded at or before the predicted
   // bottom (predictBottom) once its `card` domain docs are collected into
   // the heap as it stands: the leaves a bound-driven traversal is expected
@@ -357,24 +384,42 @@ public:
     int64_t heapSize = (int64_t)pq.size() * depth / topCount;
     auto bottom = predictBottom(*primaryKeys, card, depth, heapSize,
                                 bottomKey);
-    return bottom.has_value() ? primaryKeys->leavesBoundedAtOrBefore(*bottom)
-                              : primaryKeys->leafCount();
+    return bottom.has_value()
+        ? visitFloorAt(*primaryKeys, *bottom, card, depth)
+        : primaryKeys->leafCount();
   }
 
-  // Whether a doc-order walk of the current segment meets its best keys
-  // only at the end: every one of the floor's best-bounded leaves (the head
-  // of the persisted bound order, up to kHeadLeaves of them) lies in the
-  // second half of the segment, as for keys that improve with doc order
-  // sorted newest first. Such a walk matures its bottom only as it
-  // finishes. The column's bound order announces it; no traversal does.
+  // Where a doc-order walk of the current segment meets its best keys: the
+  // earliest leaf among the floor's best-bounded ones (the head of the
+  // persisted bound order past the leaves outside the envelope, which hold
+  // no domain doc; up to kHeadLeaves of them), or -1 when the floor holds
+  // none. The column's bound order announces it; no traversal does.
   static constexpr int64_t kHeadLeaves = 64;
-  bool bestLeavesLate(int64_t floor) const {
+  int64_t headLeaf(int64_t floor) const {
     assert(primaryKeys.has_value());
-    int64_t leaves = primaryKeys->leafCount();
-    for (int64_t rank = 0; rank < std::min(floor, kHeadLeaves); rank++) {
-      if (2 * primaryKeys->leafAt(rank) < leaves) return false;
+    int64_t from = std::min(leavesOutsideValues.best, floor);
+    int64_t to = std::min(floor, from + kHeadLeaves);
+    int64_t head = -1;
+    for (int64_t rank = from; rank < to; rank++) {
+      int64_t leaf = primaryKeys->leafAt(rank);
+      if (head < 0 || leaf < head) head = leaf;
     }
-    return floor > 0;
+    return head;
+  }
+
+  // Whether the segment's keys improve with doc order, so a doc-order walk
+  // meets them late and each doc it gathers beats the ones before it
+  // (SegmentKeys::docOrderTrend past half its range).
+  bool keysImproveWithDocOrder() const {
+    return primaryKeys.has_value() && primaryKeys->docOrderTrend() > 0.5;
+  }
+
+  // Whether a doc-order walk meets its best keys only in the second half of
+  // the segment, as for keys that improve with doc order sorted newest
+  // first: it then matures its bottom only as it finishes.
+  bool bestLeavesLate(int64_t floor) const {
+    int64_t head = headLeaf(floor);
+    return head >= 0 && 2 * head >= primaryKeys->leafCount();
   }
 
   int64_t bottomPrimaryKey() const {

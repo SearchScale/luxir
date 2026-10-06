@@ -7526,8 +7526,9 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   // Eight numeric leaf zones, uniform keys: depth 1 builds the membership,
   // whose predicted floor of two leaves the exact-domain driver serves in
-  // bound order; at depth 50 the floor covers all eight and the driver
-  // sweeps, so its plan must use offset + limit even though limit stays 1.
+  // bound order; at depth 50 the floor covers all eight and the driver walks
+  // the domain, so its plan must use offset + limit even though limit stays
+  // 1.
   BestFirstGuard bestFirst(false, false);
   for (int round = 0; round < 3; round++) {
     int32_t offset = round == 2 ? 49 : 0;
@@ -7549,7 +7550,8 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
       EXPECT_EQ(1, SkipStats::wholeFieldSortBestFirstActivations);
       EXPECT_EQ(0, SkipStats::wholeFieldSortLadderFallbacks);
       EXPECT_EQ(round == 1 ? 1 : 0, SkipStats::fieldSortBestFirstActivations);
-      EXPECT_EQ(round == 1 ? 0 : 1, SkipStats::fieldSortDocOrderSweeps);
+      EXPECT_EQ(round == 1 ? 0 : 1, SkipStats::fieldSortDocOrderSweeps
+                                        + SkipStats::fieldSortDomainScans);
     }
   }
 }

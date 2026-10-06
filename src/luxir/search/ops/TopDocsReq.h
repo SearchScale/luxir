@@ -118,15 +118,12 @@ public:
 
   // Every materialized domain whose sole numeric key offers masked leaf
   // bounds takes the exact-domain driver, whatever its cardinality or
-  // representation: the driver picks its phase by cost
-  // (ExactDomainSortCosts::choosePhase) from the predicted visit floor
+  // representation: the driver plans its phase by cost
+  // (ExactDomainSortCosts::plan) from the predicted visit floor
   // (FieldSortCollector::predictedVisitFloor: the leaves bounded at or
-  // before the bottom the heap is predicted to reach), the leaves bounded
-  // before the domain's key floor (a range on the sort field itself;
-  // FieldSortCollector::leavesBeforeKeyFloor), and the leaves the heap as it
-  // stands still admits (FieldSortCollector::leavesWithinBottom). A sweep or
-  // scan at a sub-saturating floor starts with a short bound-order probe
-  // when it can afford one (ExactDomainSortCosts::probeLeaves).
+  // before the bottom the heap is predicted to reach) and the leaves the
+  // heap as it stands still admits (FieldSortCollector::leavesWithinBottom),
+  // and re-plans the rest at checkpoints.
   struct ExactDomainSortPlan {
     FieldSortCollector::KeyBlockPlan keys;
     ExactDomainSortRoute route;
@@ -144,8 +141,10 @@ public:
     bool omitsWeight() const noexcept { return acceptedUse != nullptr; }
   };
 
+  // `firstDoc` and `lastDoc` span the domain in doc order.
   static ExactDomainSortPlan planExactDomainSort(
-      FieldSortCollector& collector, int64_t card) {
+      FieldSortCollector& collector, int64_t card, int32_t firstDoc,
+      int32_t lastDoc) {
     if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
       return {};
     }
@@ -153,20 +152,54 @@ public:
     if (keys.batch == nullptr) return {};
     ExactDomainSortRoute route;
     route.card = card;
-    route.expectedFloor = collector.predictedVisitFloor(card);
-    route.clipLeaves = collector.leavesBeforeKeyFloor;
-    int64_t withinBottom = collector.leavesWithinBottom();
+    route.floor = collector.predictedVisitFloor(card);
+    auto outside = collector.leavesOutsideValues;
+    route.empty = outside.best;
+    route.outside = std::min(keys.leafCount, outside.best + outside.worst);
+    // On keys that improve with doc order the walk meets the best keys a
+    // share of the way through the domain's span, and gathers that share of
+    // the inside leaves first; on keys in random order the best keys'
+    // places say nothing of the ones the walk meets before them.
+    int64_t head = lastDoc >= firstDoc && collector.keysImproveWithDocOrder()
+        ? collector.headLeaf(route.floor) : -1;
+    if (head >= 0) {
+      int64_t firstLeaf = firstDoc / keys.leafSize;
+      int64_t spanLeaves = lastDoc / keys.leafSize - firstLeaf + 1;
+      route.lead = std::clamp<int64_t>(head - firstLeaf, 0, spanLeaves)
+          * (keys.leafCount - route.outside) / spanLeaves;
+    }
     route.phase = forceFieldSortBestFirst
         ? ExactDomainSortPhase::BOUND_ORDER
-        : ExactDomainSortCosts::choosePhase(route.expectedFloor,
-                                            route.clipLeaves, withinBottom,
-                                            card, keys.leafCount);
+        : ExactDomainSortCosts::plan(
+              {card, keys.leafCount, route.floor,
+               collector.leavesWithinBottom(), route.empty,
+               keys.leafCount - route.outside, route.lead,
+               collector.topCount},
+              collector.leavesBeforeKeyFloor >= keys.leafCount);
     route.checkProgress = !forceFieldSortBestFirst;
     route.gatherCapForTests = forceFieldSortWorkCapForTests;
-    route.probeLeaves = ExactDomainSortCosts::probeLeaves(
-        route.phase, route.expectedFloor, route.clipLeaves, withinBottom,
-        card, keys.leafCount);
     return {keys, route};
+  }
+
+  // The first and last doc of a nonempty BITSET or ARRAY domain.
+  static void domainSpan(DocSet& domain, int32_t& first, int32_t& last) {
+    if (domain.type == DocSet::ARRAY) {
+      auto docs = ((ArrDocSet&)domain).docs();
+      if (docs.empty()) return;
+      first = docs.front();
+      last = docs.back();
+      return;
+    }
+    const FixedBitSet& bits = ((BitDocSet&)domain).bits();
+    std::span<const uint64_t> words(bits.words,
+                                    FixedBitSet::sizeInWords(bits.size()));
+    size_t w = 0;
+    while (w < words.size() && words[w] == 0) w++;
+    if (w == words.size()) return;
+    first = (int32_t)(w * 64 + std::countr_zero(words[w]));
+    w = words.size();
+    while (words[w - 1] == 0) w--;
+    last = (int32_t)((w - 1) * 64 + 63 - std::countl_zero(words[w - 1]));
   }
 
   // Seeded collection fixes its first pass before it sees a key, so it
@@ -314,7 +347,8 @@ public:
       auto predicted = FieldSortCollector::predictBottom(
           *segmentKeys, card, topCount, heapSize, bottom);
       floors[(size_t)s] = predicted.has_value()
-          ? segmentKeys->leavesBoundedAtOrBefore(*predicted)
+          ? FieldSortCollector::visitFloorAt(*segmentKeys, *predicted, card,
+                                             topCount)
           : segmentKeys->leafCount();
       if (heapSize + card >= topCount) {
         bottom = predicted.value_or(segmentKeys->keyAt(1));
@@ -2062,8 +2096,13 @@ public:
                           || domainSet->type == DocSet::ARRAY))) {
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
+                int32_t firstDoc = 0;
+                int32_t lastDoc = seg.maxDoc() - 1;
+                if (!allDocs) {
+                  domainSpan(*domainSet, firstDoc, lastDoc);
+                }
                 auto exactDomain = planExactDomainSort(
-                    *data->fieldCollector, card);
+                    *data->fieldCollector, card, firstDoc, lastDoc);
                 if (exactDomain.available()) {
                   if (!allDocs && domainSet->type == DocSet::ARRAY) {
                     collectTopKArrayDomain(

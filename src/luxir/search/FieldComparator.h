@@ -91,6 +91,22 @@ public:
       return {leaf, leafBestKey(leaf)};
     }
 
+    // How much later in doc order the best keys sit than the worst: the
+    // mean leaf of the kTrendLeaves best-bounded leaves less that of the
+    // kTrendLeaves worst, over the most it could be. Near 1 for keys that
+    // improve with doc order sorted newest first (time-ordered keys), near
+    // -1 sorted oldest first, and 0 +- 0.08 for keys in random order. Both
+    // ends of the persisted order are contiguous: a few cache lines.
+    static constexpr int64_t kTrendLeaves = 32;
+    double docOrderTrend() const {
+      int64_t n = leafCount();
+      int64_t m = std::min(kTrendLeaves, n / 2);
+      if (m == 0) return 0;
+      int64_t sum = 0;
+      for (int64_t r = 0; r < m; r++) sum += leafAt(r) - leafAt(n - 1 - r);
+      return (double)sum / (double)(m * (n - m));
+    }
+
     // Leaves bounded strictly before `key`: a prefix of bound order,
     // galloped from its head (most prefixes a top-k asks about are short).
     int64_t leavesBoundedBefore(int64_t key) const {
@@ -119,6 +135,44 @@ public:
     // The envelope's best edge as a key: every value inside the envelope
     // keys at or past it, so no leaf bounded before it can be proven out.
     int64_t keyFloor() const { return descending ? ~hi : lo; }
+
+    // Leaves holding no value inside the envelope, on its best side (their
+    // every key is before keyFloor, so bound order visits them first) and on
+    // its worst side: zones wholly below lo or wholly above hi. With no
+    // envelope, none. No domain doc lies in either.
+    struct Outside {
+      int64_t best = 0;
+      int64_t worst = 0;
+    };
+    Outside leavesOutside() const {
+      Outside out;
+      int64_t n = leafCount();
+      if (lo > hi) return {n, 0};
+      // Leaves whose max reaches lo are a prefix of the max-descending
+      // order, and leaves whose min reaches no further than hi a prefix of
+      // the min-ascending one.
+      auto prefix = [&](auto&& keep) {
+        int64_t a = 0;
+        int64_t b = n;
+        while (a < b) {
+          int64_t mid = a + (b - a) / 2;
+          if (keep(mid)) a = mid + 1;
+          else b = mid;
+        }
+        return a;
+      };
+      int64_t below = lo == std::numeric_limits<int64_t>::min() ? 0
+          : n - prefix([&](int64_t r) {
+              return leaves.leafZone(leaves.leafByMaxDescending(r)).max >= lo;
+            });
+      int64_t above = hi == std::numeric_limits<int64_t>::max() ? 0
+          : n - prefix([&](int64_t r) {
+              return leaves.leafZone(leaves.leafByMinAscending(r)).min <= hi;
+            });
+      out.best = descending ? above : below;
+      out.worst = descending ? below : above;
+      return out;
+    }
 
     // Expected number of the segment's values inside the envelope.
     double values() const { return inside; }
