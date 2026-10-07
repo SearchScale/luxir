@@ -266,8 +266,8 @@ public:
   using SegmentKeys = FieldComparator::SegmentKeys;
 
   // The primary sort column's keys in every segment, by segment ord, for a
-  // sort the exact-domain driver can serve; empty otherwise. Read from the
-  // reader's per-core leaf metadata (IndexReader::numericLeafMetas), the
+  // sort the exact-domain driver can serve; empty otherwise. Read from each
+  // segment's cached leaf metadata (PostingsReader::numericLeafMeta), the
   // keys the collector's comparator offers once on the segment.
   static std::vector<std::optional<SegmentKeys>> fieldSortSegmentKeys(
       IndexReader& reader, const SortPlan& sortPlan,
@@ -275,12 +275,10 @@ public:
     std::vector<std::optional<SegmentKeys>> keys;
     if (!fieldSortCanUseMaskedBestFirst(sortPlan)) return keys;
     const SortField& sortField = sortPlan.clauses[0].getSortField();
-    auto metas = reader.numericLeafMetas(sortField.getFieldName());
-    keys.reserve(metas->size());
-    for (const auto& meta : *metas) {
-      if (meta.has_value()) {
-        keys.emplace_back(std::in_place, *meta, sortField.isReversed(),
-                          envelope);
+    keys.reserve(reader.segments().size());
+    for (auto& segment : reader.segments()) {
+      if (const auto* meta = segment.postingsReader().numericLeafMeta(sortField.getFieldName())) {
+        keys.emplace_back(std::in_place, *meta, sortField.isReversed(), envelope);
       } else {
         keys.emplace_back();
       }

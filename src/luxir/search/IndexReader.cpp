@@ -5,7 +5,6 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
-#include "luxir/reader/IntColReader.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
@@ -365,33 +364,6 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
-
-// Built inline, not through getOrCreate's task group: one field lookup per
-// segment is cheap, a racing build is identical, and a request on a serial
-// engine starts no worker threads.
-std::shared_ptr<IndexReader::NumericLeafMetas> IndexReader::numericLeafMetas(
-    std::string_view field) {
-  std::string key(field);
-  if (auto metas = core->numericLeafMetas.get(key)) return metas;
-  auto metas = std::make_shared<NumericLeafMetas>();
-  metas->reserve(core->segs.size());
-  for (auto& segment : core->segs) {
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(segment.postingsReader());
-    std::optional<NumColumnFormat::LeafMeta> meta;
-    if (fieldReader.seek(field)) {
-      SegFieldInfo fieldInfo;
-      fieldReader.readFieldInfo(fieldInfo);
-      if (fieldInfo.columnLoc.offset() > 0) {
-        IntColReader column(segment.postingsReader(), fieldInfo);
-        if (column.leafBounded()) meta = column.leafMeta();
-      }
-    }
-    metas->push_back(meta);
-  }
-  core->numericLeafMetas.insert(key, metas);
-  return metas;
-}
 
 std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
   std::call_once(projectableOnce, [this] {

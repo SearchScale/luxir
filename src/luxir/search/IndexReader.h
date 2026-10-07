@@ -10,7 +10,6 @@
 
 #include "DocSet.h"
 #include "OrdMap.h"
-#include "luxir/codec/NumColumnFormat.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
@@ -164,11 +163,6 @@ public:
     bool derived;
   };
 
-  // A numeric column's leaf metadata in each segment, by segment ord: none
-  // where the segment's column does not bound docs' keys by leaf
-  // (IntColReader::leafBounded).
-  using NumericLeafMetas = std::vector<std::optional<NumColumnFormat::LeafMeta>>;
-
 private:
   friend class ReaderManager;
 
@@ -180,12 +174,6 @@ private:
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<SharedLazyMap<std::string, OrdMap>> ordMaps;
-    // Unlike the OrdMaps, which own their data, never shared with another
-    // core: the metadata views point into this core's mapped segment files.
-    // A delete- or overlay-only commit opens a new core under the same
-    // coreGeneration with fresh PostingsReaders, and releasing the previous
-    // reader unmaps the files its views read.
-    SharedLazyMap<std::string, NumericLeafMetas> numericLeafMetas;
     uint64_t coreGeneration = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
@@ -283,13 +271,6 @@ public:
       return OrdMap::build(field, *this);
     });
   }
-  
-  // Numeric column `field`'s leaf metadata in every segment. Physical and
-  // immutable, so read once per snapshot core rather than per request:
-  // field-sort planning reads every segment's keys, which on many small
-  // segments otherwise costs as much as the collection. The views point
-  // into segment files this core's PostingsReaders keep mapped.
-  std::shared_ptr<NumericLeafMetas> numericLeafMetas(std::string_view field);
 
   // Get the number of cached OrdMaps (for testing)
   size_t getOrdMapCacheSize() const {

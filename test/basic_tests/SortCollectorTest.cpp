@@ -398,23 +398,22 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
     }
   }
 
-  // Field-sort planning reads the same leaf metadata from the reader's core,
-  // once: the dense single-valued column offers it in every segment, the
-  // sparse and multi-valued ones in none.
+  // Field-sort planning reads the same leaf metadata from each segment's
+  // PostingsReader, once: the dense single-valued column offers it in every
+  // segment, the sparse and multi-valued ones in none.
+  ASSERT_EQ(2u, reader->segments().size());
   for (std::string_view field :
        {"dense_i", "sparse_i", "dense_is", "sparse_is"}) {
-    auto metas = reader->numericLeafMetas(field);
-    ASSERT_EQ(2u, metas->size());
-    EXPECT_EQ(metas, reader->numericLeafMetas(field));
     SimpleNumericFieldComparator comparator(std::string(field), true,
                                             FieldComparator::MISSING_LAST);
     for (auto& segment : reader->segments()) {
       comparator.setSegment(segment.ord, &segment.postingsReader());
       auto keys = comparator.keyBatch()->segmentKeys(std::nullopt);
-      const auto& meta = (*metas)[(size_t)segment.ord];
-      EXPECT_EQ(field == "dense_i", meta.has_value()) << field;
-      ASSERT_EQ(keys.has_value(), meta.has_value()) << field;
-      if (!meta.has_value()) continue;
+      const auto* meta = segment.postingsReader().numericLeafMeta(field);
+      EXPECT_EQ(meta, segment.postingsReader().numericLeafMeta(field));
+      EXPECT_EQ(field == "dense_i", meta != nullptr) << field;
+      ASSERT_EQ(keys.has_value(), meta != nullptr) << field;
+      if (meta == nullptr) continue;
       FieldComparator::SegmentKeys cached(*meta, true, std::nullopt);
       ASSERT_EQ(keys->leafCount(), cached.leafCount());
       for (int64_t rank = 0; rank < cached.leafCount(); rank++) {
@@ -428,11 +427,12 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
 }
 
 // A delete-only or an overlay-only commit opens a new snapshot core under
-// the same core generation, with fresh PostingsReaders. The cached leaf
-// metadata points into the mapped column bytes, so a multi-segment field
-// sort on the new core after the old reader is released must read only
-// mappings the new core holds. A file-backed directory unmaps on release;
-// RAMDir buffers would outlive the old core and hide a stale view.
+// the same core generation, with fresh PostingsReaders. The leaf metadata a
+// field sort plans from points into the mapped column bytes, so it lives on
+// the PostingsReader that maps them: a multi-segment field sort on the new
+// core after the old reader is released must read only mappings the new core
+// holds. A file-backed directory unmaps on release; RAMDir buffers would
+// outlive the old core and hide a stale view.
 TEST_F(SortCollectorTest, fieldSortReadsLeafMetaFromItsOwnCore) {
   bool savedOverlays = TestOverlayAuxReader::enabledForTests;
   TestOverlayAuxReader::enabledForTests = true;
@@ -477,7 +477,7 @@ TEST_F(SortCollectorTest, fieldSortReadsLeafMetaFromItsOwnCore) {
     std::weak_ptr<IndexReader> old = writer->snapshots.readers.getReader();
     ASSERT_EQ(3u, old.lock()->segments().size());
     uint64_t coreGen = old.lock()->coreGen();
-    EXPECT_EQ(expected, newest());  // caches the old core's leaf metadata
+    EXPECT_EQ(expected, newest());  // reads each segment's leaf metadata
     commit();
     auto current = writer->snapshots.readers.getReader();
     EXPECT_EQ(coreGen, current->coreGen());
