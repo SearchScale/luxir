@@ -363,6 +363,37 @@ TEST_F(DirectoryTest, checkedDirThrowsOnUnsyncedExpectSynced) {
   ASSERT_NO_THROW(dir.openFile("foo", true));
 }
 
+// Readers share open segments instead of reopening their files, so it is
+// publication that checks a root references only synced files.
+TEST_F(DirectoryTest, checkedDirThrowsOnPublishingUnsyncedFiles) {
+  auto ram = std::make_shared<RAMDir>();
+  CheckedDirectory dir(ram, CheckedDirMode::THROW);
+  auto f = dir.createFile("s01_00");
+  OutputStream os;
+  os.setFile(f.get());
+  os.write("data", 4);
+  os.close();
+  dir.finishFile(*f);
+
+  api::FileDescriptor file{"s01_00", 4, 0};
+  api::SegmentInfo segment;
+  segment.seg_id = 1;
+  segment.max_doc = 1;
+  segment.files = std::span<const api::FileDescriptor>(&file, 1);
+  api::IndexInfo info;
+  info.incarnation = "0123456789abcdef";
+  info.index_gen = 1;
+  info.segments = std::span<const api::SegmentInfo>(&segment, 1);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(info, bytes));
+  EXPECT_THROW(Manifest::commit(dir, 1, bytes), std::runtime_error);
+  EXPECT_EQ(nullptr, dir.openFile(Manifest::name(1)));
+
+  std::vector<std::string> syncFiles = {"s01_00"};
+  dir.sync(syncFiles);
+  EXPECT_NO_THROW(Manifest::commit(dir, 1, bytes));
+}
+
 TEST_F(DirectoryTest, checkedDirWarnMode) {
   auto ram = std::make_shared<RAMDir>();
   CheckedDirectory dir(ram, CheckedDirMode::WARN);

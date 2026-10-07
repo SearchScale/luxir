@@ -29,8 +29,8 @@ class CheckedDirectory : public Directory {
   boost::unordered_flat_set<std::string> unsyncedFiles_;
   std::mutex mu_;
 
-  void reportUnsyncedRead(const std::string& name) {
-    std::string msg = "CheckedDirectory: expectSynced openFile on unsynced file: " + name;
+  void reportUnsynced(std::string_view operation, const std::string& name) {
+    std::string msg = "CheckedDirectory: " + std::string(operation) + " of unsynced file: " + name;
     if (mode_ == CheckedDirMode::THROW) {
       throw std::runtime_error(msg);
     } else {
@@ -51,11 +51,20 @@ public:
       std::lock_guard lock(mu_);
       auto it = unsyncedFiles_.find(std::string(name));
       if (it != unsyncedFiles_.end()) {
-        reportUnsyncedRead(*it);
+        reportUnsynced("expectSynced openFile", *it);
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, expectSynced);
     return delegate_->openFile(name, expectSynced);
+  }
+
+  // Readers share an open segment rather than reopening it, so most reads
+  // never reach openFile(expectSynced): publication checks every file.
+  void expectSynced(std::span<const FileDescriptor> files) override {
+    std::lock_guard lock(mu_);
+    for (const auto& file : files) {
+      if (unsyncedFiles_.contains(file.name)) reportUnsynced("publication", file.name);
+    }
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {

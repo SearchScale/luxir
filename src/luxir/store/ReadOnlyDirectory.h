@@ -41,6 +41,10 @@ public:
     return delegate_->openFile(name, expectSynced);
   }
 
+  void expectSynced(std::span<const FileDescriptor> files) override {
+    delegate_->expectSynced(files);
+  }
+
   std::unique_ptr<File> createFile(std::string_view name) override {
     reject(std::string("createFile(") + std::string(name) + ")");
   }

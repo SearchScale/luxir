@@ -1642,13 +1642,26 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 // miss and each create a PostingsReader for a source segment - both are valid,
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
 // "fix" this into synchronization.
+//
 std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& seg) {
   auto pr = seg.sharedPostingsReader.load();
-  if (!pr) {
-    pr = std::make_shared<PostingsReader>(dir, seg.segId);
-    seg.sharedPostingsReader.store(pr);
-  }
+  if (pr) return pr;
+  std::shared_ptr<IndexReader> reader;
+  if (const auto* published = publishedSegment(seg, reader)) pr = published->postingsReaderShared();
+  if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
+  seg.sharedPostingsReader.store(pr);
   return pr;
+}
+
+// The published reader's segment of the same id is the same physical segment:
+// segment ids are never reused within an incarnation (lastSegId persists in
+// the manifest, and rewinding it starts a new incarnation and a new reader
+// lineage). The reader may lag this writer, never lead it.
+const Segment* IndexWriter::publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader) {
+  reader = snapshots.readers.indexReader.load(std::memory_order_acquire);
+  if (!reader || reader->incarnation() != lastSnapshot.load()->id.incarnation) return nullptr;
+  const auto* segment = reader->findSegment(seg.segId);
+  return segment != nullptr && segment->maxDoc() == seg.maxDoc ? segment : nullptr;
 }
 
 void IndexWriter::seedActiveVectorOverlayNamesFromManifestLocked() {
@@ -1901,20 +1914,28 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   if (!api::encode(info, serialized)) throw std::runtime_error("Failed to serialize IndexInfo");
   auto digest = CommitSnapshot::digestOf(serialized);
 
+  // The segments this writer owns, current or awaiting retirement, and the
+  // ones of this snapshot it holds open, for the reader that opens it.
+  boost::unordered_flat_map<uint64_t, SegInfo*> ownedSegments;
+  std::vector<std::weak_ptr<PostingsReader>> openReaders(info.segments.size());
+  {
+    std::lock_guard lock(indexMutex);
+    for (const auto& [id, seg] : segInfos) ownedSegments.emplace(id, seg.get());
+    for (const auto& seg : segmentsToDelete) ownedSegments.emplace(seg->segId, seg.get());
+    for (size_t i = 0; i < info.segments.size(); i++) {
+      auto owned = ownedSegments.find(info.segments[i].seg_id);
+      if (owned != ownedSegments.end()) openReaders[i] = owned->second->sharedPostingsReader.load();
+    }
+  }
   auto snapshot = std::make_shared<const CommitSnapshot>(
       std::make_shared<const std::vector<std::byte>>(std::move(serialized)), schema,
-      CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info), digest);
+      CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info), digest,
+      std::move(openReaders));
   std::pmr::monotonic_buffer_resource retirementArena;
   api::IndexInfo obsolete;
   if (previous) obsolete = Manifest::decode(previous->bytes, retirementArena);
   boost::unordered_flat_set<std::string> retainedFiles;
   if (previous) {
-    boost::unordered_flat_set<uint64_t> ownedSegments;
-    {
-      std::lock_guard lock(indexMutex);
-      for (const auto& [id, seg] : segInfos) ownedSegments.insert(id);
-      for (const auto& seg : segmentsToDelete) ownedSegments.insert(seg->segId);
-    }
     // A merge may have captured an older liveGen without opening it yet.
     // Segment retirement handles data and liveDocs separately, preserving only
     // published/current liveDocs and the generation a merge actually captured.
@@ -2265,11 +2286,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     std::vector<std::shared_ptr<PostingsReader>> preaders;
     preaders.reserve(segs.size());
     for (auto segInfo : segs) {
-      preaders.emplace_back(segInfo->sharedPostingsReader.load());
-      if (!preaders.back()) {
-        preaders.back() = std::make_shared<PostingsReader>(dir, segInfo->segId);
-        segInfo->sharedPostingsReader.store(preaders.back());
-      }
+      preaders.emplace_back(getSegmentPostingsReader(*segInfo));
     }
 
     phase = "load_live_docs";
@@ -2989,13 +3006,20 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   MemPool& pool = guard.pool();
 
   // Read the segment to find documents that should be deleted
-  PostingsReader reader(dir, seg.segId);
+  auto sharedReader = getSegmentPostingsReader(seg);
+  PostingsReader& reader = *sharedReader;
   int32_t maxDocId = reader.maxDoc();
 
-  // Load existing LiveDocs if they exist
+  // Load existing LiveDocs if they exist: the published reader's when it
+  // holds this generation
   std::shared_ptr<LiveDocs> existingLiveDocs;
   if (seg.liveGen > 0) {
-    existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
+    std::shared_ptr<IndexReader> publishedReader;
+    const auto* published = publishedSegment(seg, publishedReader);
+    if (published != nullptr && published->segInfo.live_gen == seg.liveGen) {
+      existingLiveDocs = published->liveDocsShared();
+    }
+    if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
   }
 
   // We'll allocate the FixedBitSet only when we find the first new delete

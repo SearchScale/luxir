@@ -1652,4 +1652,43 @@ TEST_F(ReplicationFollowerTest, corruptPeerCopiesAreFetchedAgainFromTheSource) {
   EXPECT_GT(fromSource.load(), 0);
 }
 
+// A replica reopens each installed snapshot from the reader it serves: an
+// unchanged segment keeps its PostingsReader and live docs, a changed one
+// only its PostingsReader, and a new one is opened.
+TEST_F(ReplicationFollowerTest, replicaReopenSharesUnchangedSegments) {
+  startSource(); startFollower();
+  CollectionHelper h(*source, "main");
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "c"), flatdoc("id", "d")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  auto& readers = follower->getCollection("main")->getReaderManager();
+  auto before = readers.getReader();
+  ASSERT_EQ(2u, before->segments().size());
+  ASSERT_TRUE(h.deleteById("c", UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  auto deleted = readers.getReader();
+  ASSERT_EQ(2u, deleted->segments().size());
+  EXPECT_EQ(2, deleted->liveDocs());
+  for (size_t i = 0; i < 2; i++) {
+    EXPECT_EQ(&before->segments()[i].postingsReader(), &deleted->segments()[i].postingsReader());
+  }
+  EXPECT_EQ(before->segments()[0].liveDocs(), deleted->segments()[0].liveDocs());
+  EXPECT_NE(nullptr, deleted->segments()[1].liveDocs());
+  ASSERT_TRUE(h.index(flatdoc("id", "e"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  auto added = readers.getReader();
+  ASSERT_EQ(3u, added->segments().size());
+  for (size_t i = 0; i < 2; i++) {
+    EXPECT_EQ(&deleted->segments()[i].postingsReader(), &added->segments()[i].postingsReader());
+    EXPECT_EQ(deleted->segments()[i].liveDocs(), added->segments()[i].liveDocs());
+  }
+  before.reset();
+  deleted.reset();
+  HttpReq search(followerServer->getPort());
+  search.matchQuery("id", "d").withStats().execute();
+  EXPECT_EQ(200, search.status());
+  EXPECT_EQ(1, search.found());
+}
+
 }

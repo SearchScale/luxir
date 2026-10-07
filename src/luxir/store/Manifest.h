@@ -127,8 +127,14 @@ struct Manifest {
   // never leaves a partial root and never removes one that already existed; an
   // identical existing root (an interrupted earlier commit) is only re-synced.
   // After a failure the root's durability is unknown. `source` identifies the
-  // committer to failure-injection signals.
+  // committer to failure-injection signals. Every file the root references
+  // must already be synced (Directory::expectSynced).
   static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, void* source = nullptr) {
+    {
+      std::pmr::monotonic_buffer_resource arena;
+      api::IndexInfo info;
+      if (api::decode(info, api::copyToPaddedInput(bytes, arena), arena)) dir.expectSynced(filesOf(info));
+    }
     Bytes existing;
     try { existing = read(dir, gen); }
     catch (const FileIOException&) {} // an unreadable root is what a repair replaces

@@ -23,7 +23,9 @@ class DocsEnum;
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
-// This does not contain deleted docs, so instances can be shared by different index versions.
+// This does not contain deleted docs, so one instance serves every index snapshot that holds the segment
+// (IndexReader::openSnapshot shares it from the writer or the previous snapshot, and the writer from
+// the published snapshot), and with it the views derived from the segment's bytes that it caches.
 class PostingsReader {
   // Indexed by physical filenum and intentionally sparse. Segment finalize
   // folds buffered streams without renaming survivors, which keeps already

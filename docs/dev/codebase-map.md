@@ -26,7 +26,9 @@ locations, browse `src/luxir/<area>/`.
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
-   - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment
+   - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment;
+     a reopen shares each unchanged segment's `PostingsReader` and live docs with the previous
+     snapshot, and the writer's open segments in both directions
      - Physical field catalog records available columns and stored resources;
        logical retrieval discovery is cached per reader and schema identity
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
@@ -37,7 +39,9 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `PostingsReader` reads a single segment and owns the open files for that segment
+   - `PostingsReader` reads a single segment and owns the open files for that segment, plus
+     views derived from its immutable bytes (numeric leaf metadata), which therefore live
+     exactly as long as the mapped files
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.

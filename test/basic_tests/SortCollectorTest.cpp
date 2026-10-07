@@ -427,13 +427,13 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
 }
 
 // A delete-only or an overlay-only commit opens a new snapshot core under
-// the same core generation, with fresh PostingsReaders. The leaf metadata a
-// field sort plans from points into the mapped column bytes, so it lives on
-// the PostingsReader that maps them: a multi-segment field sort on the new
-// core after the old reader is released must read only mappings the new core
-// holds. A file-backed directory unmaps on release; RAMDir buffers would
-// outlive the old core and hide a stale view.
-TEST_F(SortCollectorTest, fieldSortReadsLeafMetaFromItsOwnCore) {
+// the same core generation. The leaf metadata a field sort plans from points
+// into the mapped column bytes, so it lives on the segment's PostingsReader,
+// which the new core shares: a multi-segment field sort after the old reader
+// is released must read only mappings a live holder keeps. A file-backed
+// directory unmaps with the last holder; RAMDir buffers would hide a stale
+// view.
+TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
   bool savedOverlays = TestOverlayAuxReader::enabledForTests;
   TestOverlayAuxReader::enabledForTests = true;
   auto path = std::filesystem::temp_directory_path() / "luxir-fieldsort-reopen";
@@ -478,10 +478,15 @@ TEST_F(SortCollectorTest, fieldSortReadsLeafMetaFromItsOwnCore) {
     ASSERT_EQ(3u, old.lock()->segments().size());
     uint64_t coreGen = old.lock()->coreGen();
     EXPECT_EQ(expected, newest());  // reads each segment's leaf metadata
+    const auto* meta =
+        old.lock()->segments()[0].postingsReader().numericLeafMeta("time_i");
+    ASSERT_NE(nullptr, meta);
     commit();
     auto current = writer->snapshots.readers.getReader();
     EXPECT_EQ(coreGen, current->coreGen());
-    EXPECT_TRUE(old.expired());  // its PostingsReaders unmapped the files
+    EXPECT_TRUE(old.expired());
+    EXPECT_EQ(meta,
+              current->segments()[0].postingsReader().numericLeafMeta("time_i"));
     current.reset();
     EXPECT_EQ(expected, newest());
   };

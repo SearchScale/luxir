@@ -59,8 +59,11 @@ public:
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
-    // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
-    // or by IndexReader opening code.
+    // The segment's open PostingsReader once the writer needed one (deletes, a merge, an overlay
+    // build); kept until the segment is retired. Shared both ways with readers: filled from the
+    // published IndexReader when that holds the segment, and handed to readers that open a
+    // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
+    // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
 
     // Schema generation this segment was indexed under.
@@ -678,6 +681,10 @@ private:
   void buildSegmentOverlays(const UpdateMessage& msg,
                             std::span<SegInfo*> segsToKeep,
                             std::vector<std::string>& outFilesToSync);
+  // The published reader's copy of `seg`, or null; `reader` keeps it valid.
+  const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
+  // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
+  // slot keeps it.
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
