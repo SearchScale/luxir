@@ -2155,19 +2155,12 @@ public:
             if (!usedBulk && supplier == nullptr) {
               supplier = obtainMainSupplier();
             }
-            // Seeded two-pass query-driven route: no materialized domain
-            // exists (else the exact-domain driver took it), but the sole
-            // dense numeric primary still publishes leaf bounds, so the
-            // driver fills the heap from the best-bounded leaves (the head
-            // of the persisted bound order) via one bulk scorer and sweeps
-            // the complement with a second, independent one. Needs a
-            // supplier whose bulk plans declare independentReplan (both
-            // products are built before pass 1, and each further seeding
-            // round's after earlier products ran), a nonzero sub-saturating
-            // predicted visit floor with material headroom (4*floor+64 <
-            // leafCount), and at least one expected match per leaf.
-            // forceFieldSortSeeding bypasses only the two economic gates,
-            // never correctness or capability.
+            // Pre-fill from the best-bounded leaves, then reposition the same
+            // unscored product for the competitive sweep. The resolved plan
+            // includes every executing child and any integrated filters.
+            // Admission prices joint yield, production, seeks and sweep
+            // windows (QueryDrivenSeedCosts); forceFieldSortSeeding bypasses
+            // only that economics, never capability.
             if (!usedBulk && supplier != nullptr && !captureSharedRaw
                 && maySkipNoncompetitiveDocs && !disableFieldSortSeeding
                 && !disableFieldSortBulk && !requiresWholeIndexPrepare
@@ -2177,21 +2170,44 @@ public:
               auto plan = data->fieldCollector->maskedKeyBlockPlan();
               if (plan.batch != nullptr && plan.blockCount > 0
                   && sortSourceCost > 0) {
-                // Budget and materiality are both in leaf units (pass 1
-                // enumerates leaves). Leaf-normalized materiality measured
-                // BETTER than preserving the coarse-era activation envelope:
-                // it admits the 1% band, where seeding takes the walk from
-                // 1.66x the leaf floor to floor+O(1) and the second scorer
-                // costs far less than the excess it removes. Seeding is
-                // decided at the depth-k floor and sized at seedDepth's. A
-                // floor of zero (a full heap no leaf can beat) leaves the
-                // single competitive walk nothing to skip past.
-                int64_t leafFloor = data->fieldCollector->predictedVisitFloor(
-                    sortSourceCost);
-                bool material = leafFloor > 0
-                    && 4 * leafFloor + 64 < plan.leafCount
-                    && sortSourceCost >= plan.leafCount;
-                if (material || forceFieldSortSeeding) {
+                auto work = supplier->membershipWork(seg.maxDoc());
+                if (collectorFilter != nullptr) {
+                  work.produce += 8 * work.matches;
+                  double density = (double)collectorFilter->card() / seg.maxDoc();
+                  work.matches *= density;
+                  work.savedProduce *= density;
+                  work.window += 64;
+                }
+                auto& fieldCollector = *data->fieldCollector;
+                int64_t jointCard = (int64_t)std::max(1.0, work.matches);
+                int64_t leafFloor = fieldCollector.predictedVisitFloor(jointCard);
+                int64_t seedBudget = fieldCollector.predictedVisitFloor(
+                    jointCard, seedDepth(fieldCollector.topCount));
+                bool startable = leafFloor > 0 && seedBudget > 0;
+                // The rest of the price reads the bound order's head and the
+                // doc-order trend: once per segment, and only for a schedule
+                // that could start. Many-segment indexes pay it per segment.
+                std::optional<QueryDrivenSeedCosts> seedCosts;
+                if (startable || forceFieldSortSeeding) {
+                  auto outside = fieldCollector.leavesOutsideValues;
+                  int64_t inside = plan.leafCount
+                      - std::min(plan.leafCount, outside.best + outside.worst);
+                  double trend = fieldCollector.primaryKeys->docOrderTrend();
+                  int64_t head = fieldCollector.headLeaf(leafFloor);
+                  int64_t lead = head < 0 || trend <= 0.5 ? 0
+                      : head * inside / std::max<int64_t>(1, plan.leafCount);
+                  seedCosts.emplace(QueryDrivenSeedCosts{
+                      work, {jointCard, plan.leafCount, leafFloor,
+                             fieldCollector.leavesWithinBottom(),
+                             outside.best, inside, lead, fieldCollector.topCount},
+                      head >= 0 && 2 * head >= fieldCollector.primaryKeys->leafCount(),
+                      plan.leafSize, trend});
+                }
+                // Before selecting leaves use a complete-prefix seek price.
+                // Actual round positions refine it after selection.
+                bool profitable = startable
+                    && seedCosts->worth(0, 0, seedBudget, 1, leafFloor, work.matches);
+                if (profitable || forceFieldSortSeeding) {
                   matchWindowsPlan = supplier->planBulk(
                       Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
                       matchWindowsContext);
@@ -2200,61 +2216,21 @@ public:
                           == Query::ScorerSupplier::BulkAnswer::YES
                       && bulkPlan.supportsMatchWindows
                           == Query::ScorerSupplier::BulkAnswer::YES
-                      && bulkPlan.independentReplan
+                      && bulkPlan.supportsReposition()
                           == Query::ScorerSupplier::BulkAnswer::YES
                       && !bulkPlan.hasConstantCount()) {
-                    auto sweepPlan = supplier->planBulk(
-                        Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                        matchWindowsContext);
-                    auto* seedBulk =
-                        supplier->buildBulk(poolGuard.pool(), bulkPlan);
+                    auto* bulk = supplier->buildBulk(poolGuard.pool(), bulkPlan);
                     matchWindowsPlan.reset();  // consumed by the build
-                    auto* sweepBulk = seedBulk == nullptr ? nullptr
-                        : supplier->buildBulk(poolGuard.pool(), sweepPlan);
-                    if (seedBulk != nullptr && sweepBulk != nullptr) {
-                      int64_t seedBudget =
-                          data->fieldCollector->predictedVisitFloor(
-                              sortSourceCost,
-                              seedDepth(data->fieldCollector->topCount));
+                    if (bulk != nullptr) {
                       if (fieldSortSeedBudgetPerMilleForTests > 0) {
                         seedBudget = std::max<int64_t>(
                             1, seedBudget
                                 * fieldSortSeedBudgetPerMilleForTests / 1000);
                       }
-                      int64_t lambda = std::max<int64_t>(
-                          1, sortSourceCost / plan.leafCount);
-                      int64_t fillAbortBudget = std::max<int64_t>(
-                          8, 4 * ((data->fieldCollector->topCount + lambda - 1)
-                                  / lambda));
-                      // Further seeding rounds take fresh products of the
-                      // same independently re-plannable plan.
-                      auto nextSeedBulk = [&]() -> BulkScorer* {
-                        auto roundPlan = supplier->planBulk(
-                            Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                            matchWindowsContext);
-                        return roundPlan.available
-                                    == Query::ScorerSupplier::BulkAnswer::YES
-                                && roundPlan.supportsMatchWindows
-                                    == Query::ScorerSupplier::BulkAnswer::YES
-                            ? supplier->buildBulk(poolGuard.pool(), roundPlan)
-                            : nullptr;
-                      };
                       collectTopKMatchWindowedSeeded(
-                          segnum, seedBulk, nextSeedBulk, sweepBulk,
+                          segnum, bulk,
                           collectorFilter, *data->fieldCollector,
-                          poolGuard.pool(), seg.maxDoc(), seedBudget,
-                          fillAbortBudget,
-                          data->fieldCollector->bestLeavesLate(leafFloor));
-                      data->fieldCollector->recordSegmentSkipStats(segnum);
-                      usedBulk = true;
-                    } else if (seedBulk != nullptr) {
-                      // The pass-2 product failed to build; the untouched
-                      // pass-1 product runs today's single-pass walk.
-                      skipCount(SkipStats::fieldSortBulkCollections);
-                      collectTopKMatchWindowed(
-                          segnum, seedBulk, collectorFilter, builderPtr,
-                          *data->fieldCollector, seg.maxDoc(),
-                          maySkipNoncompetitiveDocs);
+                          poolGuard.pool(), seg.maxDoc(), seedBudget, *seedCosts);
                       data->fieldCollector->recordSegmentSkipStats(segnum);
                       usedBulk = true;
                     }

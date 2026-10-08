@@ -143,6 +143,12 @@ public:
 
     int64_t cost() override { return segment.maxDoc(); }
 
+    MembershipWork membershipWork(int32_t maxDoc) override {
+      unused(maxDoc);
+      double matches = (double)cost();
+      return {matches, 4 * matches, 0, 32, 64};
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
       unused(buildContext);

@@ -250,6 +250,15 @@ public:
         return weight.cachedTermInfo->docFreq(segment.ord);
       }
 
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        unused(maxDoc);
+        double df = (double)cost();
+        // Warm exhaustive production costs about 14-16 instructions per
+        // dense posting; sparse windows retain roughly 700 instructions of
+        // dispatch/navigation. Round upward for admission, not execution.
+        return {df, 16 * df, std::ceil(df / DocsEnumMeta::L1_DOCS), 85, 1024, 8 * df};
+      }
+
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         unused(buildContext);
@@ -302,9 +311,6 @@ public:
           BulkAnswer::NO,
         };
         plan.acceptsWindowFilter = BulkAnswer::YES;
-        // Every build constructs a fresh scorer and enum from immutable
-        // cached term state, so coexisting plans are trivially disjoint.
-        plan.independentReplan = BulkAnswer::YES;
         if (!weight.needsScores() && isMembershipWindowUse(use)) {
           plan.statelessReposition = BulkAnswer::YES;
         }

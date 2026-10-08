@@ -783,18 +783,6 @@ public:
       // the owner hook. Stateless leaves record their complete answer here.
       // Neither route is consulted during ordinary forward iteration.
       BulkAnswer statelessReposition = BulkAnswer::NO;
-      // YES declares that another planBulk() call on this supplier with an
-      // identical context may coexist with this plan: neither call
-      // invalidates the other, their build states are disjoint, each plan is
-      // built at most once, and both products enumerate the same exact
-      // matches under the same filter contract. That holds whenever the
-      // plans are made and built, also after an earlier product has run:
-      // no product's progress touches the supplier. Consumers that need
-      // several independent forward executions require YES; the seeded
-      // field-sort driver builds its first seed and sweep products before
-      // either runs, and each further seeding round's product after the
-      // earlier ones have advanced.
-      BulkAnswer independentReplan = BulkAnswer::NO;
 
       [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
         if (buildState == nullptr) return statelessReposition;
@@ -828,6 +816,42 @@ public:
     /// to compute; an upper bound is safe. Compound suppliers use it to choose
     /// lead iterators before creating scorers.
     virtual int64_t cost() = 0;
+
+    // Cold membership economics, separate from reset availability and from
+    // cost(), whose upper bound serves lead selection. Instructions are used
+    // here so the linear L1 prefix walk is priced in the same units as fills.
+    struct MembershipWork {
+      double matches = 0;
+      double produce = 0;       // one complete traversal, excluding collection
+      double seekSteps = 0;     // L1 prefix steps through the complete segment
+      double reset = 0;
+      double window = 0;        // dispatch/initialization for a bounded fill
+      // Savings need a conservative credit, separate from the debit prior. Unknown
+      // routes earn no production credit; a parent cannot sum child credits
+      // because candidate-driven execution may never produce their full dfs.
+      double savedProduce = 0;
+
+      void addWork(const MembershipWork& child) {
+        produce += child.produce;
+        seekSteps += child.seekSteps;
+        reset += child.reset;
+        window += child.window;
+      }
+
+      double seek(double fraction) const {
+        // Dense-term late seeks cost about 68 instructions per L1 prefix
+        // step above first-leaf production; round upward for admission.
+        return reset + 74 * seekSteps * std::clamp(fraction, 0.0, 1.0);
+      }
+    };
+
+    virtual MembershipWork membershipWork(int32_t maxDoc) {
+      double matches = (double)std::min<int64_t>(cost(), maxDoc);
+      // Unknown producers get a conservative scalar-verification price.
+      // Materialized membership has no verifier or postings-prefix restart.
+      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64};
+      return {matches, 128.0 * maxDoc, 0, 1024, 256};
+    }
 
     /// Pure description of the scorer returned by resolve() for this exact build
     /// context. Implementations must not construct scorers, increment counters,

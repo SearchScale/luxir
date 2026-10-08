@@ -4294,6 +4294,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
       std::string body = (docId & 1) == 0 ? "alpha" : "other";
       if (docId < 500) body = "head";
       if (docId >= 9000) body = "tail";
+      if (docId % 7 == 0) body += " excluded";
       if (seg == 1 && i % 13 == 0) {
         helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
                              "ties_i", (int64_t)(docId % 7),
@@ -4313,7 +4314,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   struct Sorts {
     std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
   };
-  enum class Main { TERM, BOOLEAN };
+  enum class Main { TERM, BOOLEAN, UNION, PHRASE_UNION };
   auto run = [&](bool seeded, bool disablePruning, const Sorts& sorts,
                  int32_t limit, bool exactCount,
                  std::string_view value = "alpha",
@@ -4326,10 +4327,18 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     if (main == Main::TERM) {
       cur.matchQuery("body_w", value);
+    } else if (main == Main::UNION) {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {}, {qb::match(cur.mr(), "body_w", value),
+                         qb::match(cur.mr(), "body_w", "head")});
+    } else if (main == Main::PHRASE_UNION) {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {}, {qb::match(cur.mr(), "body_w", value),
+                         qb::phraseWords(cur.mr(), "body_w", {"alpha", "alpha"})});
     } else {
       cur.rawQuery() = qb::boolean(
           cur.mr(), {qb::match(cur.mr(), "body_w", value)}, {},
-          {qb::match(cur.mr(), "body_w", "tail")});
+          {qb::match(cur.mr(), "body_w", "excluded")});
     }
     if (exactCount) cur.getNumber();
     for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
@@ -4388,13 +4397,28 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   // Without the force override the two-block corpus can never clear the
   // materiality gate.
   EXPECT_EQ(run(false, false, randAsc, 9, false).activations, 0);
-  // A compound main query offers no independentReplan capability.
-  EXPECT_EQ(run(true, false, randAsc, 9, false, "alpha", 0,
-                Main::BOOLEAN).activations, 0);
-  // Exact count keeps every pruning route off and stays exact.
+  // Supported compound products reuse the same graph for seeds and sweep.
+  for (Main main : {Main::BOOLEAN, Main::UNION}) {
+    for (const Sorts& sorts : {randAsc, randDesc, tiesAsc, monoAsc}) {
+      for (int32_t limit : {9, 987, 4500}) {
+        auto seeded = run(true, false, sorts, limit, false, "alpha", 500, main);
+        auto exhaustive = run(false, true, sorts, limit, false, "alpha", 0, main);
+        EXPECT_GT(seeded.activations, 0);
+        EXPECT_EQ(exhaustive.ids, seeded.ids);
+      }
+    }
+  }
+  // An unsupported executing child keeps the ordinary forward-only route.
   {
-    auto exact = run(true, false, randAsc, 9, true);
-    auto exactExh = run(false, true, randAsc, 9, true);
+    auto mixed = run(true, false, randAsc, 9, false, "alpha", 0, Main::PHRASE_UNION);
+    EXPECT_EQ(0, mixed.activations);
+    EXPECT_EQ(run(false, true, randAsc, 9, false, "alpha", 0, Main::PHRASE_UNION).ids,
+              mixed.ids);
+  }
+  // Exact count keeps every pruning route off and stays exact.
+  for (Main main : {Main::TERM, Main::UNION}) {
+    auto exact = run(true, false, randAsc, 9, true, "alpha", 0, main);
+    auto exactExh = run(false, true, randAsc, 9, true, "alpha", 0, main);
     EXPECT_EQ(exact.activations, 0);
     EXPECT_EQ(exact.ids, exactExh.ids);
     EXPECT_EQ(exact.found, exactExh.found);
@@ -4423,12 +4447,14 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   // Deletes arrive as the liveDocs domain bitset and intersect both passes.
   ASSERT_TRUE(helper.deleteByIds({"600", "1042", "7003"},
                                  UpdateMessage::COMMIT).success);
-  for (const Sorts& sorts : {randAsc, tiesAsc}) {
-    auto exhaustive = run(false, true, sorts, 987, false);
-    auto seeded = run(true, false, sorts, 987, false);
-    EXPECT_GT(seeded.activations, 0);
-    EXPECT_EQ(exhaustive.ids, seeded.ids)
-        << "deletes sort=" << sorts.clauses[0].first;
+  for (Main main : {Main::TERM, Main::UNION}) {
+    for (const Sorts& sorts : {randAsc, tiesAsc}) {
+      auto exhaustive = run(false, true, sorts, 987, false, "alpha", 0, main);
+      auto seeded = run(true, false, sorts, 987, false, "alpha", 0, main);
+      EXPECT_GT(seeded.activations, 0);
+      EXPECT_EQ(exhaustive.ids, seeded.ids)
+          << "deletes sort=" << sorts.clauses[0].first;
+    }
   }
 }
 
@@ -4494,16 +4520,11 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
   EXPECT_EQ(exhaustive.ids, seeded.ids);
 }
 
-// Seeds that come back short of the prior's expectation: a term found only
-// in the older half of a time-ordered segment. Newest first, the best
-// leaves come last in doc order, so instead of a sweep that would gather
-// every match before its bottom matured, seeding continues down the bound
-// order in rounds that double while they come back empty; the round that
-// reaches the matches is cut at its first one, and a short round takes its
-// better leaves first. Oldest first over a term found only in the newer
-// half, the best leaves come first, so the schedule is abandoned and the
-// sweep reaches the matches early. Both match exhaustive collection.
-TEST_F(SortCollectorTest, seededRoundsWhenBestLeavesComeLast) {
+// A term confined to the older half falsifies the newest-first yield prior.
+// A late head must still abandon empty rounds within the common budget and
+// let the sweep finish. Oldest-first over the newer half does the same.
+// Both terms and unions must retain exhaustive ranked-ID parity.
+TEST_F(SortCollectorTest, seededLateHeadObeysAbortBudget) {
   WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper("seeded_rounds");
   constexpr int32_t kDocs = 256 * 512;
@@ -4511,7 +4532,9 @@ TEST_F(SortCollectorTest, seededRoundsWhenBestLeavesComeLast) {
   for (int32_t doc = 0; doc < kDocs; doc++) {
     docs.push_back(flatdoc("id", std::to_string(doc), "id_s",
                            std::to_string(doc), "body_w",
-                           doc < kDocs / 2 ? "early" : "late",
+                           doc < kDocs / 2
+                               ? (doc % 2 == 0 ? "early first" : "early second")
+                               : "late",
                            "mono_i", (int64_t)doc));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
@@ -4522,19 +4545,23 @@ TEST_F(SortCollectorTest, seededRoundsWhenBestLeavesComeLast) {
     int64_t gathered = 0;
   };
   auto run = [&](std::string_view term, qb::SortDir dir, int32_t limit,
-                 bool disablePruning) {
+                 bool disablePruning, bool unionQuery = false) {
     SortPruningGuard pruningGuard(disablePruning);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("seeded_rounds");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
-    // The term, with optional clauses that keep it off the whole-membership
-    // and identity routes; its cost estimate reads as matches spread over
-    // every leaf.
-    cur.rawQuery() = qb::boolean(
-        cur.mr(), {qb::match(cur.mr(), "body_w", term)},
-        {qb::match(cur.mr(), "body_w", "early"),
-         qb::match(cur.mr(), "body_w", "late")});
+    if (unionQuery) {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {}, {qb::match(cur.mr(), "body_w", "first"),
+                         qb::match(cur.mr(), "body_w", "second")});
+    } else {
+      // Optionals retain the query-driven route while preserving term matches.
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {qb::match(cur.mr(), "body_w", term)},
+          {qb::match(cur.mr(), "body_w", "early"),
+           qb::match(cur.mr(), "body_w", "late")});
+    }
     qb::sort(cur, "mono_i", dir);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -4545,12 +4572,14 @@ TEST_F(SortCollectorTest, seededRoundsWhenBestLeavesComeLast) {
   for (int32_t limit : {1, 10, 100}) {
     auto newest = run("early", qb::DESC, limit, false);
     EXPECT_EQ(run("early", qb::DESC, limit, true).ids, newest.ids);
-    EXPECT_GT(newest.rounds, 0) << limit;
-    // Fewer than fixed kSeedRoundLeaves rounds take to cross the empty
-    // newer half (8).
-    EXPECT_LT(newest.rounds, 8) << limit;
-    EXPECT_EQ(0, newest.aborts) << limit;
-    EXPECT_LT(newest.gathered, kDocs / 8) << limit;
+    // The newer half is empty. Late-head benefit cannot excuse repeated
+    // production against a falsified yield prior; the sweep completes it.
+    EXPECT_LE(newest.rounds, 1) << limit;
+    EXPECT_GT(newest.aborts, 0) << limit;
+    auto unionNewest = run("early", qb::DESC, limit, false, true);
+    EXPECT_EQ(run("early", qb::DESC, limit, true, true).ids, unionNewest.ids);
+    EXPECT_LE(unionNewest.rounds, 1);
+    EXPECT_GT(unionNewest.aborts, 0);
     auto oldest = run("late", qb::ASC, limit, false);
     EXPECT_EQ(run("late", qb::ASC, limit, true).ids, oldest.ids);
     EXPECT_EQ(0, oldest.rounds) << limit;

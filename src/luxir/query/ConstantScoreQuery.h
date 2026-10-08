@@ -146,6 +146,10 @@ class ConstantScoreQuery final : public luxir::Query {
 
     int64_t cost() override { return childSupplier->cost(); }
 
+    MembershipWork membershipWork(int32_t maxDoc) override {
+      return childSupplier->membershipWork(maxDoc);
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
       return wrappedShape(childSupplier->describeScorer(buildContext));

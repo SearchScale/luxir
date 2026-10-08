@@ -77,6 +77,11 @@ public:
       return descending ? ~zone.max : zone.min;
     }
 
+    bool leafIntersectsValues(int64_t leaf) const {
+      NumBlockZone zone = leaves.leafZone(leaf);
+      return lo <= hi && zone.max >= lo && zone.min <= hi;
+    }
+
     // The leaf at `rank` of bound order (boundOrderLeaf), without its bound.
     int64_t leafAt(int64_t rank) const {
       return descending ? leaves.leafByMaxDescending(rank)

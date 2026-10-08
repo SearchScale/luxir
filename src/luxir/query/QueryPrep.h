@@ -449,6 +449,10 @@ public:
 
   int64_t cost() override { return delegate->cost(); }
 
+  MembershipWork membershipWork(int32_t maxDoc) override {
+    return delegate->membershipWork(maxDoc);
+  }
+
   Query::ScorerShape describeScorer(
       const Query::PlanContext& buildContext) const override {
     return delegate->describeScorer(buildContext);

@@ -1206,6 +1206,29 @@ public:
 
       int64_t cost() override { return estimatedCost; }
 
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        unused(maxDoc);
+        double matches = (double)estimatedCost;
+        const auto& sketch = reader.leafMeta().valueSketch();
+        if (points == nullptr && !sketch.empty()) {
+          matches = 0;
+          for (auto range : weight.query.intervals()) {
+            double end = range.hi == INT64_MAX ? (double)reader.numValues()
+                : sketch.countBelow(range.hi + 1);
+            matches += end - sketch.countBelow(range.lo);
+          }
+          matches = std::min(matches, (double)reader.docsWithValue());
+        }
+        // A sparse verifier can touch every value in its requested span.
+        // Price that work independently of the values that pass. The sketch
+        // refines yield without changing cost()'s lead-selection upper bound.
+        // Points may still resolve to sparse verification under a parent's
+        // bounded demand. Only a resolved materialized supplier can claim the
+        // cheaper retained-set price; this prior must cover either arm.
+        double production = 64.0 * reader.numValues();
+        return {matches, production, 0, 64, 192};
+      }
+
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         if (buildContext.numericPredicateDisableShapesForTests) return {};

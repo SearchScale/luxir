@@ -2072,6 +2072,46 @@ public:
         return optionalCost(costs, minShouldMatch, maxDoc);
       }
 
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        MembershipWork work{(double)maxDoc, 0, 0, 42, 128};
+        double universe = (double)std::max(1, maxDoc);
+        bool required = !mandatoryShapeSuppliers.empty() || !filterSuppliers.empty();
+        auto intersect = [&](auto suppliers) {
+          for (auto* child : suppliers) {
+            if (child == nullptr) { work.matches = 0; continue; }
+            auto childWork = child->membershipWork(maxDoc);
+            work.matches *= childWork.matches / universe;
+            work.addWork(childWork);
+          }
+        };
+        intersect(mandatoryShapeSuppliers);
+        intersect(filterSuppliers);
+        if (!required || minShouldMatch > 0) {
+          double missing = 1;
+          double sum = 0;
+          for (auto* child : optionalShapeSuppliers) {
+            if (child == nullptr) continue;
+            auto childWork = child->membershipWork(maxDoc);
+            missing *= 1 - childWork.matches / universe;
+            sum += childWork.matches;
+            work.addWork(childWork);
+          }
+          double optional = universe * (1 - missing);
+          if (minShouldMatch > 1) optional = std::min(optional, sum / minShouldMatch);
+          work.matches *= optional / universe;
+        }
+        for (auto* child : prohibitedShapeSuppliers) {
+          if (child == nullptr) continue;
+          auto childWork = child->membershipWork(maxDoc);
+          work.matches *= 1 - childWork.matches / universe;
+          work.addWork(childWork);
+        }
+        // Child independence is a yield prior, never a membership claim.
+        // Round observations replace it when correlation makes it optimistic.
+        work.produce += 8 * work.matches;
+        return work;
+      }
+
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         bool hasRequired = !mandatorySources.empty()

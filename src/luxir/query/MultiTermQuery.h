@@ -489,6 +489,12 @@ public:
         return std::min<int64_t>(facts->sumDocFreq, segment.maxDoc());
       }
 
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        double matches = (double)std::min<int64_t>(cost(), maxDoc);
+        // Reposition is available only for the eager materialized arm.
+        return {matches, 4 * matches, 0, 32, 64};
+      }
+
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         Query::MatchState matchState = Query::MatchState::UNKNOWN;
