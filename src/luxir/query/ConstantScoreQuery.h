@@ -34,6 +34,11 @@ class ConstantScoreQuery final : public luxir::Query {
     Scorer(Query::Scorer* child, float constantScore)
       : Query::ConstantScorer(constantScore), child(child) {}
 
+    [[gnu::cold]] void reset() override {
+      child->reset();
+      exhausted = false;
+    }
+
     int32_t next() override {
       return exhausted ? PostingsReader::END : child->next();
     }
@@ -66,6 +71,7 @@ class ConstantScoreQuery final : public luxir::Query {
   class Supplier final : public Query::ScorerSupplier {
     Query::ScorerSupplier* childSupplier;
     float constantScore;
+    bool needsScores;
 
     static Query::ScorerShape wrappedShape(
         const Query::ScorerShape& child) {
@@ -85,6 +91,7 @@ class ConstantScoreQuery final : public luxir::Query {
     class Plan final : public Query::ScorerPlan {
       Query::ScorerPlan* childPlan;
       float constantScore;
+      bool needsScores;
 
     protected:
       Query::Scorer* buildScorer(MemPool& targetPool) override {
@@ -99,16 +106,21 @@ class ConstantScoreQuery final : public luxir::Query {
       }
 
     public:
+      [[gnu::cold]] bool supportsReset() const noexcept override {
+        return unscoredResetUse() && !needsScores && childPlan->supportsReset();
+      }
+
       Plan(Supplier& supplier, const Query::PlanContext& planContext,
            const Query::ScorerShape& shape, int64_t cost,
            Query::ScorerPlan* childPlan, float constantScore)
         : Query::ScorerPlan(planContext, shape, cost),
-          childPlan(childPlan), constantScore(constantScore) {}
+          childPlan(childPlan), constantScore(constantScore),
+          needsScores(supplier.needsScores) {}
     };
 
   public:
-    Supplier(Query::ScorerSupplier* childSupplier, float constantScore)
-      : childSupplier(childSupplier), constantScore(constantScore) {}
+    Supplier(Query::ScorerSupplier* childSupplier, float constantScore, bool needsScores)
+      : childSupplier(childSupplier), constantScore(constantScore), needsScores(needsScores) {}
 
     int64_t cost() override { return childSupplier->cost(); }
 
@@ -208,10 +220,11 @@ public:
     class Prepared final : public Query::Weight::PreparedWeight {
       QueryPrep::PreparedSource child;
       float constantScore;
+      bool needsScores;
 
     public:
-      Prepared(QueryPrep::PreparedSource&& child, float constantScore)
-        : child(std::move(child)), constantScore(constantScore) {}
+      Prepared(QueryPrep::PreparedSource&& child, float constantScore, bool needsScores)
+        : child(std::move(child)), constantScore(constantScore), needsScores(needsScores) {}
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
         auto* childScorer = QueryPrep::createScorer(targetPool, segment, child.segmentSource());
@@ -225,7 +238,8 @@ public:
         auto* childSupplier = child.segmentSource().scorerSupplier(
             targetPool, segment, executionMode);
         if (childSupplier == nullptr) return nullptr;
-        return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
+        return targetPool.make<ConstantScoreQuery::Supplier>(
+            childSupplier, constantScore, needsScores);
       }
 
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -257,7 +271,7 @@ public:
       if (childWeight->needsPrepare()) {
         source.setPrepared(childWeight->prepare(ctx));
       }
-      return std::make_unique<Prepared>(std::move(source), constantScore);
+      return std::make_unique<Prepared>(std::move(source), constantScore, needsScores());
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
@@ -272,7 +286,8 @@ public:
       auto* childSupplier = childWeight->scorerSupplier(
           targetPool, segment, executionMode);
       if (childSupplier == nullptr) return nullptr;
-      return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
+      return targetPool.make<ConstantScoreQuery::Supplier>(
+          childSupplier, constantScore, needsScores());
     }
 
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {

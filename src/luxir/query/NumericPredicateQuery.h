@@ -197,6 +197,11 @@ public:
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
         query(query), allMatch(allMatch), multi(reader.multiValued()) {}
 
+    [[gnu::cold]] void reset() override {
+      iter.reset();
+      docid = -1;
+    }
+
     int32_t approximationNext() override {
       docid = iter.next();
       return docid;
@@ -334,6 +339,7 @@ public:
     int32_t docid = -1;
     int32_t iterWindowStart = 0;
     int32_t iterWindowEnd = 0;
+    const int32_t initialMaxDoc;
 
     static void setBit(std::span<uint64_t> words, int32_t windowStart,
                        int32_t doc) {
@@ -486,6 +492,12 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reset() override {
+      docid = -1;
+      maxDoc = initialMaxDoc;
+      iterWindowStart = iterWindowEnd = 0;
+    }
+
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
                   std::span<const BlockPlan> plans,
                   const NumericPredicateQuery& query,
@@ -493,7 +505,7 @@ public:
       : Query::ConstantScorer(constantScore), reader(reader), plans(plans),
           crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
-          query(query), maxDoc(maxDoc) {
+          query(query), maxDoc(maxDoc), initialMaxDoc(maxDoc) {
       if (!reader.denseDocsWithValue()) {
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
@@ -614,6 +626,13 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      scorer->reset();
+      windowStart = windowEnd = 0;
+    }
+
     PredicateBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc,
                     float constantScore)
         : scorer(scorer),
@@ -1006,6 +1025,10 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && !supplier.weight.needsScores();
+        }
+
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost, ScorerArm arm,
              bool complement)
@@ -1021,9 +1044,10 @@ public:
 
         Arm arm;
         bool complement = false;
+        BulkUse use;
 
-        BulkState(const Supplier* owner, Arm arm)
-          : arm(arm) {
+        BulkState(const Supplier* owner, Arm arm, BulkUse use)
+          : arm(arm), use(use) {
           this->owner = owner;
         }
       };
@@ -1176,25 +1200,31 @@ public:
         }
         if (points != nullptr) {
           auto* state = planPool.make<BulkState>(
-              this, BulkState::Arm::POINTS);
+              this, BulkState::Arm::POINTS, use);
           state->complement = useComplement(pointValueCount);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state,
+            BulkAnswer::NO, state, -1, BulkAnswer::NO,
           };
         }
         if (useZoneMap) {
           auto* state = planPool.make<BulkState>(
-              this, BulkState::Arm::ZONE_MAP);
+              this, BulkState::Arm::ZONE_MAP, use);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state,
+            BulkAnswer::NO, state, -1, BulkAnswer::NO,
           };
         }
         return {
           BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
           BulkAnswer::NO,
         };
+      }
+
+      [[gnu::cold]] bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept override {
+        assert(state.owner == this);
+        const auto& plan = static_cast<const BulkState&>(state);
+        return !weight.needsScores() && isMembershipWindowUse(plan.use);
       }
 
       BulkScorer* buildBulk(

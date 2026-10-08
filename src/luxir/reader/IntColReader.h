@@ -622,6 +622,12 @@ public:
       dense = !col.docs.hasBitset();
     }
 
+    [[gnu::cold]] void reset() {
+      docsIter.reset();
+      docRank = doc = -1;
+      // Value blocks are keyed by ordinal and remain valid across rewinds.
+    }
+
     ValuesImpl& values() {
       return valueIter;
     }
@@ -649,7 +655,7 @@ public:
         } else {
           doc = docRank = target;
         }
-      } else { // Would a sparse-only iterator (so we don't have the dense code in here) improve performance?
+      } else {
         doc = docsIter.advance(target);
         docRank = docsIter.rank();
       }

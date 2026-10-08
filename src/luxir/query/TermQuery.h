@@ -231,6 +231,10 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && !supplier.weight.needsScores();
+        }
+
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost)
           : Query::ScorerPlan(planContext, shape, cost),
@@ -278,7 +282,6 @@ public:
 
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
-        unused(use);
         if (bulkContext.requireConstantCount) {
           if (segment.liveDocs() != nullptr) {
             return {
@@ -291,20 +294,20 @@ public:
             BulkAnswer::NO, nullptr, cost(),
           };
         }
-        bool available = cost() != 0
-            && !bulkContext.requireFilterConsumption;
+        if (bulkContext.requireFilterConsumption || cost() == 0) return {};
         BulkPlan plan{
-          available ? BulkAnswer::YES : BulkAnswer::NO,
-          available ? BulkAnswer::YES : BulkAnswer::NO,
+          BulkAnswer::YES,
+          BulkAnswer::YES,
           BulkAnswer::NO,
           BulkAnswer::NO,
         };
-        plan.acceptsWindowFilter = available
-            ? BulkAnswer::YES : BulkAnswer::NO;
+        plan.acceptsWindowFilter = BulkAnswer::YES;
         // Every build constructs a fresh scorer and enum from immutable
         // cached term state, so coexisting plans are trivially disjoint.
-        plan.independentReplan = available
-            ? BulkAnswer::YES : BulkAnswer::NO;
+        plan.independentReplan = BulkAnswer::YES;
+        if (!weight.needsScores() && isMembershipWindowUse(use)) {
+          plan.statelessReposition = BulkAnswer::YES;
+        }
         return plan;
       }
 
@@ -415,6 +418,17 @@ public:
            float boost = 1.0f, bool useFrontierBound = true)
             : Scorer(docsEnum, ordReader, simScorer, boost, useFrontierBound) {
       buildImpacts(pool, ordReader != nullptr, useFrontierBound);
+    }
+
+    [[gnu::cold]] void reset() override {
+      docsEnum.reset();
+      minCompetitiveScore = 0.0f;
+      shallowBlock = shallowMainGroup = shallowUpTo = shallowTarget = -1;
+      shallowImpact = 0.0f;
+      shallowGranularity = ShallowGranularity::NONE;
+      shallowGroup = competitiveGroupCursor = -1;
+      competitiveUpTo = PostingsReader::END;
+      competitiveBound = hasImpacts() ? 0.0f : std::numeric_limits<float>::infinity();
     }
 
     bool hasImpacts() const {
@@ -1280,6 +1294,17 @@ public:
           outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
           outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
           maxDoc(maxDoc) {
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      scorer->reset();
+      // Leave the first posting unconsumed for intoBitSet. Its existing
+      // block seek handles target on the first window.
+      if (windowFilter != nullptr) windowFilter->reset();
+      windowStart = windowEnd = 0;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
     }
 
     bool attachWindowFilter(WindowFilter* filter) override {

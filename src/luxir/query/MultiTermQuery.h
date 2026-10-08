@@ -58,6 +58,11 @@ public:
     Scorer(FixedBitSet bits, int32_t maxDoc, float constantScore)
       : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc) {}
 
+    [[gnu::cold]] void reset() override {
+      docid = -1;
+      maxDoc = bits.size();
+    }
+
     const uint64_t* bitWordsForTests() const { return bits.words; }
 
     int32_t next() override {
@@ -447,6 +452,10 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && mode == ExpansionMode::EAGER && !supplier.weight.needsScores();
+        }
+
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost,
              const ExpansionFacts& facts, ExpansionMode mode)
@@ -571,8 +580,14 @@ public:
         auto* state = scratchPool.make<BulkState>(*this, use);
         return {
           BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-          BulkAnswer::NO, state,
+          BulkAnswer::NO, state, -1, BulkAnswer::NO,
         };
+      }
+
+      [[gnu::cold]] bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept override {
+        assert(state.owner == this);
+        const auto& plan = static_cast<const BulkState&>(state);
+        return !weight.needsScores() && isMembershipWindowUse(plan.context.demand.horizon);
       }
 
       BulkScorer* buildBulk(

@@ -1952,6 +1952,12 @@ public:
                 leadCost, parentContext.demand.horizon));
       }
 
+      static bool resettableChildren(const auto& children) {
+        return std::all_of(children.begin(), children.end(), [](const auto& child) {
+          return child.plan != nullptr && child.plan->supportsReset();
+        });
+      }
+
       class PullScorerPlan final : public Query::ScorerPlan {
         Supplier& supplier;
         std::span<PullChildPlan> required;
@@ -1981,6 +1987,13 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && !supplier.needsScores && !requiredUnsatisfiable
+              && resettableChildren(required)
+              && resettableChildren(optional)
+              && resettableChildren(prohibited);
+        }
+
         PullScorerPlan(
             Supplier& supplier,
             const Query::PlanContext& planContext,
@@ -3225,6 +3238,58 @@ public:
         }
       }
 
+      static bool resettableConjunction(const ConjunctionPlan& plan) {
+        for (const auto& entry : plan.entries) {
+          if (!entry.optionalGroup && !entry.plan->supportsReset()) return false;
+        }
+        return resettableChildren(plan.optionalGroup)
+            && resettableChildren(plan.prohibited)
+            && (plan.independentLeadPlan == nullptr
+                || plan.independentLeadPlan->supportsReset());
+      }
+
+      [[gnu::cold]] bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept override {
+        assert(state.owner == this);
+        if (needsScores) return false;
+        // These child plans preserve the bulk request's horizon. Reuse that
+        // resolved fact instead of capturing the use again in the parent.
+        switch (static_cast<const BooleanBulkBuildState&>(state).kind) {
+          case BooleanBulkBuildState::Kind::CONJUNCTION: {
+            const auto& plan = static_cast<const ConjunctionPlan&>(state);
+            return isMembershipWindowUse(plan.use) && resettableConjunction(plan);
+          }
+          case BooleanBulkBuildState::Kind::MAND_OPT: {
+            const auto& plan = static_cast<const MandOptPlan&>(state);
+            return isMembershipWindowUse(plan.mandatory.plan->demand().horizon)
+                && plan.mandatory.plan->supportsReset() && resettableChildren(plan.optional);
+          }
+          case BooleanBulkBuildState::Kind::MAX_SCORE: {
+            const auto& plan = static_cast<const MaxScorePlan&>(state);
+            return isMembershipWindowUse(plan.optional[0].plan->demand().horizon)
+                && resettableChildren(plan.optional) && resettableChildren(plan.prohibited);
+          }
+          case BooleanBulkBuildState::Kind::FILTERED_DISJUNCTION: {
+            const auto& plan = static_cast<const FilteredDisjunctionPlan&>(state);
+            return isMembershipWindowUse(plan.optional[0].plan->demand().horizon)
+                && (plan.filter.plan == nullptr || plan.filter.plan->supportsReset())
+                && resettableChildren(plan.optional);
+          }
+          case BooleanBulkBuildState::Kind::FILTER_ONLY: {
+            const auto& plan = static_cast<const FilterOnlyPlan&>(state);
+            // The other filters are materialized once during construction.
+            return !plan.filters.empty()
+                && plan.filters[0].plan.supportsReposition() == BulkAnswer::YES;
+          }
+          case BooleanBulkBuildState::Kind::DELEGATE_FILTERED_CHILD:
+            return static_cast<const DelegateFilteredChildPlan&>(state)
+                .childPlan.supportsReposition() == BulkAnswer::YES;
+          case BooleanBulkBuildState::Kind::EXACT_FILTERED_MAND_OPT:
+          case BooleanBulkBuildState::Kind::FILTERED_BODY:
+            return false;
+        }
+        std::unreachable();
+      }
+
       static BulkPlan knownBulkPlan(
           BulkAnswer available, BulkAnswer matchWindows,
           BulkAnswer exactCandidateScoring,
@@ -4095,6 +4160,9 @@ public:
         BulkPlan plan = knownBulkPlan(
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
         plan.buildState = state;
+        // The resolved context already retains the use. Do not keep another
+        // copy live across child planning and its virtual calls.
+
         return {plan, FilteredDisjunctionDisposition::BULK};
       }
 
@@ -5246,7 +5314,6 @@ public:
         uniformConstantCandidate);
     }
 
-
     Query::ScorerSupplier* scorerSupplierImpl(
         luxir::MemPool& targetPool,
         luxir::IndexReader::Segment& segment,
@@ -5326,36 +5393,18 @@ public:
       return sparseFilteredTopKFamilyKind;
     }
 
-    Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
       Query::Demand demand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max());
-      return static_cast<Scorer*>(supplier->resolve(
-          targetPool, supplier->makePlanContext(demand))->build(targetPool));
+      return supplier->resolve(
+          targetPool, supplier->makePlanContext(demand))->build(targetPool);
     }
 
     // Single-clause boolean shapes delegate to the wrapped clause. Filtered
     // count-only conjunctions exhaust the same per-window bulk intersection
     // used by collection, with filter clauses kept as lazy zero-score members.
   };  // BooleanQuery::Weight
-
-  class Scorer final : public Query::Scorer {
-  public:
-    Scorer() {}
-
-    int32_t next() override {
-      return -1;
-    }
-
-    /// doc we are positioned on
-    int32_t docId() override {
-      return -1;
-    }
-
-    float score() override {
-      return -1;
-    }
-  };
 
   class MandOptScorer final : public Query::Scorer {
     struct ApproxSlot {
@@ -5595,6 +5644,21 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reset() override {
+      mand.scorer->reset();
+      opt.scorer->reset();
+      id = windowUpTo = optCheckedDoc = -1;
+      minCompetitiveScore = 0.0f;
+      reqMaxScore = mand.scorer->getMaxScoreForSetup(PostingsReader::END);
+      windowReqMaxScore = windowMaxScore = std::numeric_limits<float>::infinity();
+      optIsRequired = optCheckedMatch = windowWalkDisabled = false;
+      uselessWindowEvals = 0;
+      windowWalkDisabledAtTheta = 0.0f;
+#ifndef NDEBUG
+      iterationProtocol = IterationProtocol::NONE;
+#endif
+    }
+
     MandOptScorer(luxir::MemPool& targetPool,
                   Scorer* mandScorer, bool mandTwoPhase,
                   Scorer* optScorer, bool optTwoPhase,
@@ -5827,6 +5891,13 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      lead->reposition(target);
+      combinedWith = nullptr;
+      combinedCard = 0;
+      combinedReady = false;
+    }
+
     FilterOnlyBulkScorer(BulkScorer* lead,
                          std::span<uint64_t> filterWords,
                          std::span<uint64_t> combinedWords,
@@ -6271,6 +6342,18 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      mand->reset();
+      for (auto* scorer : opts) scorer->reset();
+      if (windowFilter != nullptr) windowFilter->reset();
+      windowStart = windowEnd = liveOptCount = 0;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
+      mandWindowMax = std::numeric_limits<float>::infinity();
+      optWindowMaxSum = 0.0;
+    }
+
     MandOptBulkScorer(luxir::MemPool& pool, Query::Scorer* mand,
                       std::span<Query::Scorer*> opts, std::span<int64_t> optCosts,
                       int32_t maxDoc, int64_t mandCost)
@@ -6413,6 +6496,11 @@ public:
     std::span<Query::Scorer*> optional;
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      required->reposition(target);
+      for (auto* scorer : optional) scorer->reset();
+    }
+
     OptionalScoreBulkScorer(BulkScorer* required,
                             std::span<Query::Scorer*> optional)
         : required(required), optional(optional) {
@@ -6473,6 +6561,12 @@ public:
     int32_t notid = -1;
     bool notTwoPhase;
   public:
+    [[gnu::cold]] void reset() override {
+      mandScorer->reset();
+      notScorer->reset();
+      id = notid = -1;
+    }
+
     static inline bool disableNotTwoPhaseForTests = false;
 
     MandNotScorer(luxir::MemPool& targetPool,
@@ -6879,6 +6973,14 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reset() override {
+      for (auto* scorer : conjunctionClauses) scorer->reset();
+      docid = competitiveUpTo = -1;
+      minCompetitiveScore = 0.0f;
+      failStreak = 0;
+      skipSeen = false;
+    }
+
     // Test hook: disable block-max range skipping. The default evaluates each
     // scorer's natural bound horizon without imposing a minimum stride.
     static inline bool disablePruningForTests = false;
@@ -7284,6 +7386,13 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      for (auto* term : terms) term->reset();
+      nextLeadDoc = -1;
+    }
+
     ExactDocsOnlyTermConjunctionBulkScorer(
         MemPool& pool, std::span<DocsOnlyEnum*> terms,
         int32_t maxDoc)
@@ -7530,6 +7639,8 @@ public:
     int64_t denseSampleLead = 0;
     int64_t denseSampleSurvivors = 0;
     int32_t denseScoredTopK = 0;
+    CandidateCountAdmission initialCandidateCountAdmission =
+        CandidateCountAdmission::NONE;
 
     // Dense-scored admission considers requested depth, an initial survivor
     // sample, and non-lead cost. Keep the parameters together.
@@ -8994,6 +9105,34 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      for (auto* scorer : scorers) scorer->reset();
+      for (auto* scorer : prohibitedScorers) scorer->reset();
+      for (auto* term : candidateProhibitedTerms) term->reset();
+      if (candidateLeadScoreScorer != nullptr) candidateLeadScoreScorer->reset();
+      if (windowFilter != nullptr) windowFilter->reset();
+      for (size_t i = 0; i < candidateFilterProbes.size(); i++) {
+        candidateFilterProbes[i].reset(candidateFilterDocSets[i]);
+      }
+      for (size_t i = 0; i < candidateProhibitedDocSetProbes.size(); i++) {
+        candidateProhibitedDocSetProbes[i].reset(candidateProhibitedDocSets[i]);
+      }
+      for (auto& term : leadGroupTerms) term.index = term.size = 0;
+      std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
+      nextCandidatePostingsLeadDoc = -1;
+      candidateCountAdmission = initialCandidateCountAdmission;
+      if (candidateCountAdmission == CandidateCountAdmission::SAMPLING) {
+        // A failed sample clears this alias to select dense execution.
+        candidatePostingsLead = termScorers[0];
+      }
+      denseScoredAdmission = DenseScoredAdmission::SCORE_FIRST;
+      denseSampleWindows = 0;
+      denseSampleLead = denseSampleSurvivors = 0;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
+    }
+
     ConjunctionBulkScorer(luxir::MemPool& pool, std::span<Query::Scorer*> scorers,
                           std::span<Query::Scorer*> prohibitedScorers,
                           std::span<TermQuery::Scorer*>
@@ -9191,6 +9330,7 @@ public:
       if (candidatePostingsLead != nullptr && !scoredConstruction) {
         assert(denseCountPath);
         candidateCountAdmission = CandidateCountAdmission::SAMPLING;
+        initialCandidateCountAdmission = candidateCountAdmission;
       }
       denseScoredEligible = scoredConstruction && denseCountPath
           && !negatedCountPath && allTermScorers
@@ -9263,6 +9403,7 @@ public:
       // iteration; sparse execution already checks WindowFilter per match.
       if (candidateCountAdmission == CandidateCountAdmission::SAMPLING) {
         candidateCountAdmission = CandidateCountAdmission::DENSE;
+        initialCandidateCountAdmission = candidateCountAdmission;
         candidatePostingsLead = nullptr;
       }
       // The dense scored path fills every clause before applying the filter,
@@ -9495,6 +9636,16 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reset() override {
+      for (size_t i = 0; i < members.size(); i++) {
+        members[i].scorer->reset();
+        members[i].doc = -1;
+        heap[i] = &members[i];
+      }
+      pq.reset(members.size());
+      docid = -1;
+    }
+
     static inline bool disableDisjTwoPhaseForTests = false;
     static inline bool disableTwoWayForTests = false;
 
@@ -9697,7 +9848,6 @@ public:
 
 
   class MaxScoreDisjunctionScorer final : public Query::Scorer {
-    MemPool& pool;
     std::span<Scorer*> scorers;  // stable global-max order, used for deterministic scoring
     std::span<float> clauseMax;
     std::span<float> windowMax;
@@ -9713,7 +9863,7 @@ public:
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
     constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
 
-    luxir::IndirectPQ<Scorer, decltype(idComparator)>* pq = nullptr;
+    luxir::IndirectPQ<Scorer, decltype(idComparator)> pq;
 
     int32_t maxDoc;
     int32_t windowSize;
@@ -9796,7 +9946,7 @@ public:
         acc += (double) clauseMax[s];
         nePrefix[s] = acc;
       }
-      pq = pool.make<luxir::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
+      pq.reset(essentialCount);
     }
 
     void updateGlobalSplit() {
@@ -9850,7 +10000,7 @@ public:
         acc += (double) windowMax[(size_t) windowOrder[s]];
         nePrefix[s] = acc;
       }
-      pq = pool.make<luxir::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
+      pq.reset(essentialCount);
     }
 
     void setupWindow(int32_t start) {
@@ -9927,26 +10077,26 @@ public:
     int32_t nextGlobal() {
       int32_t currid = docid;
       for (;;) {
-        if (pq->size() == 0) {
+        if (pq.size() == 0) {
           docid = luxir::PostingsReader::END;
           currentScore = 0.0f;
           return docid;
         }
-        int32_t topDoc = pq->top().docId();
+        int32_t topDoc = pq.top().docId();
         if (topDoc == luxir::PostingsReader::END) {
-          pq->removeTop();
+          pq.removeTop();
           continue;
         }
         if (topDoc <= currid) {
-          int32_t nextDoc = pq->top().next();
+          int32_t nextDoc = pq.top().next();
           if (nextDoc == luxir::PostingsReader::END) {
-            pq->removeTop();
+            pq.removeTop();
           } else {
-            pq->updateTop();
+            pq.updateTop();
           }
           continue;
         }
-        docid = pq->top().docId();
+        docid = pq.top().docId();
         scoreCurrentDoc();
         return docid;
       }
@@ -9964,22 +10114,22 @@ public:
         }
 
         for (;;) {
-          if (pq->size() == 0) {
+          if (pq.size() == 0) {
             nextWindowStart = windowEnd;
             windowReady = false;
             break;
           }
-          int32_t topDoc = pq->top().docId();
+          int32_t topDoc = pq.top().docId();
           if (topDoc == luxir::PostingsReader::END) {
-            pq->removeTop();
+            pq.removeTop();
             continue;
           }
           if (topDoc < windowStart) {
-            topDoc = pq->top().advance(windowStart);
+            topDoc = pq.top().advance(windowStart);
             if (topDoc == luxir::PostingsReader::END) {
-              pq->removeTop();
+              pq.removeTop();
             } else {
-              pq->updateTop();
+              pq.updateTop();
             }
             continue;
           }
@@ -9989,11 +10139,11 @@ public:
             break;
           }
           if (topDoc <= docid) {
-            int32_t nextDoc = pq->top().next();
+            int32_t nextDoc = pq.top().next();
             if (nextDoc == luxir::PostingsReader::END) {
-              pq->removeTop();
+              pq.removeTop();
             } else {
-              pq->updateTop();
+              pq.updateTop();
             }
             continue;
           }
@@ -10008,8 +10158,7 @@ public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreDisjunctionScorer(luxir::MemPool& pool, std::span<Scorer*> scorers,
                               int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS)
-            : pool(pool),
-              scorers(scorers),
+            : scorers(scorers),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
@@ -10017,6 +10166,7 @@ public:
               essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()),
               neOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               nePrefix(pool.make_arr<double>(scorers.size()), scorers.size()),
+              pq(essentialPointers, (size_t) 0),
               maxDoc(maxDoc),
               windowSize(normalizeWindowSize(windowSize)),
               globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
@@ -10294,6 +10444,16 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      if (filterScorer != nullptr) filterScorer->reset();
+      for (auto* term : termScorers) term->reset();
+      nextFilterDoc = -1;
+      nextFilterIndex = 0;
+      candidateCount = 0;
+    }
+
     FilteredDisjunctionBulkScorer(
         MemPool& pool, Query::Scorer* filterScorer,
         std::span<const int32_t> filterDocs,
@@ -10455,6 +10615,8 @@ public:
     std::span<uint64_t> countTermBits;
     std::span<TermQuery::Scorer*> disjCountIdentityOthers;
     TermQuery::Scorer* disjCountIdentityLargest = nullptr;
+    // Immutable admission metadata across traversal-local fallbacks. Zero
+    // means the identity was not configured, or an attachment disabled it.
     int64_t disjCountIdentityLargestDf = 0;
     std::span<Query::Scorer*> exclusionScorers;  // flattened OR
     std::span<uint64_t> exclusionBits;           // current production window
@@ -11724,6 +11886,39 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      for (auto* scorer : scorers) scorer->reset();
+      for (auto* scorer : exclusionScorers) scorer->reset();
+      if (windowFilter != nullptr) windowFilter->reset();
+      arrayCursorFilter = nullptr;
+      arrayCursor = 0;
+      arrayCursorLastWindowStart = -1;
+      windowStart = windowEnd = outerWindowStart = outerWindowEnd = 0;
+      outerWindowReady = false;
+      splitIndex = firstRequired = 0;
+      minWindowSize = 1;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
+      nextPartitionMcs = std::numeric_limits<float>::infinity();
+      std::fill(compactThresholdReady.begin(), compactThresholdReady.end(), false);
+      for (size_t i = 0; i < windowOrder.size(); i++) windowOrder[i] = (int32_t) i;
+      disjCountIdentityLargest = nullptr;
+      if (disjCountIdentityLargestDf > 0) {
+        // Admission requires the largest df to dominate all the others, so
+        // it identifies exactly one retained child. Recover it on this cold
+        // path instead of growing every bulk product with a saved pointer.
+        for (size_t i = 0; i < clauseCosts.size(); i++) {
+          if (clauseCosts[i] == disjCountIdentityLargestDf) {
+            assert(disjCountIdentityLargest == nullptr);
+            disjCountIdentityLargest =
+                static_cast<TermQuery::Scorer*>(scorers[i]);
+          }
+        }
+        assert(disjCountIdentityLargest != nullptr);
+      }
+    }
+
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(luxir::MemPool& pool, std::span<Query::Scorer*> scorers,
                        std::span<int64_t> clauseCosts,
@@ -11797,6 +11992,11 @@ public:
     bool attachWindowFilter(WindowFilter* filter) override {
       assert(windowFilter == nullptr);
       windowFilter = filter;
+      // The identity counts the full largest term without consulting the
+      // filter. Attachment survives every traversal, unlike a per-call
+      // domain's temporary fallback to ordinary enumeration.
+      disjCountIdentityLargest = nullptr;
+      disjCountIdentityLargestDf = 0;
       return true;
     }
 
@@ -12476,6 +12676,11 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reset() override {
+      for (auto* scorer : scorers) scorer->reset();
+      docid = -1;
+    }
+
     MinShouldMatchScorer(luxir::MemPool& pool, std::span<Scorer*> costAscendingScorers, int32_t minMatch)
             : scorers(costAscendingScorers), minMatch(minMatch),
               leadCount((int32_t)costAscendingScorers.size() - minMatch + 1) {

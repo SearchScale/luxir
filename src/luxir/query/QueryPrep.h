@@ -169,6 +169,11 @@ public:
     }
   }
 
+  [[gnu::cold]] void reset() override {
+    doc = arrIdx = -1;
+    windowArrIdx = 0;
+  }
+
   DocSet* docSet() const { return docs; }
 
   int32_t next() override {
@@ -254,6 +259,10 @@ class DocSetSupplier final : public Query::ScorerSupplier {
     }
 
   public:
+    [[gnu::cold]] bool supportsReset() const noexcept override {
+      return unscoredResetUse();
+    }
+
     Plan(DocSetSupplier& supplier,
          const Query::PlanContext& planContext,
          const Query::ScorerShape& shape, int64_t cost)
@@ -297,7 +306,6 @@ public:
 
   BulkPlan planBulk(
       BulkUse use, const BulkScorerContext& bulkContext) override {
-    unused(use);
     if (bulkContext.requireConstantCount) {
       return {
         BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
@@ -306,12 +314,16 @@ public:
     }
     bool available = cost() != 0
         && !bulkContext.requireFilterConsumption;
-    return {
+    BulkPlan plan{
       available ? BulkAnswer::YES : BulkAnswer::NO,
       available ? BulkAnswer::YES : BulkAnswer::NO,
       BulkAnswer::NO,
       BulkAnswer::NO,
     };
+    if (available && isMembershipWindowUse(use)) {
+      plan.statelessReposition = BulkAnswer::YES;
+    }
+    return plan;
   }
 
   BulkScorer* buildBulk(

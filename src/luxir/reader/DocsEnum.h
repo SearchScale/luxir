@@ -1284,6 +1284,38 @@ protected:
   explicit DocsEnumImpl(TermsEnum& termsEnum)
       : DocsEnumImpl(termsEnum.postingsState()) {}
 
+public:
+  // Reuse the inline decode buffers. Pulsed postings never decode another
+  // block, so their one immutable doc/frequency remains in those buffers.
+  // Positions have a separate cursor and are not resettable yet.
+  [[gnu::cold]] void reset() {
+    assert(!positionTrackingEnabled);
+    // Pulsed terms carry their document in metadata and have no stream.
+    if (docsSize != 0) docIS.seek(startOfDocs);
+    posOrdStart = cumulativeTermFreq = 0;
+    positionBatchActive = false;
+    docOrd = docBufIdx = tfreqOrd = tfreqBufIdx = 0;
+    docBufEnd = tfreqBufEnd = docsSize == 0 ? 1 : 0;
+    docid = -1;
+    tfreq = docsSize == 0 ? 1 : -1;
+    blockMode = docsOnlyConsumed = docBlockResident = scoredProbeActive = false;
+    residentWordsPtr = scoredProbeWordsPtr = nullptr;
+    residentDocBase = residentBlockLast = scoredProbeDocBase = scoredProbeBlockLast = 0;
+    residentBlockStartOrd = residentNumWords = scoredProbeBlockStartOrd = 0;
+    scoredProbeState = 0;
+    pendingPosBlockOrd = pendingPosAbsoluteOffset = 0;
+    pendingPosSeekValid = false;
+    nextL0Block = nextL1Group = 0;
+    nextL0Base = nextL1Base = readyBlockBodyBytes = 0;
+    nextL0CumTf = 0;
+    bodyReady = false;
+    l0CheckpointEntries = l0CheckpointGroupBody = nullptr;
+    l0CheckpointGroupStartBlock = -1;
+    l0CheckpointCount = 0;
+    posRepairDirty = false;
+    posRepairStart = posRepairEnd = 0;
+  }
+
   DocsEnumImpl(const DocsEnumImpl& other) = delete;
 
 public:
@@ -3555,6 +3587,21 @@ public:
 
   BasicDocsEnum(const BasicDocsEnum&) = delete;
 
+  [[gnu::cold]] void reset() {
+    if (docsSize != 0) docIS.seek(startOfDocs);
+    residentWordsPtr = nullptr;
+    residentDocBase = residentBlockLast = 0;
+    residentBlockStartOrd = residentNumWords = 0;
+    docOrd = docBufIdx = nextL0Block = 0;
+    docBufEnd = docsSize == 0 ? 1 : 0;
+    docid = -1;
+    nextL0Base = 0;
+    blockMode = docBlockResident = bodyReady = false;
+    l0CheckpointEntries = l0CheckpointGroupBody = nullptr;
+    l0CheckpointGroupStartBlock = -1;
+    l0CheckpointCount = 0;
+  }
+
   // Cheap lower bound on the first doc of a term's postings: no enum
   // construction, no block decode. Exact for pulsed terms and for terms
   // whose docs fit one StreamVByte tail (docFreq < DOCS_BLOCK_SIZE); terms
@@ -3876,6 +3923,7 @@ class BasicDocsEnum<DocsEnumTier::POSITIONS> final : public DocsEnumImpl {
   using DocsEnumImpl::nextDocOnly;
   using DocsEnumImpl::peekDocBlock;
   using DocsEnumImpl::peekDocOnlyBlock;
+  using DocsEnumImpl::reset;
 
 public:
   static constexpr DocsEnumTier TIER = DocsEnumTier::POSITIONS;

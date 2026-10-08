@@ -563,6 +563,14 @@ public:
       bucket.sparse.index = -1;
     }
 
+    [[gnu::cold]] void reset() {
+      curr = bucketIdx = bucketBase = -1;
+      bucketSize = bucketRank = 0;
+      lowerBits = 0;
+      bucketType = SPARSE;
+      std::construct_at(&bucket.sparse, SparseBucket{nullptr, -1});
+    }
+
     int32_t val() const {
       return curr;
     }

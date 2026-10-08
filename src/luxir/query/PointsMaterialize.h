@@ -76,6 +76,8 @@ struct PointsMaterialize {
     PointsArrayScorer(std::span<const int32_t> docs, float constantScore)
       : Query::ConstantScorer(constantScore), docs(docs) {}
 
+    [[gnu::cold]] void reset() override { index = docid = -1; }
+
     int32_t next() override {
       assert(docid != PostingsReader::END);
       index++;
@@ -119,6 +121,11 @@ struct PointsMaterialize {
     PointsBitScorer(FixedBitSet bits, float constantScore)
       : Query::ConstantScorer(constantScore), bits(bits), limit(bits.size()) {}
 
+    [[gnu::cold]] void reset() override {
+      docid = -1;
+      limit = bits.size();
+    }
+
     int32_t next() override {
       assert(docid != PostingsReader::END);
       return seek(docid + 1);
@@ -153,6 +160,12 @@ struct PointsMaterialize {
         : docs(docs), outDocs(pool.make_span<int32_t>(docs.size())),
           outScores(pool.make_span<float>(docs.size())),
           constantScore(constantScore) {}
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0);
+      windowIndex = 0;
+    }
 
     // Bounded windows of exact matches: the default matchNextWindow serves
     // them, as the numeric predicate's bulk plan declares.
@@ -294,6 +307,12 @@ struct PointsMaterialize {
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= bits.size());
+      windowStart = windowEnd = 0;
+    }
+
     PointsBitBulkScorer(MemPool& pool, FixedBitSet bits, float constantScore)
         : bits(bits),
           windowBits(pool.make_span<uint64_t>(WINDOW_WORDS)),

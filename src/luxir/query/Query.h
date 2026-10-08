@@ -140,6 +140,9 @@ public:
   // Attach a lazy, window-local filter to scored execution. The filter is
   // prepared by the bulk scorer only after it has selected the final
   // production-window bounds. Unsupported bulk scorers reject the attach.
+  // A late attachment expands the executing graph: before repositioning,
+  // the caller must AND the filter's child-plan capabilities with the bulk
+  // plan's answer. An earlier YES alone does not cover the new filter.
   virtual bool attachWindowFilter(WindowFilter* filter) {
     unused(filter);
     return false;
@@ -161,6 +164,9 @@ public:
   // an exhaustion latch, and the caller may keep issuing later bounded
   // requests (which must return empty windows once the underlying stream is
   // truly exhausted). Only an unbounded request's END means exhaustion.
+  // A lookahead resume beyond max has the same bounded continuation rule:
+  // the next range may begin at max. Within a range, honor the returned
+  // resume; across ranges, the forward frontier is min(resume, previous max).
   virtual int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
                                   int32_t min, int32_t max) {
     return scoreNextWindow(out, filter, min, max,
@@ -185,6 +191,16 @@ public:
     }
     count += window.size;
     return next;
+  }
+
+  // Cold boundary between forward-only traversals. Invalidates prior output
+  // and resume points; subsequent windows start at min >= target. Only call
+  // when the resolved plan (including attached filters) supports reposition.
+  // Thresholds and adaptive state start fresh; immutable caches survive.
+  [[gnu::cold]] virtual void reposition(int32_t target) {
+    unused(target);
+    assert(false);
+    std::unreachable();
   }
 };
 
@@ -711,6 +727,10 @@ public:
   public:
     using BulkUse = ExecutionUse;
 
+    static bool isMembershipWindowUse(BulkUse use) noexcept {
+      return use == BulkUse::MATCH_WINDOWS || use == BulkUse::COUNT_WINDOWS;
+    }
+
     enum class BulkAnswer : uint8_t {
       YES,
       NO,
@@ -751,6 +771,10 @@ public:
       const BulkBuildState* buildState = nullptr;
       int64_t constantCount = -1;
       BulkAnswer acceptsWindowFilter = BulkAnswer::NO;
+      // Stateful arms derive capability from their resolved graph through
+      // the owner hook. Stateless leaves record their complete answer here.
+      // Neither route is consulted during ordinary forward iteration.
+      BulkAnswer statelessReposition = BulkAnswer::NO;
       // YES declares that another planBulk() call on this supplier with an
       // identical context may coexist with this plan: neither call
       // invalidates the other, their build states are disjoint, each plan is
@@ -763,6 +787,12 @@ public:
       // either runs, and each further seeding round's product after the
       // earlier ones have advanced.
       BulkAnswer independentReplan = BulkAnswer::NO;
+
+      [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
+        if (buildState == nullptr) return statelessReposition;
+        return buildState->owner->bulkStateSupportsReposition(*buildState)
+            ? BulkAnswer::YES : BulkAnswer::NO;
+      }
 
       bool hasConstantCount() const noexcept {
         return constantCount >= 0;
@@ -927,6 +957,14 @@ public:
         bulk,
         bulk != nullptr && plan.consumesFilters == BulkAnswer::YES,
       };
+    }
+
+  protected:
+    // Interpret this resolved plan's state, without planning again. The
+    // owning supplier graph must outlive both construction and inspection.
+    [[gnu::cold]] virtual bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept {
+      unused(state);
+      return false;
     }
   };
 
@@ -1829,6 +1867,14 @@ public:
       return {};
     }
 
+    // Restore unpositioned state for a new protocol epoch, without matching
+    // or allocating. The resolved plan owns the capability; resetting an
+    // owner also resets its exposed approximation/probe aliases.
+    [[gnu::cold]] virtual void reset() {
+      assert(false);
+      std::unreachable();
+    }
+
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 
@@ -1867,6 +1913,11 @@ public:
 
     const PlanContext& context() const noexcept { return planContext; }
 
+    bool unscoredResetUse() const noexcept {
+      return planContext.demand.horizon != ExecutionUse::SCORED_WINDOWS
+          && planContext.demand.horizon != ExecutionUse::EXACT_CANDIDATE_SCORING;
+    }
+
   public:
     ScorerPlan(const ScorerPlan&) = delete;
     ScorerPlan& operator=(const ScorerPlan&) = delete;
@@ -1876,6 +1927,11 @@ public:
     const ScorerShape& shape() const noexcept { return recordedShape; }
     const Demand& demand() const noexcept { return planContext.demand; }
     int64_t cost() const noexcept { return resolvedCost; }
+    // Inspect the resolved graph only when reuse is requested. Computing
+    // this recursively during construction taxes ordinary forward searches.
+    // Like build(), this borrows the originating supplier graph; keep that
+    // graph alive while consulting the plan, including after consumption.
+    [[gnu::cold]] virtual bool supportsReset() const noexcept { return false; }
 
     Scorer* build(MemPool& targetPool) {
       consume();
@@ -2038,6 +2094,11 @@ class WindowFilter {
   int64_t filterCost = 0;
 
 public:
+  [[gnu::cold]] void reset() {
+    for (Query::Scorer* scorer : scorers) scorer->reset();
+    windowStart = windowEnd = 0;
+  }
+
   WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers,
                bool probeMode = false, int64_t filterCost = 0)
       : scorers(scorers),
