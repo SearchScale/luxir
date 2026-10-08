@@ -78,17 +78,22 @@ public:
         StringSortMode override = stringSortModeOverride.load();
         if (override != StringSortMode::DEFAULT) return override;
 
-        const char* configured = std::getenv("LUXIR_STRING_SORT");
-        if (configured == nullptr || *configured == '\0' ||
-            std::string_view(configured) == "segment") {
+        // Environment overrides are process settings. Resolve once instead
+        // of scanning the environment for every sort specification.
+        static const StringSortMode environmentMode = [] {
+            const char* configured = std::getenv("LUXIR_STRING_SORT");
+            if (configured == nullptr || *configured == '\0' ||
+                std::string_view(configured) == "segment") {
+                return StringSortMode::SEGMENT;
+            }
+            if (std::string_view(configured) == "global") {
+                return StringSortMode::GLOBAL;
+            }
+            LOG_WARN("Ignoring invalid LUXIR_STRING_SORT='{}'; expected global or segment",
+                     configured);
             return StringSortMode::SEGMENT;
-        }
-        if (std::string_view(configured) == "global") {
-            return StringSortMode::GLOBAL;
-        }
-        LOG_WARN("Ignoring invalid LUXIR_STRING_SORT='{}'; expected global or segment",
-                 configured);
-        return StringSortMode::SEGMENT;
+        }();
+        return environmentMode;
     }
 
     static StringSortMode setStringSortModeForTests(StringSortMode value) {

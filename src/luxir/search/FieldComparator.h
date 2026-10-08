@@ -640,24 +640,26 @@ public:
     return out;
   }
 
-  virtual int64_t getDocValue(int32_t docid) {
+  int64_t getDocValue(int32_t docid) {
     if (!iter.has_value()) {
       return missingValueSubstitute;
     }
 
-    if (iter->docId() < docid) {
-      iter->advance(docid);
-    }
-    if (iter->docId() > docid) {
-      return missingValueSubstitute;
+    // Dense presence maps doc ids directly to value ordinals. Avoid moving
+    // a presence cursor for each lookup; the value decoder caches by ordinal.
+    int32_t rank = docid;
+    if (docsIter.has_value()) {
+      if (iter->docId() < docid) iter->advance(docid);
+      if (iter->docId() > docid) return missingValueSubstitute;
+      rank = iter->rank();
     }
     // Multi-valued numeric columns store per-doc values unsorted, so the
     // cheap deterministic sort key is the FIRST stored value (storage order).
     // min/max over unsorted values would scan every value per doc; callers
     // that want that spell it explicitly (min(f)/max(f) sort expressions).
     int64_t value = multiValued
-        ? iter->values().valueAt(reader->getStartValueRank(iter->rank()))
-        : iter->value();
+        ? iter->values().valueAt(reader->getStartValueRank(rank))
+        : iter->values().valueAt(rank);
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier
     // but this will be a predictable branch anyway.

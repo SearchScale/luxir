@@ -796,7 +796,10 @@ private:
   // Warmup fill then bottom-gated replacement over one gathered chunk.
   // Shared by the in-order window path (which gathers keys per chunk) and
   // the masked block driver (which gathers fused with the domain bits).
-  void admitChunk(int32_t segment, std::span<const int32_t> docs,
+  // Pin the start alignment: the replacement loop is one tight compare per
+  // doc, and a 32-byte shift from unrelated code moving cost resident
+  // field sorts about 5% more cycles at identical instruction counts.
+  [[gnu::aligned(64)]] void admitChunk(int32_t segment, std::span<const int32_t> docs,
                   std::span<const int64_t> keys,
                   FieldComparator::KeyBatch* batch) {
     size_t i = 0;

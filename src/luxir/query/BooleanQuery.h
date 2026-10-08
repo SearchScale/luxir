@@ -6957,6 +6957,10 @@ public:
                 });
       if (!competitivePruning
           && !disableExactDirectApproximationsForTests) {
+        // These leaves are final, so exact type equality identifies the
+        // specialization without walking their inheritance trees.
+        static_assert(std::is_final_v<DirectTermScorer>
+                      && std::is_final_v<PreparedDocSetScorer>);
         auto kinds =
             pool.make_span<ExactApproxKind>(approximations.size());
         bool supported = true;
@@ -6964,18 +6968,21 @@ public:
           const ApproxSlot& approximation = approximations[i];
           if (approximation.kind == ApproxSlot::Kind::DOCS_ENUM) {
             kinds[i] = ExactApproxKind::DOCS_ENUM;
-          } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
-                     && dynamic_cast<DirectTermScorer*>(
-                            approximation.scorer) != nullptr) {
-            kinds[i] = ExactApproxKind::TERM_SCORER;
-          } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
-                     && dynamic_cast<PreparedDocSetScorer*>(
-                            approximation.scorer) != nullptr) {
-            kinds[i] = ExactApproxKind::DOC_SET;
-          } else {
-            supported = false;
-            break;
+            continue;
           }
+          if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE) {
+            const std::type_info& type = typeid(*approximation.scorer);
+            if (type == typeid(DirectTermScorer)) {
+              kinds[i] = ExactApproxKind::TERM_SCORER;
+              continue;
+            }
+            if (type == typeid(PreparedDocSetScorer)) {
+              kinds[i] = ExactApproxKind::DOC_SET;
+              continue;
+            }
+          }
+          supported = false;
+          break;
         }
         if (supported) {
           exactApproxKinds = kinds;
@@ -7859,22 +7866,6 @@ public:
     }
 
     template <bool TermFast, bool TermTailFast = false>
-    int32_t scorerAdvanceForClauseProbe(size_t index, int32_t target) {
-      if constexpr (TermFast) {
-        return disableScoredProbeForTests
-            ? termScorers[index]->docsEnum.advance(target)
-            : termScorers[index]->advanceScoredProbe(target);
-      } else if constexpr (TermTailFast) {
-        assert(index > 0);
-        return disableScoredProbeForTests
-            ? termScorers[index]->docsEnum.advance(target)
-            : termScorers[index]->advanceScoredProbe(target);
-      } else {
-        return scorers[index]->advance(target);
-      }
-    }
-
-    template <bool TermFast, bool TermTailFast = false>
     int32_t scorerAdvanceLead(int32_t target) {
       const int64_t before =
           SkipStats::enabled ? SkipStats::tfreqBlocksDecoded : 0;
@@ -7956,26 +7947,18 @@ public:
       }
     }
 
-    template <bool TermFast, bool TermTailFast = false>
-    float scorerScore(size_t index) {
-      if constexpr (TermFast) {
-        return termScorers[index]->score();
-      } else if constexpr (TermTailFast) {
-        return index == 0 ? scorers[0]->score()
-                          : termScorers[index]->score();
-      } else {
-        return scorers[index]->score();
-      }
-    }
-
     template <bool CheckBound>
     int32_t LUXIR_INLINE applyScoredProbeToCandidates(
         TermQuery::Scorer* scorer, int32_t size,
         double remaining) {
+      // Child probes mutate postings, never the parent's scratch bindings.
+      // Retain the bases across probes instead of reloading each candidate.
+      int32_t* docs = candDocs.data();
+      float* scores = candScores.data();
       int32_t write = 0;
       for (int32_t i = 0; i < size; i++) {
-        int32_t doc = candDocs[(size_t) i];
-        float sum = candScores[(size_t) i];
+        int32_t doc = docs[(size_t) i];
+        float sum = scores[(size_t) i];
         if constexpr (CheckBound) {
           if (((double) sum + remaining) * scoreBoundFactor
               < (double) minCompetitiveScore) {
@@ -7984,8 +7967,8 @@ public:
         }
         float clauseScore;
         if (!scorer->matchScoredProbe(doc, clauseScore)) continue;
-        candDocs[(size_t) write] = doc;
-        candScores[(size_t) write] = sum + clauseScore;
+        docs[(size_t) write] = doc;
+        scores[(size_t) write] = sum + clauseScore;
         write++;
       }
       return write;
@@ -7994,7 +7977,19 @@ public:
     template <bool CheckBound, bool TermFast, bool TermTailFast = false>
     int32_t LUXIR_INLINE applyScorerToCandidates(
         size_t clause, int32_t size, double remaining) {
-      int32_t scorerDoc = scorerDocId<TermFast, TermTailFast>(clause);
+      // A batch probes one child. Retain that binding across its calls rather
+      // than recovering it from the parent's span and clause index per doc.
+      auto* scorer = [&] {
+        if constexpr (TermFast || TermTailFast) return termScorers[clause];
+        else return scorers[clause];
+      }();
+      int32_t scorerDoc;
+      if constexpr (TermFast || TermTailFast) {
+        assert(!TermTailFast || clause > 0);
+        scorerDoc = scorer->docsEnum.docId();
+      } else {
+        scorerDoc = scorer->docId();
+      }
       int32_t write = 0;
       for (int32_t i = 0; i < size; i++) {
         int32_t doc = candDocs[(size_t) i];
@@ -8006,13 +8001,16 @@ public:
           }
         }
         if (scorerDoc < doc) {
-          scorerDoc = scorerAdvanceForClauseProbe<TermFast, TermTailFast>(
-              clause, doc);
+          if constexpr (TermFast || TermTailFast) {
+            scorerDoc = disableScoredProbeForTests
+                ? scorer->docsEnum.advance(doc) : scorer->advanceScoredProbe(doc);
+          } else {
+            scorerDoc = scorer->advance(doc);
+          }
         }
         if (scorerDoc != doc) continue;
         candDocs[(size_t) write] = doc;
-        candScores[(size_t) write] =
-            sum + scorerScore<TermFast, TermTailFast>(clause);
+        candScores[(size_t) write] = sum + scorer->score();
         write++;
       }
       return write;
@@ -8194,7 +8192,10 @@ public:
           // blocks. A filter is a zero-score required clause: it owns
           // membership and may own the candidate feed, but contributes no
           // score bound and must not parse frequency/impact data here.
-          for (size_t c = 0; c < scorers.size(); c++) {
+          // Child calls cannot change the parent's clause count. Keep it
+          // local across shallow probes rather than reloading after each one.
+          const size_t numScorers = scorers.size();
+          for (size_t c = 0; c < numScorers; c++) {
             if (scoringClauses[c] != 0) {
               upTo = std::min(
                   upTo,
@@ -8204,8 +8205,8 @@ public:
           if (upTo < leadDoc) {
             upTo = leadDoc;
           }
-          suffixMax[scorers.size()] = 0.0;
-          for (size_t c = scorers.size(); c-- > 0; ) {
+          suffixMax[numScorers] = 0.0;
+          for (size_t c = numScorers; c-- > 0; ) {
             windowMax[c] = scoringClauses[c] != 0
                 ? scorerGetMaxScore<TermFast, TermTailFast>(c, upTo)
                 : 0.0f;
@@ -8291,6 +8292,8 @@ public:
                 windowFilter != nullptr && !windowFilter->probes();
             if (filter != nullptr || fillFilter) {
               int32_t w = 0;
+              // Candidate batches benefit from amortizing filter-loop control.
+              #pragma GCC unroll 2
               for (int32_t i = 0; i < n; i++) {
                 int32_t doc = candDocs[(size_t) i];
                 if (filter != nullptr && !filter->get(doc)) continue;

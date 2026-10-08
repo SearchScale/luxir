@@ -285,24 +285,55 @@ public:
   void orRange(std::span<uint64_t> destination, int32_t from,
                int32_t to) const {
     assert(from >= 0 && to >= from && to <= nbits);
+    assert((int64_t) destination.size() * 64 >= to - from);
+    if (from == to) return;
+    if (((from | to) & 63) != 0) {
+      orUnalignedRange(destination, from, to);
+      return;
+    }
+    const uint64_t* source = words + (from >> 6);
+    int32_t count = (to - from) >> 6;
+    for (int32_t i = 0; i < count; i++) destination[(size_t) i] |= source[i];
+  }
+
+private:
+  // Whole-word windows are the common path. Keep arbitrary shifts and the
+  // tail mask out of their callers' register frame and inline budget.
+  [[gnu::noinline]] void orUnalignedRange(std::span<uint64_t> destination,
+                                        int32_t from, int32_t to) const {
+    assert(from >= 0 && to >= from && to <= nbits);
     int32_t bitCount = to - from;
     assert((int64_t) destination.size() * 64 >= bitCount);
     if (bitCount == 0) return;
 
-    int32_t destinationWords = (bitCount + 63) >> 6;
+    int32_t fullWords = bitCount >> 6;
     int32_t sourceWord = from >> 6;
     int32_t shift = from & 63;
-    for (int32_t i = 0; i < destinationWords; i++) {
-      uint64_t sourceBits = words[sourceWord + i] >> shift;
-      if (shift != 0 && sourceWord + i + 1 < (int32_t) nwords) {
-        sourceBits |= words[sourceWord + i + 1] << (64 - shift);
+    const uint64_t* source = words + sourceWord;
+    // Keep the tail mask out of the word loop. A conditional on the last
+    // word makes vectorization depend on matching source/destination
+    // alignment, which changes with unrelated arena allocations.
+    if (shift == 0) {
+      for (int32_t i = 0; i < fullWords; i++) {
+        destination[(size_t) i] |= source[i];
       }
-      if (i + 1 == destinationWords && (bitCount & 63) != 0) {
-        sourceBits &= (1ULL << (bitCount & 63)) - 1ULL;
+    } else {
+      for (int32_t i = 0; i < fullWords; i++) {
+        destination[(size_t) i] |= (source[i] >> shift)
+            | (source[i + 1] << (64 - shift));
       }
-      destination[(size_t) i] |= sourceBits;
+    }
+    int32_t tailBits = bitCount & 63;
+    if (tailBits != 0) {
+      uint64_t sourceBits = source[fullWords] >> shift;
+      if (shift != 0 && sourceWord + fullWords + 1 < (int32_t) nwords) {
+        sourceBits |= source[fullWords + 1] << (64 - shift);
+      }
+      destination[(size_t) fullWords] |= sourceBits & ((1ULL << tailBits) - 1);
     }
   }
+
+public:
 
   void set(int32_t index) {
     assert(index < nbits);
