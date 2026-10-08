@@ -1939,6 +1939,20 @@ private:
     return consumed;
   }
 
+  // A resident block left by the previous window may end below this window's
+  // base: the same boundary intoBitSet's entry check jumps from. Without the
+  // jump the loop streams every block of the gap, which seeding's scattered
+  // leaves and competitive-range walks over dense word-coded terms pay in
+  // full. Out of line: it runs once per window at most.
+  [[gnu::noinline]] void jumpPastResidentBlock(int32_t bitsBase) {
+    assert(!docBlockResident && docBufEnd == Postings::DOCS_BLOCK_SIZE);
+    if (docid != PostingsReader::END && nextL0Block < numDocBlocks
+        && docBuf[Postings::DOCS_BLOCK_SIZE - 1] < bitsBase) {
+      skipToBlock(bitsBase);
+      blockMode = true;
+    }
+  }
+
 public:
   // Bulk count fill (the Lucene PostingsEnum#intoBitSet shape): consume every
   // remaining doc below upTo, setting bit (doc - bitsBase) for docs at or past
@@ -1968,6 +1982,7 @@ public:
     for (;;) {
       if (docBlockResident) {
         if (orDocOnlyResidentIntoBitSet(bits, bitsBase, upTo)) {
+          jumpPastResidentBlock(bitsBase);
           continue;
         }
         return;
@@ -3711,6 +3726,18 @@ public:
     blockMode = true;
   }
 
+private:
+  // See DocsEnumImpl::jumpPastResidentBlock.
+  [[gnu::noinline]] void jumpPastResidentBlock(int32_t bitsBase) {
+    assert(!docBlockResident && docBufEnd == Postings::DOCS_BLOCK_SIZE);
+    if (docid != PostingsReader::END && nextL0Block < numDocBlocks
+        && db[Postings::DOCS_BLOCK_SIZE - 1] < bitsBase) {
+      skipToBlock(bitsBase);
+      blockMode = true;
+    }
+  }
+
+public:
   void intoBitSet(std::span<uint64_t> bits, int32_t bitsBase, int32_t upTo) {
     // Same jumped-window block-level repositioning as
     // DocsEnumImpl::intoBitSet: skip data moves the block cursor, no doc is
@@ -3724,6 +3751,7 @@ public:
     for (;;) {
       if (docBlockResident) {
         if (orResidentIntoBitSet(bits, bitsBase, upTo)) {
+          jumpPastResidentBlock(bitsBase);
           continue;
         }
         return;
