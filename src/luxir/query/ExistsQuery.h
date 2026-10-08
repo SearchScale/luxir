@@ -75,6 +75,23 @@ public:
     }
 
     int32_t docId() override { return iterator.val(); }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t min, int32_t max) override {
+      fillWindowBits(words, min, max);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      if (min >= max) return;
+      int32_t doc = iterator.val();
+      if (doc < min) doc = iterator.advance(min);
+      while (doc < max) {
+        int32_t bit = doc - min;
+        words[(size_t)bit >> 6] |= 1ULL << (bit & 63);
+        doc = iterator.next();
+      }
+    }
   };
 
   class Weight final : public Query::Weight {

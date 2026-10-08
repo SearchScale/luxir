@@ -207,9 +207,23 @@ public:
 
   int32_t docId() override { return doc; }
 
+  // Membership seek. Every member is exact, so there is nothing to verify
+  // and landing past max is navigation, which the bounded protocol allows:
+  // the next member is the caller's lookahead resume point. Answer here
+  // rather than through the base class's virtual docId()/advance() pair.
+  int32_t advanceWindow(int32_t min, int32_t max) override {
+    if (min >= max) return max;
+    return doc >= min ? doc : advance(min);
+  }
+
   // Window fills OR membership into caller-owned scratch; the caller clears
   // separate clause scratch and ANDs across conjunctive scorers. The array
   // resume cursor requires windows to arrive in nondecreasing order.
+  void fillScoredWindowBits(std::span<uint64_t> words,
+                            int32_t start, int32_t end) override {
+    fillWindowBits(words, start, end);
+  }
+
   void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                       int32_t windowEnd) override {
     assert(windowStart >= 0 && windowEnd >= windowStart && windowEnd <= maxDoc);

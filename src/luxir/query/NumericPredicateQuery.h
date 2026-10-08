@@ -34,6 +34,11 @@ class NumericPredicateQuery final : public Query {
 
 public:
   static inline bool disableShapesForTests = false;
+#ifndef NDEBUG
+  // Observe actual verification, not column decoding or metadata navigation.
+  // Tests install this only after the product has been built.
+  static inline thread_local void (*verificationObserver)(int32_t) = nullptr;
+#endif
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi)
     : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi} {}
@@ -178,6 +183,9 @@ public:
 
     bool valueMatches() {
       if (docid == PostingsReader::END) return false;
+#ifndef NDEBUG
+      if (verificationObserver != nullptr) verificationObserver(docid);
+#endif
       if (!multi) {
         if (allMatch) return true;
         return query.matchesValue(iter.value());
@@ -236,6 +244,33 @@ public:
       return docid;
     }
     int32_t docId() override { return docid; }
+
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      if (docid < min) docid = iter.advance(min);
+      return docid;
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      if (docid < min) docid = iter.advance(min);
+      while (docid < max && !valueMatches()) docid = iter.next();
+      return docid;
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      skipCount(SkipStats::countBulkFillCalls);
+      if (min >= max) return;
+      if (docid < min) docid = iter.advance(min);
+      while (docid < max) {
+        if (valueMatches()) {
+          int32_t index = docid - min;
+          words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+        }
+        docid = iter.next();
+      }
+    }
   };
 
   enum class BlockRelation : uint8_t {
@@ -410,6 +445,11 @@ public:
         while (rank < limit) {
           doc = docForRank(rank);
           if (doc >= max) return;
+#ifndef NDEBUG
+          if (plan.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
+            verificationObserver(doc);
+          }
+#endif
           if (plan.relation == BlockRelation::INSIDE
               || crossing.matches(rank, plan, query)) {
             setBit(words, min, doc);
@@ -444,6 +484,9 @@ public:
       auto [doc, docRank] = firstDocRank(min);
       while (doc < max && docRank < reader.docsWithValue()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
+#ifndef NDEBUG
+        if (verificationObserver != nullptr) verificationObserver(doc);
+#endif
         if (start < end && docValuesMatch(start, end)) {
           setBit(words, min, doc);
         }
@@ -514,6 +557,11 @@ public:
       std::fill(iterBits.begin(), iterBits.end(), 0);
     }
 
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
+    }
+
     void fillWindowBits(std::span<uint64_t> words, int32_t min,
                         int32_t max) override {
       assert(min >= 0 && min <= max && max <= maxDoc);
@@ -533,6 +581,31 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      if (min >= maxDoc) return docid = PostingsReader::END;
+      int32_t limit = std::min(max, maxDoc);
+      int32_t found = findInIterationWindow(min);
+      if (found < limit) return docid = found;
+      // The cached window is complete from its start; continue after it
+      // only when it covers min. Fill no further than the caller's bound,
+      // clearing just the words that bound uses: point probes stay O(1).
+      int32_t target = min >= iterWindowStart && min < iterWindowEnd
+          ? iterWindowEnd : min;
+      while (target < limit) {
+        iterWindowStart = target;
+        iterWindowEnd = (int32_t)std::min<int64_t>(limit,
+            (int64_t)target + ITER_WINDOW_SIZE);
+        std::fill_n(iterBits.begin(),
+                    (iterWindowEnd - iterWindowStart + 63) >> 6, 0);
+        fillWindowBits(iterBits, iterWindowStart, iterWindowEnd);
+        found = findInIterationWindow(target);
+        if (found < limit) return docid = found;
+        target = iterWindowEnd;
+      }
+      return docid = limit == maxDoc ? PostingsReader::END : max;
+    }
 
   protected:
     // The current iteration window is behind docid, so emptying the doc

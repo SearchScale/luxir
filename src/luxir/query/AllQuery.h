@@ -69,6 +69,11 @@ public:
 
     void exhaust() override { lastDoc = -1; }
 
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
+    }
+
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       skipCount(SkipStats::countBulkFillCalls);

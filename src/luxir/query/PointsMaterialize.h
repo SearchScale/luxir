@@ -101,6 +101,26 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t min, int32_t max) override {
+      fillWindowBits(words, min, max);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      if (min >= max) return;
+      if (docid < min) advance(min);
+      // The retained array is already exact. Walk it directly instead of
+      // invoking the generic bounded seek for each member of the window.
+      while (docid < max) {
+        int32_t bit = docid - min;
+        words[(size_t)bit >> 6] |= 1ULL << (bit & 63);
+        ++index;
+        docid = index < (int64_t)docs.size()
+            ? docs[(size_t)index] : PostingsReader::END;
+      }
+    }
   protected:
     void exhaust() override { index = (int64_t)docs.size(); }
   };
@@ -135,6 +155,17 @@ struct PointsMaterialize {
       return seek(target);
     }
     int32_t docId() override { return docid; }
+    // Exact members need no verification; the next one past max is a
+    // lookahead resume point (see QueryPrep::DocSetScorer::advanceWindow).
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      return docid >= min ? docid : seek(min);
+    }
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
+    }
+
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       assert(windowStart >= 0 && windowEnd >= windowStart

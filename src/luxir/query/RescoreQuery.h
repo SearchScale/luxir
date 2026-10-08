@@ -174,6 +174,10 @@ class RescoreQuery final : public Query {
       composeBounds(PostingsReader::END, false);
     }
 
+    [[gnu::cold]] void prepareMembership() override {
+      child->prepareMembership();
+    }
+
     int32_t next() override {
       return skipUncompetitive(false, child->next());
     }

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <limits>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -75,12 +76,35 @@ std::vector<int32_t> pullDocs(Query::Scorer& scorer, int32_t min,
   return docs;
 }
 
+// The same observer covers nested verifiers, including prohibited children
+// and probes. Fresh-product parity alone would miss identical overproduction.
+struct VerificationBounds {
+#ifndef NDEBUG
+  static inline thread_local int32_t min = 0, max = 0;
+  static inline thread_local int64_t observations = 0;
+  static void observe(int32_t doc) {
+    observations++;
+    EXPECT_GE(doc, min);
+    EXPECT_LT(doc, max);
+  }
+  VerificationBounds(int32_t begin, int32_t end) {
+    min = begin;
+    max = end;
+    NumericPredicateQuery::verificationObserver = observe;
+  }
+  ~VerificationBounds() { NumericPredicateQuery::verificationObserver = nullptr; }
+#else
+  VerificationBounds(int32_t, int32_t) {}
+#endif
+};
+
 std::vector<int32_t> bulkDocs(BulkScorer& bulk, DocSet* domain,
                               int32_t min, int32_t max) {
   std::vector<int32_t> docs;
   // Call even for an empty range: it must leave no stale output behind.
   for (;;) {
     ScoreWindow window;
+    VerificationBounds bounds(min, max);
     int32_t next = bulk.matchNextWindow(window, domain, min, max);
     for (int32_t i = 0; i < window.size; i++) {
       int32_t doc = window.docs[(size_t) i];
@@ -99,6 +123,7 @@ int64_t bulkCount(BulkScorer& bulk, DocSet* domain, int32_t min, int32_t max,
                   DocSetBuilder* output = nullptr) {
   int64_t count = 0;
   for (;;) {
+    VerificationBounds bounds(min, max);
     int32_t next = bulk.countNextWindow(count, output, domain, min, max);
     if (next == PostingsReader::END || next >= max) return count;
     EXPECT_GT(next, min);
@@ -135,14 +160,73 @@ void checkPull(IndexReader& reader, Query& query, int64_t leadCost) {
   }
 }
 
-void checkBulk(IndexReader& reader, Query& query, bool expectedAvailable,
-               DocSet* domain = nullptr, Query* attached = nullptr, bool probe = false) {
+void checkBoundedPull(IndexReader& reader, Query& query, int64_t leadCost) {
+  Products reused(reader, query);
+  auto* scorer = reused.pullPlan(leadCost)->build(reused.pool);
+  for (auto [min, max] : windows(reader.segments()[0].maxDoc())) {
+    Products fresh(reader, query);
+    auto expected = pullDocs(*fresh.pullPlan(leadCost)->build(fresh.pool), min, max, false);
+    scorer->reset();
+    std::vector<int32_t> actual;
+    {
+      VerificationBounds bounds(min, max);
+      for (int32_t target = min; target < max;) {
+        int32_t doc = scorer->advanceWindow(target, max);
+        if (doc >= max) break;
+        actual.push_back(doc);
+        target = doc + 1;
+      }
+    }
+    EXPECT_EQ(expected, actual);
+    // A rejected point probe can leave an unverified cursor at the next
+    // window. Filling must verify it, even when docId already equals min.
+    scorer->reset();
+    if (min > 0) {
+      VerificationBounds bounds(min - 1, min);
+      scorer->advanceWindow(min - 1, min);
+    }
+    std::vector<uint64_t> words((size_t)(max - min + 63) / 64);
+    {
+      VerificationBounds bounds(min, max);
+      scorer->fillWindowBits(words, min, max);
+    }
+    actual.clear();
+    for (int32_t doc = min; doc < max; doc++) {
+      int32_t bit = doc - min;
+      if ((words[(size_t)bit >> 6] >> (bit & 63)) & 1) actual.push_back(doc);
+    }
+    EXPECT_EQ(expected, actual);
+    // A conjunction partner may re-enter below a match the scorer found past
+    // empty navigation chunks. The answer is still that match.
+    scorer->reset();
+    int32_t first = scorer->advanceWindow(min, max);
+    if (first < max && first > min) {
+      EXPECT_EQ(first, scorer->advanceWindow(min + 1, max));
+    }
+  }
+}
+
+void checkBulk(IndexReader& reader, Query& query, std::optional<bool> expectedAvailable,
+               DocSet* domain = nullptr, Query* attached = nullptr, bool probe = false,
+               Query* enclosing = nullptr) {
   int32_t maxDoc = reader.segments()[0].maxDoc();
   for (Use use : {Use::MATCH_WINDOWS, Use::COUNT_WINDOWS}) {
     Products reused(reader, query);
     ASSERT_NE(nullptr, reused.supplier);
-    auto plan = reused.supplier->planBulk(use, {});
-    if (!expectedAvailable) {
+    auto planFor = [&](Products& product) {
+      Query::ScorerSupplier::BulkScorerContext context;
+      if (enclosing != nullptr) {
+        auto filters = product.pool.make_span<Query::ScorerSupplier*>(1);
+        filters[0] = enclosing->createWeight(product.context, 0)->scorerSupplier(
+            product.pool, reader.segments()[0], Query::SupplierExecutionMode::RAW_MEMBERSHIP);
+        context.filterSuppliers = filters;
+        context.filterCost = filters[0]->cost();
+        context.requireFilterConsumption = true;
+      }
+      return product.supplier->planBulk(use, context);
+    };
+    auto plan = planFor(reused);
+    if (!expectedAvailable.value_or(plan.available == Answer::YES)) {
       EXPECT_EQ(Answer::NO, plan.supportsReposition());
       continue;
     }
@@ -167,7 +251,7 @@ void checkBulk(IndexReader& reader, Query& query, bool expectedAvailable,
     for (auto [min, max] : windows(maxDoc)) {
       SCOPED_TRACE(::testing::Message() << "bulk epoch=" << epoch++ << " range=" << min << ':' << max);
       Products fresh(reader, query);
-      auto freshPlan = fresh.supplier->planBulk(use, {});
+      auto freshPlan = planFor(fresh);
       auto* expected = fresh.supplier->buildBulk(fresh.pool, freshPlan);
       ASSERT_NE(nullptr, expected);
       if (attached != nullptr) attach(fresh, expected);
@@ -190,7 +274,7 @@ void checkBulk(IndexReader& reader, Query& query, bool expectedAvailable,
     // returned an out-of-range lookahead doc or bounded END. Compare the
     // concatenation against an independent, unbounded traversal.
     Products fresh(reader, query);
-    auto freshPlan = fresh.supplier->planBulk(use, {});
+    auto freshPlan = planFor(fresh);
     auto* expected = fresh.supplier->buildBulk(fresh.pool, freshPlan);
     ASSERT_NE(nullptr, expected);
     if (attached != nullptr) attach(fresh, expected);
@@ -373,6 +457,9 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   Query* all = queries.make<AllQuery>();
   Query* prefix = queries.make<PrefixQuery>("body_w", "q");
   Query* zone = queries.make<NumericPredicateQuery>("column", 100, N / 2);
+  // Matches only past several empty zone-map iteration windows.
+  Query* zoneLate = queries.make<NumericPredicateQuery>(
+      "column", 3 * DocsEnumMeta::L1_DOCS + 5, 4 * DocsEnumMeta::L1_DOCS);
   Query* pointArray = queries.make<NumericPredicateQuery>("point", 125, 140);
   Query* pointBits = queries.make<NumericPredicateQuery>("point", 100, N / 2);
   Query* pointComplement = queries.make<NumericPredicateQuery>("point", 0, N - 100);
@@ -390,12 +477,14 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   Query* numericNot = boolean(clauses({word}), {}, clauses({multi}));
   for (Query* query : {dense, word, packed, shortTerm, pulse, conjunction, lookahead, disjunction,
                       nested, nestedFiltered, excluded, filtered, filterOnly, optional, all, prefix,
-                      zone, pointArray, pointBits, pointComplement, sparse, scan,
+                      zone, zoneLate, pointArray, pointBits, pointComplement, sparse, scan,
                       multi, exists, existsDense, existsRare, constant, boosted, twoWay, minMatch,
                       numericConjunction, numericUnion, numericNot}) {
     SCOPED_TRACE(::testing::Message() << "query=" << (int) query->getKind());
     checkPull(*reader, *query, N);
     checkPull(*reader, *query, 0);
+    checkBoundedPull(*reader, *query, N);
+    checkBoundedPull(*reader, *query, 0);
   }
   for (Query* query : {dense, word, packed, shortTerm, pulse, conjunction, lookahead, disjunction,
                       nested, nestedFiltered, excluded, filtered, filterOnly, optional, all, prefix,
@@ -403,6 +492,33 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
     SCOPED_TRACE(::testing::Message() << "bulk query=" << (int) query->getKind());
     checkBulk(*reader, *query, true);
   }
+  for (Query* query : {numericConjunction, numericUnion, numericNot}) {
+    SCOPED_TRACE(::testing::Message() << "numeric bulk "
+        << (query == numericConjunction ? "conjunction"
+            : query == numericUnion ? "union" : "not"));
+    checkBulk(*reader, *query, std::nullopt);
+  }
+  // Exhaustive numeric conjunctions: dense fills, per-candidate leapfrog,
+  // and the sparse route admitted for an enclosing filter. In the pulse
+  // case the physical demand still selects sparse numeric verification.
+  for (int32_t mode : {0, 1, 2}) {
+    using Conj = BooleanQuery::ConjunctionBulkScorer;
+    SearchOverridesGuard guard(BooleanQuery::disableExactTermCountForTests,
+        Conj::denseThresholdInverseForTests,
+        Conj::denseLeapfrogThresholdForTests, Conj::termLeadLeapfrogThresholdForTests);
+    BooleanQuery::disableExactTermCountForTests = true;
+    Conj::denseThresholdInverseForTests = mode == 2 ? 1 : N;
+    Conj::denseLeapfrogThresholdForTests = mode == 1 ? N : 0;
+    Conj::termLeadLeapfrogThresholdForTests = mode == 1 ? N : 0;
+    for (Query* lead : {word, shortTerm, pulse}) {
+      SCOPED_TRACE(::testing::Message() << "numeric FILTER mode=" << mode
+          << " lead=" << (lead == word ? "word" : lead == shortTerm ? "short" : "pulse"));
+      Query* body = boolean(clauses({lead, packed}), {});
+      checkBulk(*reader, *body, true, nullptr, nullptr, false, zone);
+    }
+  }
+  Query* numericExcluded = boolean(clauses({word}), {}, clauses({pointArray}), clauses({zone}));
+  checkBulk(*reader, *numericExcluded, true);
   checkBulk(*reader, *sparse, false);
   checkBulk(*reader, *scan, false);
   checkBulk(*reader, *exists, false);
@@ -468,6 +584,38 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   for (Query* query : {dominantUnion, disjunction, all, filterOnly}) {
     checkChangingDomains(*reader, *query, &array, &bits);
   }
+  {
+    SearchOverridesGuard statsGuard(SkipStats::enabled);
+    SkipStats::enabled = true;
+    int64_t before = SkipStats::filteredDisjBatchPostingsFeedEngagements;
+    Query* sparseFiltered = boolean({}, clauses({word, packed}), {}, clauses({shortTerm}), 1);
+    for (Use use : {Use::MATCH_WINDOWS, Use::COUNT_WINDOWS}) {
+      Products reused(*reader, *sparseFiltered);
+      auto plan = reused.supplier->planBulk(use, {});
+      ASSERT_EQ(Answer::YES, plan.supportsReposition());
+      auto* bulk = reused.supplier->buildBulk(reused.pool, plan);
+      for (int epoch = 0; epoch < 2; epoch++) {
+        bulk->reposition(0);
+        int32_t min = 0;
+        for (DocSet* domain : {(DocSet*)nullptr, (DocSet*)&array,
+                              (DocSet*)&bits, (DocSet*)nullptr}) {
+          int32_t max = min == 39 ? N : min + 13;
+          Products fresh(*reader, *sparseFiltered);
+          auto freshPlan = fresh.supplier->planBulk(use, {});
+          auto* expected = fresh.supplier->buildBulk(fresh.pool, freshPlan);
+          if (use == Use::MATCH_WINDOWS) {
+            EXPECT_EQ(bulkDocs(*expected, domain, min, max),
+                      bulkDocs(*bulk, domain, min, max));
+          } else {
+            EXPECT_EQ(bulkCount(*expected, domain, min, max),
+                      bulkCount(*bulk, domain, min, max));
+          }
+          min = max;
+        }
+      }
+    }
+    EXPECT_GT(SkipStats::filteredDisjBatchPostingsFeedEngagements, before);
+  }
   for (DocSet* domain : std::array<DocSet*, 2>{&array, &bits}) {
     checkBulk(*reader, *dense, true, domain);
     checkBulk(*reader, *disjunction, true, domain);
@@ -506,12 +654,104 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   Query* mixedMust = boolean(clauses({dense, &phrase}), {});
   Query* mixedShould = boolean({}, clauses({packed, &sloppy}));
   Query* mixedNot = boolean(clauses({dense}), {}, clauses({&phrase}));
+  // Check the executing phrase arms before later traversals can populate a
+  // prohibited membership cache and legitimately resolve to materialized docs.
   for (Query* query : std::array<Query*, 5>{&phrase, &sloppy, mixedMust, mixedShould, mixedNot}) {
     Products product(*reader, *query);
     ASSERT_NE(nullptr, product.supplier);
     EXPECT_FALSE(product.pullPlan(N)->supportsReset());
     EXPECT_EQ(Answer::NO, product.supplier->planBulk(Use::MATCH_WINDOWS, {}).supportsReposition());
   }
+  // Scored bit fills must retain exact cursor state. In particular a sparse
+  // predicate must not leave an unverified doc at the next window's start.
+  for (Query* query : {zone, sparse, scan, multi, all, prefix, pointBits}) {
+    for (int64_t leadCost : {int64_t(0), int64_t(N)}) {
+      Products reused(*reader, *query, Query::NEED_SCORES);
+      auto* scorer = reused.pullPlan(leadCost, Use::PULL)->build(reused.pool);
+      std::vector<int32_t> actual;
+      for (int32_t start = 0; start < 257; start += 13) {
+        int32_t end = std::min(257, start + 13);
+        uint64_t bits = 0;
+        scorer->fillScoredWindowBits(std::span(&bits, 1), start, end);
+        while (bits != 0) {
+          actual.push_back(start + (int32_t)std::countr_zero(bits));
+          bits &= bits - 1;
+        }
+      }
+      if (scorer->docId() < 257) scorer->advance(257);
+      for (int32_t doc = scorer->docId(); doc < N; doc = scorer->next()) {
+        actual.push_back(doc);
+      }
+      Products fresh(*reader, *query, Query::NEED_SCORES);
+      EXPECT_EQ(pullDocs(*fresh.pullPlan(leadCost, Use::PULL)->build(fresh.pool),
+                         0, N, false), actual);
+    }
+  }
+  // Membership drains retain ownership after a scored prefix. In particular,
+  // a conjunction may have driven a phrase's postings enums externally.
+  Query* wrappedPhraseConj = queries.make<ConstantScoreQuery>(mixedMust);
+  Query* wrappedTerm = queries.make<ConstantScoreQuery>(word);
+  Query* constantUnion = boolean({}, clauses({wrappedPhraseConj, wrappedTerm}));
+  Query* wrappedPrivatePhrase = queries.make<ConstantScoreQuery>(mixedShould);
+  for (Query* query : {mixedMust, mixedShould, mixedNot, wrappedPhraseConj,
+                      wrappedPrivatePhrase, constantUnion}) {
+    Products reused(*reader, *query, Query::NEED_SCORES);
+    auto* scorer = reused.pullPlan(N, Use::PULL)->build(reused.pool);
+    scorer->advance(17);
+    scorer->prepareMembership();
+    constexpr int32_t begin = 257, end = 2 * DocsEnumMeta::L1_DOCS + 1;
+    Products fresh(*reader, *query, Query::NEED_SCORES);
+    auto expected = pullDocs(*fresh.pullPlan(N, Use::PULL)->build(fresh.pool), begin, end, false);
+    std::vector<uint64_t> actual((end - begin + 63) / 64);
+    scorer->fillWindowBits(actual, begin, end);
+    std::vector<int32_t> docs;
+    for (int32_t doc = begin; doc < end; doc++) {
+      int32_t bit = doc - begin;
+      if ((actual[(size_t)bit >> 6] >> (bit & 63)) & 1) docs.push_back(doc);
+    }
+    EXPECT_EQ(expected, docs);
+  }
+  {
+    SearchOverridesGuard statsGuard(SkipStats::enabled);
+    SkipStats::enabled = true;
+    int64_t intersectionsBefore = SkipStats::maxScoreRequiredIntersectionWindows;
+    Products reused(*reader, *constantUnion, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto plan = reused.supplier->planBulk(Use::SCORED_WINDOWS, {});
+    ASSERT_EQ(Answer::YES, plan.available);
+    auto* bulk = reused.supplier->buildBulk(reused.pool, plan);
+    // All matching docs belong to both clauses. A floor requiring both
+    // engages the scored bit intersection, followed by another scored window.
+    std::vector<int32_t> scored;
+    int32_t cursor = 0;
+    constexpr int32_t stop = 2 * DocsEnumMeta::L1_DOCS;
+    while (cursor < stop) {
+      ScoreWindow out;
+      int32_t next = bulk->scoreNextWindow(out, nullptr, cursor, stop, 1.5f);
+      scored.insert(scored.end(), out.docs.begin(), out.docs.begin() + out.size);
+      if (next == PostingsReader::END || next >= stop) break;
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    EXPECT_GT(SkipStats::maxScoreRequiredIntersectionWindows, intersectionsBefore);
+    Products expected(*reader, *word);
+    EXPECT_EQ(pullDocs(*expected.pullPlan(N)->build(expected.pool), 0, stop, false), scored);
+    Products drain(*reader, *constantUnion, Query::NEED_SCORES);
+    auto drainPlan = drain.supplier->planBulk(Use::SCORED_WINDOWS, {});
+    ASSERT_EQ(Answer::YES, drainPlan.available);
+    auto* draining = drain.supplier->buildBulk(drain.pool, drainPlan);
+    ScoreWindow out;
+    int32_t resume = draining->scoreNextWindow(out, nullptr, 0, stop,
+                                              std::numeric_limits<float>::lowest());
+    ASSERT_NE(PostingsReader::END, resume);
+    draining->prepareMembership();
+    Products rest(*reader, *word);
+    auto remaining = pullDocs(*rest.pullPlan(N)->build(rest.pool), resume, N, false);
+    EXPECT_EQ((int64_t)remaining.size(), bulkCount(*draining, nullptr, resume, N));
+  }
+#ifndef NDEBUG
+  EXPECT_GT(VerificationBounds::observations, 0);
+#endif
+
   for (Query* query : {dense, disjunction, all, exists, constant, prefix, zone, pointArray}) {
     for (int32_t flags : {Query::NEED_SCORES, Query::NEED_SCORES | Query::ALLOW_PRUNING}) {
       Products scored(*reader, *query, flags);

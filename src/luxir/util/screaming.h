@@ -366,6 +366,15 @@ public:
     return OBS::nextSetBit(index, nwords);
   }
 
+  // Bounded navigation must not scan an empty suffix beyond the caller's
+  // window. The last word may straddle the limit; mask its result logically.
+  index_type nextSetBit(int32_t index, int32_t limit) const {
+    assert(index >= 0 && limit <= nbits);
+    if (index >= limit) return OBS::MAX_INDEX;
+    index_type found = OBS::nextSetBit(index, ((int64_t)limit + 63) >> 6);
+    return found < (index_type)limit ? found : OBS::MAX_INDEX;
+  }
+
   // Clear a bit at the given index
   void clear(int32_t index) {
     assert(index >= 0 && index < nbits);

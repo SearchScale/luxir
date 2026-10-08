@@ -844,6 +844,9 @@ inline void collectFirstKConstantWindowed(
   if (drain == ConstantScoreDrain::LIMIT_ONLY) {
     return;
   }
+  if (cursor != PostingsReader::END && cursor < maxDoc) {
+    bulk->prepareMembership();
+  }
   int64_t count = 0;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
     int32_t next = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);

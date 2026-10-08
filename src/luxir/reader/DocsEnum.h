@@ -1528,6 +1528,13 @@ private:
   }
 
 public:
+  // One-way handoff after exhaustive scoring. Preserve the current posting
+  // and normalize at most one pending probe block into the existing buffers.
+  // Docs-only advance and window fills keep their branch-free protocol.
+  [[gnu::cold]] void prepareMembership() {
+    if (scoredProbeActive) materializeScoredProbeBlock();
+  }
+
   int32_t nextDoc() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);

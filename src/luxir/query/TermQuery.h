@@ -420,6 +420,10 @@ public:
       buildImpacts(pool, ordReader != nullptr, useFrontierBound);
     }
 
+    [[gnu::cold]] void prepareMembership() override {
+      docsEnum.prepareMembership();
+    }
+
     [[gnu::cold]] void reset() override {
       docsEnum.reset();
       minCompetitiveScore = 0.0f;
@@ -553,6 +557,14 @@ public:
     /// doc we are positioned on
     int32_t docId() override {
       return docsEnum.docId();
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      int32_t doc = docsEnum.docId();
+      // Window fills consume docs without frequencies. Keep bounded probes
+      // on that protocol, including a probe after a previous word fill.
+      return doc < min ? docsEnum.advanceDocOnly(min) : doc;
     }
 
     // Keep the norms advance out-of-line at the per-doc score() call site.
@@ -1294,6 +1306,11 @@ public:
           outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
           outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
           maxDoc(maxDoc) {
+    }
+
+    [[gnu::cold]] void prepareMembership() override {
+      scorer->prepareMembership();
+      if (windowFilter != nullptr) windowFilter->prepareMembership();
     }
 
     [[gnu::cold]] void reposition(int32_t target) override {

@@ -73,7 +73,18 @@ public:
       assert(docid < target);  // strict advance
       return advanceTo(target);
     }
+    // Exact members need no verification; the next one past max is a
+    // lookahead resume point (see QueryPrep::DocSetScorer::advanceWindow).
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      return docid >= min ? docid : advanceTo(min);
+    }
     int32_t docId() override { return docid; }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
+    }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {

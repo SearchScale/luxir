@@ -34,6 +34,15 @@ class ConstantScoreQuery final : public luxir::Query {
     Scorer(Query::Scorer* child, float constantScore)
       : Query::ConstantScorer(constantScore), child(child) {}
 
+    [[gnu::cold]] void prepareMembership() override {
+      child->prepareMembership();
+    }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      child->fillScoredWindowBits(words, start, end);
+    }
+
     [[gnu::cold]] void reset() override {
       child->reset();
       exhausted = false;
@@ -49,6 +58,19 @@ class ConstantScoreQuery final : public luxir::Query {
 
     int32_t docId() override {
       return child->docId();
+    }
+
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      return child->advanceApproximationWindow(min, max);
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      return child->advanceWindow(min, max);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      child->fillWindowBits(words, min, max);
     }
 
     // Matching is exactly the child's, so forward two-phase iteration: a
