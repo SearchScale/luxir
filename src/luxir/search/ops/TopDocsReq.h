@@ -172,6 +172,22 @@ public:
     return {keys, route};
   }
 
+  // A supplier's membership work as a walk over it meets it: under an
+  // external filter the walk still produces the supplier's matches, and
+  // collects only the filter's share of them.
+  static Query::ScorerSupplier::MembershipWork walkMembershipWork(
+      Query::ScorerSupplier& supplier, DocSet* filter, int32_t maxDoc) {
+    auto work = supplier.membershipWork(maxDoc);
+    if (filter != nullptr) {
+      work.produce += 8 * work.matches;
+      double density = (double)filter->card() / maxDoc;
+      work.matches *= density;
+      work.savedProduce *= density;
+      work.window += 64;
+    }
+    return work;
+  }
+
   // The first and last doc of a nonempty BITSET or ARRAY domain.
   static void domainSpan(DocSet& domain, int32_t& first, int32_t& last) {
     if (domain.type == DocSet::ARRAY) {
@@ -2141,6 +2157,20 @@ public:
             if (!usedBulk && supplier == nullptr) {
               supplier = obtainMainSupplier();
             }
+            // Every walk arm below prices against the docs it expects to
+            // collect: the supplier's membership yield (for a conjunction
+            // the independence product, not its lead's cost), under an
+            // external filter only the filter's share of it. Seeding prices
+            // the same work; leaf descent the same domain.
+            std::optional<Query::ScorerSupplier::MembershipWork> walkWork;
+            if (!usedBulk && supplier != nullptr && maySkipNoncompetitiveDocs
+                && data->fieldCollector->topCount > 0
+                && data->fieldCollector->primaryKeys.has_value()) {
+              walkWork = walkMembershipWork(*supplier, collectorFilter,
+                                            seg.maxDoc());
+              data->fieldCollector->setWalkCard(
+                  (int64_t)std::max(1.0, walkWork->matches));
+            }
             // Pre-fill from the best-bounded leaves, then reposition the same
             // unscored product for the competitive sweep. The resolved plan
             // includes every executing child and any integrated filters.
@@ -2156,14 +2186,8 @@ public:
               auto plan = data->fieldCollector->maskedKeyBlockPlan();
               if (plan.batch != nullptr && plan.blockCount > 0
                   && sortSourceCost > 0) {
-                auto work = supplier->membershipWork(seg.maxDoc());
-                if (collectorFilter != nullptr) {
-                  work.produce += 8 * work.matches;
-                  double density = (double)collectorFilter->card() / seg.maxDoc();
-                  work.matches *= density;
-                  work.savedProduce *= density;
-                  work.window += 64;
-                }
+                assert(walkWork.has_value());
+                const auto& work = *walkWork;
                 auto& fieldCollector = *data->fieldCollector;
                 int64_t jointCard = (int64_t)std::max(1.0, work.matches);
                 int64_t leafFloor = fieldCollector.predictedVisitFloor(jointCard);

@@ -1222,7 +1222,12 @@ struct ExactDomainSortCosts {
   // Leaf descent in the doc-order match-window walk (FieldSortCollector::
   // nextCompetitiveRange, over a query-driven or unrouted domain): the
   // leaves of each coarse block the bottom cannot rule out are classified,
-  // and the runs it rules out are neither produced nor gathered. The walk
+  // and the runs it rules out are neither produced nor gathered. The card
+  // is what the walk expects to collect (TopDocsReq::walkMembershipWork): a
+  // conjunction's yield, not its lead's cost, which put its bottom 10x too
+  // low and its skipped leaves 10x too full (AND of a 1% and a 10% term on
+  // 10M docs: 2388 us descending vs 2123 not). A two-phase query's card is
+  // its approximation's, the candidates the gate checks. The walk
   // finds about `swept` of the inside leaves competitive, so descent skips
   // the domain's other card - m*swept docs, for classifying the inside
   // leaves at kWalkLeafCost walked docs each (the bound test plus the

@@ -3328,6 +3328,47 @@ TEST_F(SortCollectorTest, exactDomainSortCostsDecide) {
                                     kGridLeaves, kGridLeaves, 10}));
 }
 
+// The walk prices leaf descent on the docs it expects to collect
+// (TopDocsReq::walkMembershipWork), not on what its source costs. One
+// 256-leaf segment under uniform keys at k = 1: a 10% term alone admits few
+// leaves and holds 51 docs in each, so the walk descends; ANDed with an
+// independent 2.5% term its lead costs the same, but it collects 0.25% - 1.3
+// docs a leaf over the 80% of leaves the bottom admits - and does not.
+TEST_F(SortCollectorTest, walkDescentPricesTheCollectedDomain) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  SeededGuard seededGuard(true, false);
+  CollectionHelper helper("walk_descent");
+  constexpr int32_t kDocs = 256 * 512;
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    SplitMix64 r((uint64_t)docId);
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId),
+                         "rnd_i", r.rint(1 << 30),
+                         "lead_s", r.rint(10) == 0 ? "y" : "n",
+                         "rare_s", r.rint(40) == 0 ? "y" : "n"),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  auto leavesSkipped = [&](bool conjunction) {
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("walk_descent");
+    auto& cur = req->topDocs("q").limit(1).fields({"id_s"});
+    auto& mr = cur.mr();
+    cur.rawQuery() = conjunction
+        ? qb::boolean(mr, {qb::match(mr, "lead_s", "y"),
+                           qb::match(mr, "rare_s", "y")})
+        : qb::match(mr, "lead_s", "y");
+    qb::sort(cur, "rnd_i", qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return SkipStats::fieldSortLeavesSkipped;
+  };
+  EXPECT_GT(leavesSkipped(false), 0);
+  EXPECT_EQ(0, leavesSkipped(true));
+}
+
 // Every exact-domain phase over every representation matches unpruned
 // collection of the same docs. One segment of 24 full leaves and a 300-doc
 // last leaf (four coarse blocks, the last partial); one key column ties

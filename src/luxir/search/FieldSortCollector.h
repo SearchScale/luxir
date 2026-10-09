@@ -184,6 +184,9 @@ public:
   int64_t candidateLo = 0;
   int64_t candidateHi = -1;
   int64_t segmentSourceCost = 0;
+  // The docs a walk over the segment expects to collect (setWalkCard); 0
+  // until a walk names it, when the source cost stands in.
+  int64_t segmentWalkCard = 0;
   int32_t segmentMaxDoc = 0;
   // The values every doc this collector will see holds in the primary sort
   // column (a request fact, from the query and filters; see
@@ -290,6 +293,7 @@ public:
     nextProbeDoc = 0;
     candidatesDisabled = false;
     segmentSourceCost = sourceCost;
+    segmentWalkCard = 0;
     segmentMaxDoc = reader != nullptr ? reader->maxDoc() : 0;
     for (auto& clause : clauses) {
       clause.resetCache();
@@ -314,6 +318,12 @@ public:
     }
     if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
   }
+
+  // The docs a walk over the current segment expects to collect, which
+  // prices its leaf descent (descendsToLeaves). The source cost overstates
+  // them for a conjunction (its lead's cost), and the domain decides both
+  // how far the bottom matures and how many docs a skipped leaf holds.
+  void setWalkCard(int64_t card) { segmentWalkCard = card; }
 
   // The predicted heap bottom once a segment's domain - `card` docs whose
   // keys follow `segment`'s in-envelope values - is collected
@@ -865,17 +875,19 @@ private:
 
   // Whether nextCompetitiveRange descends to leaves: priced by the docs the
   // leaves it would skip hold against classifying them
-  // (ExactDomainSortCosts::walkDescends, over segmentRest). Decided once per
-  // segment, against the heap at the first consult that can prune.
+  // (ExactDomainSortCosts::walkDescends, over segmentRest of the walk's
+  // card). Decided once per segment, against the heap at the first consult
+  // that can prune.
   bool descendsToLeaves() {
     if (leafDescent == LeafDescent::UNDECIDED) {
       bool descend = false;
       if (forceLeafDescentForTests.has_value()) {
         descend = *forceLeafDescentForTests;
-      } else if (primaryKeys.has_value() && segmentSourceCost > 0) {
+      } else if (int64_t card = segmentWalkCard > 0 ? segmentWalkCard
+                                                    : segmentSourceCost;
+                 primaryKeys.has_value() && card > 0) {
         descend = ExactDomainSortCosts::walkDescends(segmentRest(
-            segmentSourceCost, predictedVisitFloor(segmentSourceCost), 0,
-            segmentMaxDoc - 1));
+            card, predictedVisitFloor(card), 0, segmentMaxDoc - 1));
       }
       leafDescent = descend ? LeafDescent::ON : LeafDescent::OFF;
     }
