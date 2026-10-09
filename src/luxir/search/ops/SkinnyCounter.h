@@ -6,6 +6,7 @@
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/util/BigBuffer.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -13,7 +14,7 @@ template<typename SkinnyType=uint8_t, typename KeyType=int64_t, typename ValType
 class SkinnyCounter {
 public:
   size_t max;
-  std::vector<SkinnyType> counts;
+  BigVector<SkinnyType> counts;
   boost::unordered_flat_map<KeyType, ValType> overflow;
 
   /// "max" is the maximum number of values to expect, from 0 to max-1

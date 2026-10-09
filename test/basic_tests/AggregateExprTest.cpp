@@ -1114,15 +1114,14 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
 
 TEST_F(AggregateExprTest, denseTableHugePageBoundaryAndReuse) {
   RequestMemTracker tracker(0);
-  for (size_t bytes : {mappedAllocationFloor - 8, mappedAllocationFloor, mappedAllocationFloor + 8}) {
+  for (size_t bytes : {bigBufferFloor - 8, bigBufferFloor, bigBufferFloor + 8}) {
     for (int reuse = 0; reuse < 2; ++reuse) {
       {
         FacetEntryTable table;
         int64_t keys = (int64_t)(bytes / sizeof(int64_t));
         table.configure({}, tracker, keys, "dense boundary", nullptr);
         table.initialize(3, true, false);
-        size_t storage = bytes < mappedAllocationFloor ? bytes : MappedAlloc::roundedSize(bytes);
-        EXPECT_EQ(tracker.bytes(), storage + 3 * sizeof(int64_t));
+        EXPECT_EQ(tracker.bytes(), bigBufferStorage(bytes) + 3 * sizeof(int64_t));
         for (int64_t key : {int64_t{0}, keys / 2, keys - 1}) {
           auto* entry = table.resolveEntry(key);
           EXPECT_EQ(table.occurrenceCount(entry), 0);

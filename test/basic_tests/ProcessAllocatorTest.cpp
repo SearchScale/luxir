@@ -4,6 +4,7 @@
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "luxir/util/MemPool.h"
+#include "luxir/util/BigBuffer.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/index/SortedDeletes.h"
 #include "luxir/server/Stats.h"
@@ -161,6 +162,8 @@ TEST(ProcessAllocatorTest, hugePageAllocationRouting) {
     bool jemalloc = arena.stats().has_value();
     for (size_t size : {size_t{0}, size_t{1024}, hugePageSize - 1, hugePageSize,
                         hugePageSize + 1, hugePageSize * 3 / 2, hugePageSize * 2}) {
+      // Whole-page arenas take only huge-page multiples.
+      if (wholePurge && (size == 0 || size % hugePageSize != 0)) continue;
       for (size_t alignment : {alignof(std::max_align_t), 2 * hugePageSize}) {
         SCOPED_TRACE(::testing::Message() << "size=" << size << " alignment=" << alignment
                                         << " wholePurge=" << wholePurge);
@@ -394,8 +397,7 @@ TEST(ProcessAllocatorTest, wholeHugePagePurgeAndReuse) {
 }
 
 TEST(ProcessAllocatorTest, backgroundDecayAndReuse) {
-  AllocatorArena arena("test-background-decay",
-      {.wholeHugePagePurge = true, .dirtyDecayMs = 250});
+  AllocatorArena arena("test-background-decay", {.hugePages = true, .dirtyDecayMs = 250});
   auto start = arena.stats();
   if (!start) GTEST_SKIP() << "Arena decay requires jemalloc with stats enabled";
   if (!allocatorBackgroundThreadsEnabled()) {
@@ -429,4 +431,78 @@ TEST(ProcessAllocatorTest, backgroundDecayAndReuse) {
     }
     EXPECT_LT(arena.stats()->resident, start->resident + hugePageSize);
   }
+}
+
+TEST(BigBufferTest, routingAndRounding) {
+  EXPECT_THROW(bigBufferStorage(SIZE_MAX), std::length_error);
+  EXPECT_THROW(BigBufferAllocator<int64_t>().allocate(SIZE_MAX), std::bad_array_new_length);
+  auto& arena = bigBufferArena();
+  bool jemalloc = arena.stats().has_value();
+  for (size_t bytes : {bigBufferFloor - 8, bigBufferFloor, bigBufferFloor + 8}) {
+    SCOPED_TRACE(bytes);
+    for (int reuse = 0; reuse < 2; ++reuse) {
+      auto start = arena.stats();
+      BigVector<char> buffer(bytes);
+      EXPECT_TRUE(std::all_of(buffer.begin(), buffer.end(), [](char c) { return c == 0; }));
+      std::memset(buffer.data(), 0x55, bytes);
+      if (!jemalloc) continue;
+      bool big = bytes >= bigBufferFloor;
+      EXPECT_EQ(arena.stats()->allocated, start->allocated + (big ? bigBufferStorage(bytes) : 0));
+      if (big) {
+        EXPECT_EQ((uintptr_t)buffer.data() % hugePageSize, 0);
+        EXPECT_EQ(hugePageAdvice(buffer.data()), std::optional<bool>(true));
+      }
+    }
+  }
+  BigFlatMap<int64_t, int64_t> map;
+  map.reserve(bigBufferFloor / sizeof(int64_t));
+  map[1] = 2;
+  if (jemalloc) {
+    EXPECT_EQ(hugePageAdvice(&*map.find(1)), std::optional<bool>(true));
+  }
+}
+
+TEST(BigBufferTest, statsReportArena) {
+  auto stats = bigBufferArena().stats();
+  if (!stats) GTEST_SKIP() << "Arena statistics require jemalloc with stats enabled";
+  BigVector<char> buffer(2 * hugePageSize);
+  LuxirNode node;
+  api::StatsResponse response;
+  std::pmr::monotonic_buffer_resource memory;
+  api::StatsRequest request;
+  request.memory = true;
+  gatherStats(node, request, response, memory);
+  ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
+  const auto& bigBuffer = response.memory->jemalloc->big_buffer;
+  EXPECT_EQ(bigBuffer.allocated_bytes, bigBufferArena().stats()->allocated);
+  EXPECT_GE(bigBuffer.allocated_bytes, buffer.size());
+  EXPECT_GE(bigBuffer.resident_bytes, bigBuffer.allocated_bytes);
+}
+
+TEST(BigBufferTest, backgroundDecay) {
+  auto& arena = bigBufferArena();
+  auto start = arena.stats();
+  if (!start) GTEST_SKIP() << "Arena decay requires jemalloc with stats enabled";
+  if (!allocatorBackgroundThreadsEnabled()) {
+    GTEST_SKIP() << "Background decay requires background_thread:true (MALLOC_CONF overrides it)";
+  }
+  constexpr size_t size = 8 * hugePageSize;
+  std::array<BigVector<char>, 4> buffers;
+  for (auto& buffer : buffers) buffer.resize(size, 1);
+  auto live = *arena.stats();
+  // Exceed the 1024-page wake threshold and give a skipped trylock subsequent
+  // epoch advances to signal on. No explicit purge, even during setup.
+  for (auto& buffer : buffers) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+    BigVector<char>().swap(buffer);
+  }
+  EXPECT_EQ(arena.stats()->allocated, start->allocated);
+  // The arena's 5 s decay is approximate; allow two windows plus scheduling
+  // margin. Background stats reads don't advance this arena's decay epoch.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  size_t target = live.resident - buffers.size() * size + hugePageSize;
+  while (arena.stats()->resident >= target && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_LT(arena.stats()->resident, target);
 }

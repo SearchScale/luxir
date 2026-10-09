@@ -24,7 +24,9 @@ constexpr std::pair<size_t, size_t> hugePageInterior(uintptr_t start, size_t len
 }
 
 struct AllocatorArenaOptions {
+  // Huge-page multiples get huge pages; other sizes go to a companion arena.
   bool hugePages = false;
+  // Huge pages purged only whole; every request must be a huge-page multiple.
   bool wholeHugePagePurge = false;
   // An explicit positive decay also disables eager oversize purging.
   // Background decay is best effort, not a per-arena idle deadline.
@@ -38,6 +40,8 @@ class AllocatorArena final : public std::pmr::memory_resource {
   std::array<unsigned, 2> arenas{};
   unsigned arenaCount = 0;
   bool hugePages;
+  // Only whole huge pages are allocated and purged; no companion arena.
+  bool wholePages;
 
   void* do_allocate(size_t bytes, size_t alignment) override;
   void do_deallocate(void* ptr, size_t bytes, size_t alignment) override;

@@ -1329,7 +1329,7 @@ message JemallocStats {
   uint64 dirty_bytes = 8;
   // Dedicated arena for indexing memory.
   ArenaStats indexing = 9;
-  // Dedicated huge-page arena for big buffers (MappedAlloc).
+  // Dedicated huge-page arena for big buffers (BigBuffer.h).
   ArenaStats big_buffer = 10;
 }
 

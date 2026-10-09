@@ -482,8 +482,8 @@ class IntFacetReq : public FieldFacetReq {
 public:
   class MergeableIntFacet : public MergeableData {
   public:
-    using IntHash = boost::unordered_flat_map<int64_t, int64_t>;
-    using CountVector = std::vector<int64_t>;
+    using IntHash = BigFlatMap<int64_t, int64_t>;
+    using CountVector = BigVector<int64_t>;
     std::variant<std::monostate, IntHash, CountVector> counts;
     int64_t missing_num = 0; // number of missing values in this segment
     int64_t minValue = 0; // minimum value in the range (used when counts is a vector)

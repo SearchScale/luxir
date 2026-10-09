@@ -143,8 +143,8 @@ class StrFacetOp : public FieldFacetReq {
 public:
   class MergeableStrData : public luxir::MergeableData {
   public:
-    using OrdHash = boost::unordered_flat_map<int64_t, int64_t>;
-    using CountVector = std::vector<int64_t>;
+    using OrdHash = BigFlatMap<int64_t, int64_t>;
+    using CountVector = BigVector<int64_t>;
     std::variant<std::monostate, OrdHash, SkinnyCounter8, CountVector,
                  SpanCounter> counts;
     int64_t missing_num = 0; // number of missing values in this segment

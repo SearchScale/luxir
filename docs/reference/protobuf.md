@@ -1001,7 +1001,7 @@ jemalloc's process-wide statistics (stats.\*), read at one statistics epoch per 
 | <a id="field-luxir.jemallocstats.retained_bytes"></a>[`retained_bytes`](#field-luxir.jemallocstats.retained_bytes) | 7 | `uint64` | singular | Virtual mappings kept for reuse instead of unmapped. Mostly purged; the huge-page arenas can leave fringe pages resident. |
 | <a id="field-luxir.jemallocstats.dirty_bytes"></a>[`dirty_bytes`](#field-luxir.jemallocstats.dirty_bytes) | 8 | `uint64` | singular | Freed pages awaiting decay, across all arenas. |
 | <a id="field-luxir.jemallocstats.indexing"></a>[`indexing`](#field-luxir.jemallocstats.indexing) | 9 | [`ArenaStats`](#message-luxir.arenastats) | singular | Dedicated arena for indexing memory. |
-| <a id="field-luxir.jemallocstats.big_buffer"></a>[`big_buffer`](#field-luxir.jemallocstats.big_buffer) | 10 | [`ArenaStats`](#message-luxir.arenastats) | singular | Dedicated huge-page arena for big buffers (MappedAlloc). |
+| <a id="field-luxir.jemallocstats.big_buffer"></a>[`big_buffer`](#field-luxir.jemallocstats.big_buffer) | 10 | [`ArenaStats`](#message-luxir.arenastats) | singular | Dedicated huge-page arena for big buffers (BigBuffer.h). |
 
 <a id="message-luxir.knnquery"></a>
 

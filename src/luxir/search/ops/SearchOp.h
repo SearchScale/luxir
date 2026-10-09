@@ -19,7 +19,7 @@
 #include "luxir/search/DocSet.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
-#include "luxir/util/MappedAlloc.h"
+#include "luxir/util/BigBuffer.h"
 #include "luxir/util/thread.h"
 
 
@@ -432,16 +432,14 @@ class FacetEntryTable {
       2 * (sizeof(std::pair<int64_t, char*>) + 1);
   static constexpr std::string_view BREAKER = "facet aggregate state";
 
-  boost::unordered_flat_map<int64_t, char*> sparseEntries;
+  BigFlatMap<int64_t, char*> sparseEntries;
   // The entry header counts documents delivered to metrics. Repeated values
   // add only facet occurrences, without changing compact metric denominators.
   boost::unordered_flat_map<char*, int64_t> extraOccurrences;
   std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
-  MappedAlloc denseMapping;
-  char* denseMalloc = nullptr;
-  char* denseBase = nullptr;
+  BigVector<char> denseEntries;
   std::span<SearchOp::InlineCalculator*> calcs;
   RequestMemTracker* tracker = nullptr;
   InlineFacetEntryStats* stats = nullptr;
@@ -485,13 +483,11 @@ class FacetEntryTable {
   }
 
   char* denseEntryForIndex(size_t index) {
-    return denseBase + index * stride;
+    return denseEntries.data() + index * stride;
   }
 
   bool tryInitializeDense(size_t logicalBytes, size_t expectedTouched) {
-    bool mapped = logicalBytes >= mappedAllocationFloor;
-    size_t storageBytes = mapped ? MappedAlloc::roundedSize(logicalBytes)
-                                 : logicalBytes;
+    size_t storageBytes = bigBufferStorage(logicalBytes);
     if (expectedTouched > std::numeric_limits<size_t>::max()
                               / sizeof(int64_t)) {
       return false;
@@ -504,20 +500,8 @@ class FacetEntryTable {
     if (!tracker->tryCharge(reservation)) return false;
     try {
       if (expectedTouched != 0) touchedKeys.reserve(expectedTouched);
-      if (!mapped) {
-        denseMalloc = (char*)std::malloc(logicalBytes);
-        if (denseMalloc == nullptr) throw std::bad_alloc();
-        denseBase = denseMalloc;
-        memset(denseBase, 0, logicalBytes);
-      } else {
-        denseMapping = MappedAlloc(logicalBytes);
-        assert(denseMapping.size() == storageBytes);
-        denseBase = (char*)denseMapping.data();
-      }
+      denseEntries.resize(logicalBytes);
     } catch (...) {
-      std::free(denseMalloc);
-      denseMalloc = nullptr;
-      denseBase = nullptr;
       releaseCharge(reservation);
       std::vector<int64_t>().swap(touchedKeys);
       throw;
@@ -630,7 +614,6 @@ public:
   FacetEntryTable& operator=(const FacetEntryTable&) = delete;
 
   ~FacetEntryTable() {
-    std::free(denseMalloc);
     if (tracker != nullptr) {
       releaseCharge(denseStorageBytesCharged + sparseBytesCharged
                     + touchedCapacityCharged);
@@ -802,7 +785,7 @@ public:
     if (rep == Rep::DENSE) {
       for (int64_t key : touchedKeys) {
         size_t index = (size_t)key;
-        accept(key, denseBase + index * stride);
+        accept(key, denseEntries.data() + index * stride);
       }
       return;
     }

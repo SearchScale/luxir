@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/util/ProcessAllocator.h"
-#include "luxir/util/MappedAlloc.h"
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -134,10 +134,11 @@ extent_hooks_t* hugePageHooks(bool wholePurge) {
 } // namespace
 
 AllocatorArena::AllocatorArena(const char* name, AllocatorArenaOptions options)
-    : hugePages(options.hugePages || options.wholeHugePagePurge) {
+    : hugePages(options.hugePages || options.wholeHugePagePurge),
+      wholePages(options.wholeHugePagePurge) {
 #if LUXIR_JEMALLOC
   try {
-    for (unsigned i = 0; i < (hugePages ? 2u : 1u); ++i) {
+    for (unsigned i = 0; i < (hugePages && !wholePages ? 2u : 1u); ++i) {
       extent_hooks_t* hooks = hugePages && i == 0 ? hugePageHooks(options.wholeHugePagePurge) : nullptr;
       size_t size = sizeof(arenas[i]);
       int error = mallctl("arenas.create", &arenas[i], &size,
@@ -198,8 +199,11 @@ int AllocatorArena::allocationFlags(size_t bytes, size_t alignment) const {
   // buffers the pad starts the next huge page; whole-page purge hooks leave
   // this fringe alone. The indexing arena keeps the default purge policy.
   bool useHugePages = hugePages && bytes != 0 && bytes % hugePageSize == 0;
-  // Partial huge pages can strand resident memory outside the purged extent.
-  unsigned arena = arenas[hugePages && !useHugePages ? 1 : 0];
+  // Partial huge pages can strand resident memory outside the purged extent,
+  // so they go to the companion. Whole-page arenas have none: their callers
+  // round requests to whole huge pages.
+  assert(useHugePages || !wholePages);
+  unsigned arena = arenas[!useHugePages && arenaCount > 1 ? 1 : 0];
   if (useHugePages) alignment = std::max(alignment, hugePageSize);
   return MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE | MALLOCX_ALIGN(alignment);
 #else
@@ -293,32 +297,6 @@ AllocatorArena& bigBufferArena() {
   static auto* arena = new AllocatorArena("big-buffers",
       {.hugePages = true, .wholeHugePagePurge = true, .dirtyDecayMs = 5000});
   return *arena;
-}
-
-MappedAlloc::MappedAlloc(size_t bytes) : mappingSize(roundedSize(bytes)) {
-  if (mappingSize == 0) return;
-#if LUXIR_JEMALLOC
-  mapping = bigBufferArena().allocateZeroed(mappingSize, hugePageSize);
-#else
-  mapping = ::mmap(nullptr, mappingSize, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (mapping == MAP_FAILED) {
-    throw std::system_error(errno, std::generic_category(), "mmap");
-  }
-  (void)::madvise(mapping, mappingSize, MADV_HUGEPAGE);
-#endif
-  (void)::madvise(mapping, mappingSize, MADV_POPULATE_WRITE);
-}
-
-void MappedAlloc::reset() noexcept {
-  if (!mapping) return;
-#if LUXIR_JEMALLOC
-  bigBufferArena().deallocate(mapping, mappingSize, hugePageSize);
-#else
-  (void)::munmap(mapping, mappingSize);
-#endif
-  mapping = nullptr;
-  mappingSize = 0;
 }
 
 std::string allocatorName() {

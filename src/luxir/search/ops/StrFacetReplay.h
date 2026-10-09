@@ -294,7 +294,7 @@ public:
   };
 
   struct Vector {
-    std::vector<int64_t> counts;
+    BigVector<int64_t> counts;
   };
 
   struct Skinny {
@@ -303,8 +303,8 @@ public:
     explicit Skinny(size_t slots) : counts(slots) {}
   };
 
-  using PackedHash = boost::unordered_flat_map<uint64_t, int64_t>;
-  using WideHash = boost::unordered_flat_map<WideKey, int64_t, WideHashFn>;
+  using PackedHash = BigFlatMap<uint64_t, int64_t>;
+  using WideHash = BigFlatMap<WideKey, int64_t, WideHashFn>;
 
 private:
   int32_t numOwners;
@@ -321,12 +321,12 @@ private:
 
   bool canAllocateVector() const {
     return totalSlots
-        <= (__int128)std::vector<int64_t>().max_size();
+        <= (__int128)BigVector<int64_t>().max_size();
   }
 
   bool canAllocateSkinny() const {
     return totalSlots <= (__int128)std::numeric_limits<int64_t>::max()
-        && totalSlots <= (__int128)std::vector<uint8_t>().max_size();
+        && totalSlots <= (__int128)BigVector<uint8_t>().max_size();
   }
 
   bool withinAutoFlatBudget(size_t bytesPerSlot) const {
