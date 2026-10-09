@@ -776,6 +776,8 @@ public:
       return filled;
     }
 
+    // normBuf is bounded by the postings block size.
+    LUXIR_NO_STACK_PROTECTOR
     void fillScoresFromSpans(int32_t* docs, float* scores, std::span<const int32_t> blockDocs,
                              std::span<const int32_t> blockFreqs, int32_t count) {
       for (int32_t i = 0; i < count; i++) {

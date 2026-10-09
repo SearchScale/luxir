@@ -15,6 +15,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(_luxir_cpu_tune generic)
   endif()
   add_compile_options("-march=${LUXIR_CPU_TARGET}" "-mtune=${_luxir_cpu_tune}")
+  # Plain -fstack-protector instead of the distro-default -strong. -strong also
+  # instruments functions with any array or address-taken local, putting canary
+  # loads in per-document loops (up to 9% on facet loops). The canary lives at
+  # a fixed page offset in the thread's TCB, so pushes in a hot frame can
+  # 4K-alias it and move timing by ~3% on unrelated frame-size changes. Plain
+  # still covers functions with character buffers, where overflows of request
+  # bytes would occur. Index-data hot paths that keep one opt out with
+  # LUXIR_NO_STACK_PROTECTOR.
+  add_compile_options(-fstack-protector)
 endif()
 
 option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
