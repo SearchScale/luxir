@@ -75,6 +75,19 @@ public:
   }
 };
 
+class LeafDescentGuard {
+  std::optional<bool> saved;
+
+public:
+  explicit LeafDescentGuard(std::optional<bool> descend)
+      : saved(FieldSortCollector::forceLeafDescentForTests) {
+    FieldSortCollector::forceLeafDescentForTests = descend;
+  }
+  ~LeafDescentGuard() {
+    FieldSortCollector::forceLeafDescentForTests = saved;
+  }
+};
+
 class SortPruningGuard {
   bool saved;
 
@@ -2570,17 +2583,26 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   Sorts monoAsc{{{"mono_i", qb::ASC}}};
   Sorts revDesc{{{"rev_i", qb::DESC}}};
 
-  for (bool matchAll : {true, false}) {
-    for (const Sorts& sorts :
-         {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc, revDesc}) {
-      for (int32_t limit : {1, 9, 987, 4500}) {
-        for (bool forcePull : {false, true}) {
-          auto exhaustive = run(true, forcePull, matchAll, sorts, limit, false);
-          auto pruned = run(false, forcePull, matchAll, sorts, limit, false);
-          EXPECT_EQ(exhaustive.ids, pruned.ids)
-              << "matchAll=" << matchAll << " limit=" << limit
-              << " forcePull=" << forcePull
-              << " sort=" << sorts.clauses[0].first;
+  // The walk's leaf descent is priced (descendsToLeaves); both arms must
+  // match exhaustive collection whichever the pricing picks here.
+  for (std::optional<bool> descend :
+       {std::optional<bool>{}, std::optional<bool>{false},
+        std::optional<bool>{true}}) {
+    LeafDescentGuard descentGuard(descend);
+    for (bool matchAll : {true, false}) {
+      for (const Sorts& sorts :
+           {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc, revDesc}) {
+        for (int32_t limit : {1, 9, 987, 4500}) {
+          for (bool forcePull : {false, true}) {
+            auto exhaustive =
+                run(true, forcePull, matchAll, sorts, limit, false);
+            auto pruned = run(false, forcePull, matchAll, sorts, limit, false);
+            EXPECT_EQ(exhaustive.ids, pruned.ids)
+                << "matchAll=" << matchAll << " limit=" << limit
+                << " forcePull=" << forcePull
+                << " sort=" << sorts.clauses[0].first
+                << " descend=" << (descend ? (int)*descend : -1);
+          }
         }
       }
     }
@@ -3284,6 +3306,26 @@ TEST_F(SortCollectorTest, exactDomainSortCostsDecide) {
   EXPECT_EQ(Phase::BOUND_ORDER, Costs::costs(late).cheapest());
   late.lead = 0;
   EXPECT_NE(Phase::BOUND_ORDER, Costs::costs(late).cheapest());
+
+  // The doc-order walk's leaf descent (walkDescends) on a 10M-doc segment
+  // (19532 leaves) under uniform keys at k = 10: a 0.1% domain's bottom
+  // admits 40% of the leaves with half a domain doc in each, so the 2.3k
+  // docs the skipped leaves hold cannot pay for classifying every leaf; at
+  // 1% it admits 5% and skips 80k docs. The boundary falls near 1.4 docs a
+  // leaf: 0.24% stays off, 0.3% descends.
+  constexpr int64_t kGridLeaves = 19532;
+  auto descends = [&](int64_t card, int64_t floor) {
+    return Costs::walkDescends({card, kGridLeaves, floor, kGridLeaves, 0,
+                                kGridLeaves, 0, 10});
+  };
+  EXPECT_FALSE(descends(10000, 7829));
+  EXPECT_TRUE(descends(100000, 975));
+  EXPECT_FALSE(descends(24000, 3752));
+  EXPECT_TRUE(descends(30000, 3065));
+  // Best keys last in doc order (a lead over every inside leaf) leave the
+  // walk nothing to skip, however dense the domain.
+  EXPECT_FALSE(Costs::walkDescends({100000, kGridLeaves, 975, kGridLeaves, 0,
+                                    kGridLeaves, kGridLeaves, 10}));
 }
 
 // Every exact-domain phase over every representation matches unpruned

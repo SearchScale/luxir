@@ -6,7 +6,10 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/search/FieldSortCollector.h"
 #include "luxir/search/SortField.h"
+#include <format>
+#include <optional>
 
 using namespace luxir;
 using namespace luxir::test;
@@ -64,6 +67,7 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
 
 static constexpr int64_t STRING_SORT_DOCS = 10'000'000;
 static constexpr const char* STRING_SORT_SHAPE = "9555";
+static constexpr int64_t INT_SORT_SS_DOCS = 5'000'000;
 
 // One instrumented pass's pruning-attribution SkipStats, exposed as counters:
 // competitiveRanges vs irreducibleBlocks is the reordering headroom,
@@ -180,8 +184,21 @@ LUXIR_BENCHMARK_CAPTURE(BM_StringSort, segment_desc, STRING_SORT_DOCS,
 // domain best-first route cannot fire and collection rides the pruned
 // doc-order window walk. queryField "short_u10_s" ~= 10% density per term,
 // "short_u100_s" ~= 1%, "short_u10k_s" ~= 0.01% (sparse control).
+// `descent` forces the walk's leaf descent on (1) or off (0) to measure both
+// arms of FieldSortCollector::descendsToLeaves (ExactDomainSortCosts::
+// kWalkLeafCost was calibrated so); -1 leaves it priced.
 static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
-                            const char* queryField, bool singleSeg = false) {
+                            const char* queryField, bool singleSeg = false,
+                            int descent = -1, int32_t limit = 10) {
+  struct DescentGuard {
+    std::optional<bool> saved = FieldSortCollector::forceLeafDescentForTests;
+    explicit DescentGuard(int descent) {
+      if (descent >= 0) {
+        FieldSortCollector::forceLeafDescentForTests = descent == 1;
+      }
+    }
+    ~DescentGuard() { FieldSortCollector::forceLeafDescentForTests = saved; }
+  } descentGuard(descent);
   if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   if (singleSeg) {
@@ -190,7 +207,11 @@ static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
     CollectionHelper::calcSegSizes(nDocs, 10, STRING_SORT_SHAPE, docsPerSeg);
   }
 
-  const char* collection = singleSeg ? "int_sort_bm" : "string_sort_bm";
+  // One single-segment collection per size, so sizes never rebuild each
+  // other's index.
+  std::string collection = !singleSeg ? "string_sort_bm"
+      : nDocs == INT_SORT_SS_DOCS ? "int_sort_bm"
+      : std::format("int_sort_bm_{}", nDocs);
   CollectionHelper helper(collection);
   bool reused = helper.indexMatchesShape(docsPerSeg);
   if (!reused) buildBenchIndex(helper, nDocs, docsPerSeg);
@@ -198,7 +219,7 @@ static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
   auto execute = [&]() -> int64_t {
     auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& top = req->topDocs("q").limit(10).fields({"id"})
+    auto& top = req->topDocs("q").limit(limit).fields({"id"})
         .matchQuery(queryField, "3");
     qb::sort(top, "u10m_i", qb::ASC);
     req->execute(false);
@@ -240,7 +261,6 @@ LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, all, STRING_SORT_DOCS, 0);
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, f10pct, STRING_SORT_DOCS, 1000);
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, f1pct, STRING_SORT_DOCS, 100);
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, f0p1pct, STRING_SORT_DOCS, 10);
-static constexpr int64_t INT_SORT_SS_DOCS = 5'000'000;
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_all, INT_SORT_SS_DOCS, 0, true);
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f10pct, INT_SORT_SS_DOCS, 1000, true);
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f1pct, INT_SORT_SS_DOCS, 100, true);
@@ -254,3 +274,10 @@ LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p1pct, INT_SORT_SS_DOCS,
                         "short_u1000_s", true);
 LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p01pct, INT_SORT_SS_DOCS,
                         "short_u10k_s", true);
+// The grid's 10M-doc segment: at 0.1% its 10k-doc domain admits 40% of the
+// leaves with half a domain doc in each, where leaf descent loses.
+static constexpr int64_t INT_SORT_SS10M_DOCS = 10'000'000;
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss10m_q1pct, INT_SORT_SS10M_DOCS,
+                        "short_u100_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss10m_q0p1pct, INT_SORT_SS10M_DOCS,
+                        "short_u1000_s", true);

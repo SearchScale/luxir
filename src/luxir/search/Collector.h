@@ -1165,36 +1165,85 @@ struct ExactDomainSortCosts {
     }
   };
 
+  // A rest as every phase reads it: the inside leaves and the m domain docs
+  // each holds; bound order's visits, of which the first `empty` are the
+  // empty leaves leading its order; the inside leaves the bottom admits; the
+  // walk's lead; and the inside leaves the walk gathers (swept).
+  struct Reading {
+    double inside = 1;
+    double m = 0;
+    double visits = 0;
+    double empty = 0;
+    double admitted = 0;
+    double lead = 0;
+    double swept = 0;
+  };
+
+  static Reading read(const Rest& rest) {
+    Reading r;
+    r.inside = (double)std::clamp<int64_t>(rest.inside, 1, rest.leaves);
+    r.m = (double)rest.card / r.inside;
+    r.visits = (double)std::min({rest.floor, rest.admitted, rest.leaves});
+    r.empty = std::min((double)std::max<int64_t>(0, rest.empty), r.visits);
+    // The walk passes the empty leaves without a look, so it matures and
+    // gathers over the inside ones alone.
+    r.admitted = std::max(
+        0.0, (double)std::min(rest.admitted, rest.leaves) - r.empty);
+    double floor = std::min(r.visits - r.empty, r.inside);
+    r.lead = std::clamp((double)rest.lead, 0.0, r.inside);
+    r.swept = std::min(std::max(sweptLeaves(floor, r.inside),
+                                std::min(r.lead + floor, r.inside)),
+                       r.admitted);
+    return r;
+  }
+
   static PhaseCosts costs(const Rest& rest) {
     if (rest.leaves <= 0 || rest.card <= 0) return {};
     double card = (double)rest.card;
-    double inside = (double)std::clamp<int64_t>(rest.inside, 1, rest.leaves);
-    double m = card / inside;
-    double visits = (double)std::min({rest.floor, rest.admitted, rest.leaves});
-    double empty = std::min((double)std::max<int64_t>(0, rest.empty), visits);
-    // The walk passes the empty leaves without a look, so it matures and
-    // gathers over the inside ones alone.
-    double admitted = std::max(
-        0.0, (double)std::min(rest.admitted, rest.leaves) - empty);
-    double floor = std::min(visits - empty, inside);
-    double lead = std::clamp((double)rest.lead, 0.0, inside);
-    double swept = std::min(
-        std::max(sweptLeaves(floor, inside), std::min(lead + floor, inside)),
-        admitted);
+    Reading r = read(rest);
+    double m = r.m;
     double k = (double)std::max<int64_t>(1, rest.topCount);
     double admit = kAdmitLevelCost * std::log2(std::max(2.0, k));
-    double gathered = (visits - empty) * m;
-    double admittable = admitted * m;
+    double gathered = (r.visits - r.empty) * m;
+    double admittable = r.admitted * m;
     PhaseCosts costs;
-    costs.boundOrder = empty * kBoundOrderEmptyLeafCost
-        + (visits - empty) * kBoundOrderLeafCost
+    costs.boundOrder = r.empty * kBoundOrderEmptyLeafCost
+        + (r.visits - r.empty) * kBoundOrderLeafCost
         + gathered * kBoundOrderDocCost
         + admit * admissions(gathered, k, 0, admittable);
     costs.scan = kScanDocCost * card
-        + admit * admissions(card, k, lead * m, admittable);
-    costs.sweep = kSweepLeafCost * occupiedLeaves(card, inside) + m * swept
-        + admit * admissions(m * swept, k, lead * m, admittable);
+        + admit * admissions(card, k, r.lead * m, admittable);
+    costs.sweep = kSweepLeafCost * occupiedLeaves(card, r.inside)
+        + m * r.swept
+        + admit * admissions(m * r.swept, k, r.lead * m, admittable);
     return costs;
+  }
+
+  // Leaf descent in the doc-order match-window walk (FieldSortCollector::
+  // nextCompetitiveRange, over a query-driven or unrouted domain): the
+  // leaves of each coarse block the bottom cannot rule out are classified,
+  // and the runs it rules out are neither produced nor gathered. The walk
+  // finds about `swept` of the inside leaves competitive, so descent skips
+  // the domain's other card - m*swept docs, for classifying the inside
+  // leaves at kWalkLeafCost walked docs each (the bound test plus the
+  // producer call each skipped run splits off). The share of leaves
+  // skipped cannot decide it alone: a leaf's bound covers all of its docs,
+  // so a domain of a given size admits the same share of leaves at any
+  // density, while the docs each skipped leaf saves fall with the density.
+  //
+  // Measured on single 5M and 10M-doc segments (munin, uniform keys,
+  // term-query domains, 2026-10-09), forced descent against none: the
+  // skipped docs per inside leaf at which descent lost were 0.04-0.41
+  // (10M at 0.1%, k = 10: 620 vs 398 us; at k = 1: 220 vs 195), and at
+  // which it won 1.19-4.1 (10M at 1%, k = 100: 2221 vs 2323 us; k = 10:
+  // 569 vs 1590); the price sits mid-bracket. On a 10M-doc segment at
+  // k = 10 it descends from about 1.4 domain docs a leaf (0.27%).
+  static constexpr double kWalkLeafCost = 0.7;
+
+  static bool walkDescends(const Rest& rest) {
+    if (rest.leaves <= 0 || rest.card <= 0) return false;
+    Reading r = read(rest);
+    return (double)rest.card - r.m * r.swept > kWalkLeafCost * r.inside;
   }
 
   // Whether a domain of `card` docs is scanned without planning: bound order

@@ -159,30 +159,16 @@ public:
       route.phase = ExactDomainSortPhase::SCAN;
       return {keys, route};
     }
-    route.floor = collector.predictedVisitFloor(card);
-    auto outside = collector.leavesOutsideValues;
-    route.empty = outside.best;
-    route.outside = std::min(keys.leafCount, outside.best + outside.worst);
-    // On keys that improve with doc order the walk meets the best keys a
-    // share of the way through the domain's span, and gathers that share of
-    // the inside leaves first; on keys in random order the best keys'
-    // places say nothing of the ones the walk meets before them.
-    int64_t head = lastDoc >= firstDoc && collector.keysImproveWithDocOrder()
-        ? collector.headLeaf(route.floor) : -1;
-    if (head >= 0) {
-      int64_t firstLeaf = firstDoc / keys.leafSize;
-      int64_t spanLeaves = lastDoc / keys.leafSize - firstLeaf + 1;
-      route.lead = std::clamp<int64_t>(head - firstLeaf, 0, spanLeaves)
-          * (keys.leafCount - route.outside) / spanLeaves;
-    }
+    auto rest = collector.segmentRest(
+        card, collector.predictedVisitFloor(card), firstDoc, lastDoc);
+    route.floor = rest.floor;
+    route.empty = rest.empty;
+    route.outside = rest.leaves - rest.inside;
+    route.lead = rest.lead;
     route.phase = forceFieldSortBestFirst
         ? ExactDomainSortPhase::BOUND_ORDER
         : ExactDomainSortCosts::plan(
-              {card, keys.leafCount, route.floor,
-               collector.leavesWithinBottom(), route.empty,
-               keys.leafCount - route.outside, route.lead,
-               collector.topCount},
-              collector.leavesBeforeKeyFloor >= keys.leafCount);
+              rest, collector.leavesBeforeKeyFloor >= keys.leafCount);
     return {keys, route};
   }
 
@@ -2189,17 +2175,12 @@ public:
                 // that could start. Many-segment indexes pay it per segment.
                 std::optional<QueryDrivenSeedCosts> seedCosts;
                 if (startable || forceFieldSortSeeding) {
-                  auto outside = fieldCollector.leavesOutsideValues;
-                  int64_t inside = plan.leafCount
-                      - std::min(plan.leafCount, outside.best + outside.worst);
                   double trend = fieldCollector.primaryKeys->docOrderTrend();
                   int64_t head = fieldCollector.headLeaf(leafFloor);
-                  int64_t lead = head < 0 || trend <= 0.5 ? 0
-                      : head * inside / std::max<int64_t>(1, plan.leafCount);
                   seedCosts.emplace(QueryDrivenSeedCosts{
-                      work, {jointCard, plan.leafCount, leafFloor,
-                             fieldCollector.leavesWithinBottom(),
-                             outside.best, inside, lead, fieldCollector.topCount},
+                      work,
+                      fieldCollector.segmentRest(jointCard, leafFloor, 0,
+                                                 seg.maxDoc() - 1),
                       head >= 0 && 2 * head >= fieldCollector.primaryKeys->leafCount(),
                       plan.leafSize, trend});
                 }

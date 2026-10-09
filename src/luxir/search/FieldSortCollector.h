@@ -23,6 +23,8 @@ class FieldSortCollector {
 
 public:
   inline static bool disableKeyGatherForTests = false;
+  // Overrides the priced leaf-descent decision (descendsToLeaves).
+  inline static std::optional<bool> forceLeafDescentForTests;
 
   struct SortDoc {
     segdoc doc;
@@ -414,14 +416,6 @@ public:
     return primaryKeys.has_value() && primaryKeys->docOrderTrend() > 0.5;
   }
 
-  // Whether a doc-order walk meets its best keys only in the second half of
-  // the segment, as for keys that improve with doc order sorted newest
-  // first: it then matures its bottom only as it finishes.
-  bool bestLeavesLate(int64_t floor) const {
-    int64_t head = headLeaf(floor);
-    return head >= 0 && 2 * head >= primaryKeys->leafCount();
-  }
-
   int64_t bottomPrimaryKey() const {
     assert(heapFull());
     return clauses[0].comparator->keyBatch()->slotKeys[pq.top().slot];
@@ -437,6 +431,36 @@ public:
     assert(primaryKeys.has_value());
     if (!heapFull()) return primaryKeys->leafCount();
     return primaryKeys->leavesBoundedAtOrBefore(bottomPrimaryKey());
+  }
+
+  // The current segment, whole, as the field-sort costs read it
+  // (ExactDomainSortCosts::Rest) for a domain of `card` docs spanning
+  // [firstDoc, lastDoc] with visit floor `floor` (predictedVisitFloor):
+  // the leaves the bottom admits, those outside the domain's value
+  // envelope, and the walk's lead. On keys that improve with doc order the
+  // walk meets the best keys a share of the way through the domain's span,
+  // and gathers that share of the inside leaves first; on keys in random
+  // order the best keys' places say nothing of the ones the walk meets
+  // before them. Every whole-segment field-sort decision prices this.
+  ExactDomainSortCosts::Rest segmentRest(int64_t card, int64_t floor,
+                                         int32_t firstDoc,
+                                         int32_t lastDoc) const {
+    assert(primaryKeys.has_value());
+    int64_t leaves = primaryKeys->leafCount();
+    int64_t inside = leaves - std::min(
+        leaves, leavesOutsideValues.best + leavesOutsideValues.worst);
+    int64_t lead = 0;
+    int64_t head = lastDoc >= firstDoc && keysImproveWithDocOrder()
+        ? headLeaf(floor) : -1;
+    if (head >= 0) {
+      int64_t leafSize = clauses[0].comparator->keyBatch()->leafBlockSize();
+      int64_t firstLeaf = firstDoc / leafSize;
+      int64_t spanLeaves = lastDoc / leafSize - firstLeaf + 1;
+      lead = std::clamp<int64_t>(head - firstLeaf, 0, spanLeaves) * inside
+          / spanLeaves;
+    }
+    return {card, leaves, floor, leavesWithinBottom(),
+            leavesOutsideValues.best, inside, lead, topCount};
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
@@ -839,27 +863,21 @@ private:
     }
   }
 
-  // Leaf descent in nextCompetitiveRange pays only when the walk's bottom
-  // lets it skip MATERIALLY many leaves. At saturation every leaf
-  // classifies COLLECT, so descending would only split producer calls
-  // eight ways and classify eight bounds per block for nothing - and near
-  // saturation (measured at floor/leafCount ~0.99: a reproducible ~30%
-  // regression) the few skippable leaves fragment producer ranges without
-  // paying for the classifications. The 2x margin on the predicted visit
-  // floor keeps the whole win at 1% and off through the boundary band. The
-  // walk runs in doc order, so it skips nothing before its bottom matures,
-  // which is never when the best keys come last (bestLeavesLate). Decided
-  // once per segment, against the heap at the first consult that can
-  // prune.
+  // Whether nextCompetitiveRange descends to leaves: priced by the docs the
+  // leaves it would skip hold against classifying them
+  // (ExactDomainSortCosts::walkDescends, over segmentRest). Decided once per
+  // segment, against the heap at the first consult that can prune.
   bool descendsToLeaves() {
     if (leafDescent == LeafDescent::UNDECIDED) {
-      leafDescent = LeafDescent::OFF;
-      if (primaryKeys.has_value() && segmentSourceCost > 0) {
-        int64_t floor = predictedVisitFloor(segmentSourceCost);
-        if (2 * floor < primaryKeys->leafCount() && !bestLeavesLate(floor)) {
-          leafDescent = LeafDescent::ON;
-        }
+      bool descend = false;
+      if (forceLeafDescentForTests.has_value()) {
+        descend = *forceLeafDescentForTests;
+      } else if (primaryKeys.has_value() && segmentSourceCost > 0) {
+        descend = ExactDomainSortCosts::walkDescends(segmentRest(
+            segmentSourceCost, predictedVisitFloor(segmentSourceCost), 0,
+            segmentMaxDoc - 1));
       }
+      leafDescent = descend ? LeafDescent::ON : LeafDescent::OFF;
     }
     return leafDescent == LeafDescent::ON;
   }
