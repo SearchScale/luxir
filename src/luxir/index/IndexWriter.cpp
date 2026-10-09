@@ -341,7 +341,6 @@ IndexWriter::~IndexWriter() {
   idleInverters.clear();
   busyInverters.clear();
   flushingInverters.clear();
-  indexingArena().purge();
 }
 
 void IndexWriter::close() {
@@ -1117,8 +1116,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segmentsToDelete.push_back(std::move(segInfo));
   }
 
-  // Declared before the owner so unwinding also purges after destruction.
-  auto purge = scope_guard([] { indexingArena().purge(); });
   std::unique_ptr<Inverter> inverterPtr;
   std::shared_ptr<const SortedDeletes> deletes;
   if (!aborted && inverter.hasDeletions()) {
@@ -1178,7 +1175,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
   }
 
-  // Destroy before purging, and before removing an aborted segment's files.
+  // Destroy before removing an aborted segment's files.
   uint64_t segId = inverterPtr->getPostingsWriter().segId;
   inverterPtr.reset();
   if (aborted) {
@@ -2659,7 +2656,6 @@ void IndexWriter::testDeleteAllData() {
 
     // drop all idle inverters (unflushed segments)
     idleInverters.clear();
-    indexingArena().purge();
 
     // drop all segments
     segInfos.clear();

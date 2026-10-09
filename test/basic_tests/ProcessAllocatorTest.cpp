@@ -288,11 +288,10 @@ TEST(ProcessAllocatorTest, alignedAllocation) {
   arena.purge();
 }
 
-TEST(ProcessAllocatorTest, abortedFlushAndDestructionReclaimArena) {
+TEST(ProcessAllocatorTest, abortedFlushAndDestructionFreeArenaMemory) {
   auto& arena = indexingArena();
   if (!arena.stats()) GTEST_SKIP() << "Arena statistics require jemalloc with stats enabled";
   for (bool abortFlush : {true, false}) {
-    arena.purge();
     auto start = *arena.stats();
     {
       LuxirNode node;
@@ -308,16 +307,13 @@ TEST(ProcessAllocatorTest, abortedFlushAndDestructionReclaimArena) {
         writer.releaseInverter(inverter, true);
         writer.updateGraph.wait_for_all();
         EXPECT_EQ(arena.stats()->allocated, start.allocated);
-        EXPECT_LT(arena.stats()->resident, start.resident + 4 * 1024 * 1024);
       } else {
         writer.releaseInverter(inverter);
         writer.close();
         EXPECT_GT(arena.stats()->allocated, start.allocated + 1024 * 1024);
       }
     }
-    auto freed = *arena.stats();
-    EXPECT_EQ(freed.allocated, start.allocated);
-    EXPECT_LT(freed.resident, start.resident + 4 * 1024 * 1024);
+    EXPECT_EQ(arena.stats()->allocated, start.allocated);
   }
 }
 
