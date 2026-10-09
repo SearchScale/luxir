@@ -65,7 +65,9 @@ TEST(MappedAllocTest, hugePageAdviceAndBackend) {
     LuxirNode node;
     api::StatsResponse response;
     std::pmr::monotonic_buffer_resource memory;
-    gatherStats(node, {.memory = true}, response, memory);
+    api::StatsRequest request;
+    request.memory = true;
+    gatherStats(node, request, response, memory);
     ASSERT_TRUE(response.memory.has_value());
     if (auto stats = bigBufferArena().stats()) {
       ASSERT_TRUE(response.memory->jemalloc.has_value());

@@ -236,7 +236,9 @@ TEST(ProcessAllocatorTest, inverterFlushReclaimsArena) {
   EXPECT_GT(arena.stats()->allocated, start.allocated + 1024 * 1024);
   api::StatsResponse response;
   std::pmr::monotonic_buffer_resource responseMemory;
-  gatherStats(node, {.memory = true}, response, responseMemory);
+  api::StatsRequest request;
+  request.memory = true;
+  gatherStats(node, request, response, responseMemory);
   ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
   const auto& jemalloc = *response.memory->jemalloc;
   EXPECT_EQ(jemalloc.indexing.allocated_bytes, arena.stats()->allocated);
