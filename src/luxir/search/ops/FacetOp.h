@@ -107,8 +107,11 @@ public:
     return true;
   }
 
+  // callback(docid, ord) per value, ord 0-based in `ordSpace`
+  // (forEachOrdValue).
   bool facetSegOrdCol(DocSet* domain, int32_t segnum, int64_t& missing_num,
-                      SegFieldInfo& segFieldInfo, auto&& callback) {
+                      SegFieldInfo& segFieldInfo,
+                      const OrdMap::SegToGlobal& ordSpace, auto&& callback) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -119,7 +122,8 @@ public:
     }
     fieldReader.readFieldInfo(segFieldInfo);
     OrdColReader ordColReader(postingsReader, segFieldInfo);
-    forEachOrdValue(domain, ordColReader, maxDoc, missing_num, callback);
+    forEachOrdValue(domain, ordColReader, ordSpace, maxDoc, missing_num,
+                    callback);
     return true;
   }
 };

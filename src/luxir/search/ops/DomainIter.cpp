@@ -18,9 +18,10 @@ static_assert(OrdValueBatches::BATCH_SIZE >= ORD_BLOCK);
 } // namespace
 
 OrdValueBatches::OrdValueBatches(DocSet* domain, const OrdColReader& column,
+                                 const OrdMap::SegToGlobal& ordSpace,
                                  int32_t maxDoc, bool complement,
                                  OrdColReader::ForEachOrdStats* stats)
-    : column(column), stats(stats), maxDoc(maxDoc) {
+    : column(column), ordSpace(ordSpace), stats(stats), maxDoc(maxDoc) {
   if (!complement && domain != nullptr
       && domain->type == DocSet::Type::ARRAY) {
     auto* arrayDomain = dynamic_cast<ArrDocSet*>(domain);
@@ -75,6 +76,7 @@ bool OrdValueBatches::next(Batch& batch) {
       }
       break;
   }
+  ordSpace.globalOrdsOfStored(batch.stored, batch.size, batch.ords);
   return batch.size > 0;
 }
 
@@ -85,7 +87,7 @@ void OrdValueBatches::fillDocIdArray(Batch& batch) {
                                               arrayEnd - arrayNext);
     int32_t present = column.presentOrdsAt(
         std::span<const int32_t>(arrayNext, (size_t)take),
-        batch.docs + batch.size, batch.ords + batch.size);
+        batch.docs + batch.size, batch.stored + batch.size);
     arrayNext += take;
     batch.size += present;
     missingCount += take - present;
@@ -118,7 +120,7 @@ void OrdValueBatches::fillDocIdBits(Batch& batch) {
     if (hits == 0) continue;
 
     int32_t* docsOut = batch.docs + batch.size;
-    int32_t* ordsOut = batch.ords + batch.size;
+    int32_t* storedOut = batch.stored + batch.size;
     int32_t present = 0;
     bool bulk = OrdColReader::bulkBlock(hits, end - start, bulkMinHits);
     if (bulk) {
@@ -132,13 +134,13 @@ void OrdValueBatches::fillDocIdBits(Batch& batch) {
           uint32_t ord = frame[offset];
           assert(ord <= INT32_MAX);
           docsOut[present] = start + offset;
-          ordsOut[present] = (int32_t)ord;
+          storedOut[present] = (int32_t)ord;
           present += ord != 0;
         }
       }
     } else {
       uint64_t words[2] = {low, high};
-      present = column.presentOrdsAtBits(words, start, docsOut, ordsOut);
+      present = column.presentOrdsAtBits(words, start, docsOut, storedOut);
     }
     batch.size += present;
     missingCount += hits - present;
@@ -167,7 +169,7 @@ void OrdValueBatches::fillDocIdAll(Batch& batch) {
       uint32_t ord = frame[i];
       assert(ord <= INT32_MAX);
       batch.docs[present] = start + i;
-      batch.ords[present] = (int32_t)ord;
+      batch.stored[present] = (int32_t)ord;
       present += ord != 0;
     }
     missingCount += count - (present - batch.size);
@@ -212,7 +214,7 @@ void OrdValueBatches::fillRank(Batch& batch) {
   auto drainPending = [&]() LUXIR_INLINE {
     for (; pendingRank < pendingEnd && batch.size < BATCH_SIZE; pendingRank++) {
       batch.docs[batch.size] = pendingDoc;
-      batch.ords[batch.size] = value(pendingRank);
+      batch.stored[batch.size] = value(pendingRank);
       batch.size++;
     }
   };
@@ -228,7 +230,7 @@ void OrdValueBatches::fillRank(Batch& batch) {
     }
     if (!column.multiValued()) {
       batch.docs[batch.size] = doc;
-      batch.ords[batch.size] = value(iter.rank());
+      batch.stored[batch.size] = value(iter.rank());
       batch.size++;
       continue;
     }

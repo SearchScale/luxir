@@ -727,28 +727,16 @@ public:
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        if (mapping.bits == 0) {
-          // Identity segment (always so for one segment): local ords ARE global
-          // ords, so the column value is the key with nothing in between.
-          facetReq.facetSegOrdCol(
-              domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t val) LUXIR_INLINE {
-                data.counts.add((int64_t)val - 1, docid);
-              });
-        } else {
-          // Remapped segment ords arrive in document order, so use the point
-          // globalOrd()/deltaAt accessor: it decodes one packed value per random
-          // arrival. BulkGlobalOrds is for ordered local-ord drains, where its
-          // decoded frame is reused. Local staging may still win with enough
-          // repeats; countSegment's skinny repeats>2 crossover is the prior art
-          // for that measured follow-up.
-          facetReq.facetSegOrdCol(
-              domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t val) LUXIR_INLINE {
-                data.counts.add(
-                    mapping.globalOrd((int64_t)val - 1), docid);
-              });
-        }
+        // Ords arrive in document order; a remapped segment's are mapped a
+        // batch at a time by point decodes of its deltas (an identity
+        // segment's need none). Local staging may still win with enough
+        // repeats; countSegment's skinny repeats>2 crossover is the prior art
+        // for that measured follow-up.
+        facetReq.facetSegOrdCol(
+            domain, segnum, missing_num, segFieldInfo, mapping,
+            [&](int32_t docid, int64_t ord) LUXIR_INLINE {
+              data.counts.add(ord, docid);
+            });
 
         data.missing_num += missing_num;
       });
@@ -1021,12 +1009,11 @@ public:
               std::vector<int32_t> localCounts((size_t)nTerms);
               forEachComplementOrdValue(
                   domainView, poolGuard.pool(), ordColReader, compMissing,
-                  [&](int32_t docid, int32_t value) LUXIR_INLINE {
+                  [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                     unused(docid);
-                    // Column value 0 is missing; value v maps to term ord
-                    // v-1. Multi-valued ord columns hold distinct ords per
-                    // doc, so this counts the same doc-term pairs as docFreq.
-                    localCounts[(size_t)value - 1]++;
+                    // Multi-valued ord columns hold distinct ords per doc, so
+                    // this counts the same doc-term pairs as docFreq.
+                    localCounts[(size_t)localOrd]++;
                   });
               emitCounts([&](int64_t localOrd, int32_t docFreq) LUXIR_INLINE {
                 int32_t complementCount = localCounts[(size_t)localOrd];
@@ -1042,9 +1029,9 @@ public:
               hits.reserve((size_t)domainView.compCard);
               forEachComplementOrdValue(
                   domainView, poolGuard.pool(), ordColReader, compMissing,
-                  [&](int32_t docid, int32_t value) LUXIR_INLINE {
+                  [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                     unused(docid);
-                    hits.push_back(value - 1);
+                    hits.push_back((int32_t)localOrd);
                   });
               std::sort(hits.begin(), hits.end());
               std::vector<std::pair<int32_t, int32_t>> side;
@@ -1076,9 +1063,9 @@ public:
               SkinnyCounter<uint8_t, int32_t, int32_t> local((size_t)nTerms);
               forEachComplementOrdValue(
                   domainView, poolGuard.pool(), ordColReader, compMissing,
-                  [&](int32_t docid, int32_t value) LUXIR_INLINE {
+                  [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                     unused(docid);
-                    local.increment(value - 1);
+                    local.increment((int32_t)localOrd);
                   });
               std::vector<std::pair<int32_t, int32_t>> side(
                   local.overflow.begin(), local.overflow.end());
@@ -1130,16 +1117,17 @@ public:
           assert(countSpan != nullptr);
           if (forcedFacetCounterMode == FacetCounterMode::SPAN_GLOBAL) {
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
+              mapping, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
                 unused(docid);
-                countSpan->increment(mapping.globalOrd((int64_t)localOrd - 1));
+                countSpan->increment(ord);
               });
           } else {
             std::vector<uint32_t> localCounts(segFieldInfo.nTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
+              OrdMap::SegToGlobal::identity(),
+              [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                 unused(docid);
-                localCounts[(size_t)((int64_t)localOrd - 1)]++;
+                localCounts[(size_t)localOrd]++;
               });
             forEachMappedOrd(localCounts.size(),
                              [&](size_t localOrd, int64_t globalOrd) {
@@ -1153,28 +1141,24 @@ public:
           return;
         }
 
-        // if we want a vector, then there are enough repeats that we should collect
-        // local counts first and then only convert to global ords once.
         if (countVec) {
-          if (mapping.bits == 0) {
-            // Identity segment: local ords ARE global ords, so count straight
-            // into the global vector - no local buffer, no drain copy.
-            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
-                unused(docid);
-                (*countVec)[(int64_t)localOrd - 1]++;
-              });
-          } else {
-            // Remapped segment: count dense local ords once, drain to global.
-            // TODO: we have a countVec, but if we wanted a map, that means we
-            // should probably not do 2 pass.  Unclear how often this happens.
-            // for single-valued, we could get away with int32_t
-            std::vector<int64_t> localCounts(segFieldInfo.nTerms);
-            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
-                unused(docid);
-                localCounts[(int64_t)localOrd - 1]++;
-              });
+          // A vector means enough repeats that a remapped segment counts its
+          // dense local ords once and drains them to global ords; an identity
+          // segment's local ords are already global, so it counts straight
+          // into the global vector.
+          // TODO: we have a countVec, but if we wanted a map, that means we
+          // should probably not do 2 pass.  Unclear how often this happens.
+          // for single-valued, we could get away with int32_t
+          bool stage = mapping.bits != 0;
+          std::vector<int64_t> localCounts(stage ? segFieldInfo.nTerms : 0);
+          int64_t* counts = stage ? localCounts.data() : countVec->data();
+          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            stage ? OrdMap::SegToGlobal::identity() : mapping,
+            [&](int32_t docid, int64_t ord) LUXIR_INLINE {
+              unused(docid);
+              counts[ord]++;
+            });
+          if (stage) {
             forEachMappedOrd(localCounts.size(), [&](size_t localOrd, int64_t globalOrd) {
               auto count = localCounts[localOrd];
               if (count > 0) {
@@ -1185,9 +1169,8 @@ public:
 
         } else if (countMap) {
           facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
+            mapping, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
               unused(docid);
-              int64_t ord = mapping.globalOrd((int64_t)localOrd - 1);
               (*countMap)[ord]++;
             });
         } else {
@@ -1205,11 +1188,11 @@ public:
           if (useLocal) {
             std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
+              OrdMap::SegToGlobal::identity(),
+              [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
               unused(docid);
-              int64_t ord = (int64_t)localOrd - 1;
-              if (++localCounts[ord] == 0) {
-                countSkinny->increment(mapping.globalOrd(ord),
+              if (++localCounts[localOrd] == 0) {
+                countSkinny->increment(mapping.globalOrd(localOrd),
                                        std::numeric_limits<uint8_t>::max() + 1);
               }
             });
@@ -1222,9 +1205,9 @@ public:
           } else {
             // Not many repeats expected, so just collect global ords directly.
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int32_t localOrd) LUXIR_INLINE {
+              mapping, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
                 unused(docid);
-                countSkinny->increment(mapping.globalOrd((int64_t)localOrd - 1));
+                countSkinny->increment(ord);
               });
           }
         }
@@ -1500,10 +1483,11 @@ public:
           DocSet* domain = input[segnum].get();
           selectedMap.visit([&](const auto& ownerOfOrd) {
             forEachOrdValue(
-                domain, ordColReader, maxDoc, missing_num,
-                [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
+                domain, ordColReader, OrdMap::SegToGlobal::identity(), maxDoc,
+                missing_num,
+                [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                   int32_t owner = StrFacetSelectedOrdMap::owner(
-                      ownerOfOrd, storedOrd);
+                      ownerOfOrd, localOrd);
                   if (owner >= 0) builders[(size_t)owner].add(docid);
                 });
           });

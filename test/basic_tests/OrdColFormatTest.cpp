@@ -205,17 +205,18 @@ TEST_F(OrdColFormatTest, arrayDomainAlwaysUsesPointOrds) {
   ArrDocSet domain(std::vector<int32_t>{0, 127, 128, 511, 512, 1023});
   OrdBulkMinHitsGuard threshold(0);
   OrdColReader::ForEachOrdStats stats;
-  std::vector<std::pair<int32_t, int32_t>> seen;
+  std::vector<std::pair<int32_t, int64_t>> seen;
   int64_t missing = 0;
 
-  forEachOrdValue(&domain, reader, count, missing,
-      [&](int32_t doc, int32_t ord) {
+  forEachOrdValue(&domain, reader, OrdMap::SegToGlobal::identity(), count,
+      missing,
+      [&](int32_t doc, int64_t ord) {
         seen.emplace_back(doc, ord);
       },
       &stats);
 
   ASSERT_EQ(domain.docs().size(), seen.size());
-  for (auto [doc, ord] : seen) EXPECT_EQ(doc + 1, ord);
+  for (auto [doc, ord] : seen) EXPECT_EQ(doc, ord);
   EXPECT_EQ(0, missing);
   EXPECT_EQ((int64_t)seen.size(), stats.pointLoads);
   EXPECT_EQ(0, stats.bulkLoads);
@@ -236,9 +237,10 @@ TEST_F(OrdColFormatTest, docIdIndexedBitDomainChoosesPerBlockAtThreshold) {
   std::vector<int32_t> seen;
   int64_t missing = 0;
 
-  forEachOrdValue(&domain, reader, count, missing,
-      [&](int32_t doc, int32_t ord) {
-        EXPECT_EQ(doc + 1, ord);
+  forEachOrdValue(&domain, reader, OrdMap::SegToGlobal::identity(), count,
+      missing,
+      [&](int32_t doc, int64_t ord) {
+        EXPECT_EQ(doc, ord);
         seen.push_back(doc);
       },
       &stats);
@@ -267,9 +269,10 @@ TEST_F(OrdColFormatTest, bitDomainScalesThresholdForTailBlock) {
   std::vector<int32_t> seen;
   int64_t missing = 0;
 
-  forEachOrdValue(&domain, reader, count, missing,
-      [&](int32_t doc, int32_t ord) {
-        EXPECT_EQ(doc + 1, ord);
+  forEachOrdValue(&domain, reader, OrdMap::SegToGlobal::identity(), count,
+      missing,
+      [&](int32_t doc, int64_t ord) {
+        EXPECT_EQ(doc, ord);
         seen.push_back(doc);
       },
       &stats);
@@ -305,9 +308,10 @@ TEST_F(OrdColFormatTest, rankIndexedArrayDomainAlwaysUsesPointOrds) {
   std::vector<int32_t> seenDocs;
   int64_t missing = 0;
 
-  forEachOrdValue(&domain, *field.ordReader, 6, missing,
-      [&](int32_t doc, int32_t ord) {
-        EXPECT_GT(ord, 0);
+  forEachOrdValue(&domain, *field.ordReader, OrdMap::SegToGlobal::identity(),
+      6, missing,
+      [&](int32_t doc, int64_t ord) {
+        EXPECT_GE(ord, 0);
         seenDocs.push_back(doc);
       },
       &stats);
@@ -341,9 +345,10 @@ TEST_F(OrdColFormatTest, rankIndexedBitAndAllDomainsKeepFixedBulkOrds) {
   std::vector<int32_t> seenDocs;
   int64_t missing = 0;
 
-  forEachOrdValue(&domain, *field.ordReader, 6, missing,
-      [&](int32_t doc, int32_t ord) {
-        EXPECT_GT(ord, 0);
+  forEachOrdValue(&domain, *field.ordReader, OrdMap::SegToGlobal::identity(),
+      6, missing,
+      [&](int32_t doc, int64_t ord) {
+        EXPECT_GE(ord, 0);
         seenDocs.push_back(doc);
       },
       &stats);
@@ -358,9 +363,10 @@ TEST_F(OrdColFormatTest, rankIndexedBitAndAllDomainsKeepFixedBulkOrds) {
   stats = {};
   seenDocs.clear();
   missing = 0;
-  forEachOrdValue(nullptr, *field.ordReader, 6, missing,
-      [&](int32_t doc, int32_t ord) {
-        EXPECT_GT(ord, 0);
+  forEachOrdValue(nullptr, *field.ordReader, OrdMap::SegToGlobal::identity(),
+      6, missing,
+      [&](int32_t doc, int64_t ord) {
+        EXPECT_GE(ord, 0);
         seenDocs.push_back(doc);
       },
       &stats);
@@ -421,7 +427,7 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
       int32_t maxDoc = postings.maxDoc();
       OrdColReader& reader = *field.ordReader;
 
-      using Values = std::vector<std::pair<int32_t, int32_t>>;
+      using Values = std::vector<std::pair<int32_t, int64_t>>;
       auto expected = [&](const std::vector<int32_t>& docs, int64_t& missing) {
         Values values;
         int32_t lastDoc = -1;
@@ -429,7 +435,7 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
         OrdColReader::getValues(index.pool, postings, field.fieldInfo, docs,
             [&](size_t, int32_t doc, int32_t ord, int64_t, int64_t) {
               if (ord == 0) return;
-              values.emplace_back(doc, ord);
+              values.emplace_back(doc, (int64_t)ord - 1);
               withValue += doc != lastDoc;
               lastDoc = doc;
             });
@@ -454,7 +460,7 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
                        << " complement=" << complement);
           Values got;
           int64_t missing = 0;
-          auto collect = [&](int32_t doc, int32_t ord) {
+          auto collect = [&](int32_t doc, int64_t ord) {
             got.emplace_back(doc, ord);
           };
           if (complement) {
@@ -462,7 +468,8 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
             forEachComplementOrdValue(view, index.pool, reader, missing,
                                       collect);
           } else {
-            forEachOrdValue(domain, reader, maxDoc, missing, collect);
+            forEachOrdValue(domain, reader, OrdMap::SegToGlobal::identity(),
+                            maxDoc, missing, collect);
           }
           int64_t expectedMissing = 0;
           EXPECT_EQ(expected(walked, expectedMissing), got);

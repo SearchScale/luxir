@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <mutex>
 #include <thread>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <functional>
@@ -214,7 +215,7 @@ public:
 
 } // namespace
 
-TEST_F(FacetTest, stringReplaySelectedOrdMapsRouteStoredOrds) {
+TEST_F(FacetTest, stringReplaySelectedOrdMapsRouteLocalOrds) {
   std::vector<SelectedFacetBucket<std::string_view>> buckets{
       {.key = "b", .id = FacetBucketId{1}, .count = 2,
        .owner = FacetOwnerSlot{0}, .output = FacetOutputSlot{0}},
@@ -226,10 +227,11 @@ TEST_F(FacetTest, stringReplaySelectedOrdMapsRouteStoredOrds) {
                         StrFacetReplaySelector::SPARSE}) {
     StrFacetSelectedOrdMap selected(identity, buckets, strategy);
     selected.visit([&](const auto& map) {
-      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 1));
-      EXPECT_EQ(0, StrFacetSelectedOrdMap::owner(map, 2));
-      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 3));
-      EXPECT_EQ(1, StrFacetSelectedOrdMap::owner(map, 4));
+      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 0));
+      EXPECT_EQ(0, StrFacetSelectedOrdMap::owner(map, 1));
+      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 2));
+      EXPECT_EQ(1, StrFacetSelectedOrdMap::owner(map, 3));
+      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 4));
       EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 5));
     });
   }
@@ -453,6 +455,127 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
     auto expected = run(FacetCounterMode::AUTO, mincount);
     EXPECT_EQ(expected, run(FacetCounterMode::SPAN_GLOBAL, mincount));
     EXPECT_EQ(expected, run(FacetCounterMode::SPAN_LOCAL, mincount));
+  }
+}
+
+// Every string facet counting path agrees with counts taken straight from
+// the indexed values when each segment's ords are remapped: every forced
+// counter representation and staging choice, every count strategy, the
+// inline per-bucket path, single- and multi-valued fields, missing values,
+// and all-docs, sparse, and dense domains. Each segment holds a different
+// window of the field's terms: past the first, whose window is the global
+// prefix and maps as identity, every segment's ords are remapped.
+TEST_F(FacetTest, stringFacetCountsMatchValuesAcrossRemappedSegments) {
+  CollectionHelper helper;
+  helper.clear();
+  constexpr int segments = 4;
+  constexpr int docsPerSegment = 500;
+  struct Expected {
+    std::map<std::string, int64_t> counts;
+    int64_t missing = 0;
+  };
+  // [field][domain]: domains are all docs, sparse_s:y and dense_s:y.
+  const std::array<std::string_view, 2> fields = {"cat_s", "tags_ss"};
+  const std::array<std::string_view, 3> domains = {"", "sparse_s", "dense_s"};
+  std::array<std::array<Expected, 3>, 2> expected;
+
+  for (int seg = 0; seg < segments; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < docsPerSegment; i++) {
+      bool inDomain[3] = {true, i % 29 == 0, i % 10 != 0};
+      Doc doc = flatdoc("id", std::format("r-{}-{}", seg, i), "num_i", i % 5);
+      if (inDomain[1]) doc.push_back({"sparse_s", "y"});
+      if (inDomain[2]) doc.push_back({"dense_s", "y"});
+      std::vector<std::string> values[2];
+      if (i % 11 != 5) {
+        values[0].push_back(std::format("c{:04}", seg * 100 + (i * 7) % 250));
+        doc.push_back({"cat_s", values[0][0]});
+      }
+      for (int m = 0; m < i % 4; m++) {
+        values[1].push_back(
+            std::format("t{:03}", seg * 50 + (i * 13 + m * 41) % 200));
+      }
+      if (!values[1].empty()) doc.push_back({"tags_ss", values[1]});
+      for (size_t f = 0; f < fields.size(); f++) {
+        for (size_t d = 0; d < domains.size(); d++) {
+          if (!inDomain[d]) continue;
+          if (values[f].empty()) expected[f][d].missing++;
+          for (const auto& value : values[f]) expected[f][d].counts[value]++;
+        }
+      }
+      docs.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ((size_t)segments, reader->segments().size());
+  for (std::string_view field : fields) {
+    auto ordMap = reader->getOrdMap(field);
+    ASSERT_NE(nullptr, ordMap);
+    EXPECT_EQ(0, ordMap->getSegToGlobal(0).bits) << field;
+    for (int seg = 1; seg < segments; seg++) {
+      ASSERT_NE(0, ordMap->getSegToGlobal(seg).bits) << field << " " << seg;
+    }
+  }
+
+  SearchOverridesGuard guard(forcedFacetCounterMode, forcedStrFacetStrategy,
+                             forcedFacetSubOpInline);
+  auto run = [&](size_t f, size_t d, bool inlineAll) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs();
+    topDocs.getNumber(true);
+    if (domains[d].empty()) topDocs.allQuery();
+    else topDocs.matchQuery(domains[d], "y");
+    auto& facet = topDocs.facet("f", fields[f]).limit(-1);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+    if (inlineAll) facet.avg("a", "num_i");
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Expected got;
+    const auto* docs = req->docList("q");
+    if (docs == nullptr) return got;
+    const auto* result = docs->ops.at("f")->facetResult();
+    if (result == nullptr) return got;
+    const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+    for (size_t i = 0; i < ids.size(); i++) {
+      got.counts[std::string(ids[i])] = result->counts[i];
+    }
+    got.missing = result->missing.value_or(0);
+    return got;
+  };
+
+  for (size_t f = 0; f < fields.size(); f++) {
+    for (size_t d = 0; d < domains.size(); d++) {
+      auto check = [&](const Expected& got, std::string_view what) {
+        EXPECT_EQ(expected[f][d].counts, got.counts)
+            << fields[f] << " domain=" << domains[d] << " " << what;
+        EXPECT_EQ(expected[f][d].missing, got.missing)
+            << fields[f] << " domain=" << domains[d] << " " << what;
+      };
+      forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
+      for (auto strategy : {StrFacetStrategy::AUTO,
+                            StrFacetStrategy::COLUMN_DOMAIN,
+                            StrFacetStrategy::COLUMN_COMPLEMENT,
+                            StrFacetStrategy::TERM_DRIVEN}) {
+        for (auto mode : {FacetCounterMode::AUTO, FacetCounterMode::SPAN_GLOBAL,
+                          FacetCounterMode::SPAN_LOCAL,
+                          FacetCounterMode::FORCE_VECTOR,
+                          FacetCounterMode::FORCE_SKINNY,
+                          FacetCounterMode::FORCE_HASH,
+                          FacetCounterMode::SKINNY_GLOBAL,
+                          FacetCounterMode::SKINNY_LOCAL}) {
+          forcedStrFacetStrategy = strategy;
+          forcedFacetCounterMode = mode;
+          check(run(f, d, false),
+                std::format("strategy={} mode={}", (int)strategy, (int)mode));
+        }
+      }
+      forcedStrFacetStrategy = StrFacetStrategy::AUTO;
+      forcedFacetCounterMode = FacetCounterMode::AUTO;
+      forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+      check(run(f, d, true), "inline");
+    }
   }
 }
 
