@@ -130,6 +130,10 @@ class StrFacetOp : public FieldFacetReq {
   // won at 100K matching docs and lost at 10K; 48K is the initial bracketed
   // boundary.
   static constexpr int64_t INLINE_ALL_MIN_DOMAIN = 48 * 1024;
+  // Vector counting spreads each segment's counters over this many lanes
+  // while they fit COUNTER_LANE_BYTES (countSegment). Refittable.
+  static constexpr int32_t COUNTER_LANES = 4;
+  static constexpr int64_t COUNTER_LANE_BYTES = 32 * 1024;
 
   std::shared_ptr<OrdMap> ordMap;
   struct PinnedBucket {
@@ -1142,25 +1146,38 @@ public:
         }
 
         if (countVec) {
-          // A vector means enough repeats that a remapped segment counts its
-          // dense local ords once and drains them to global ords; an identity
-          // segment's local ords are already global, so it counts straight
-          // into the global vector.
+          // A vector means many increments per counter, and back-to-back
+          // increments of one counter wait on each other's stores: with few
+          // hot counters that chain is the walk's critical path. While the
+          // segment's counters fit COUNTER_LANE_BYTES, each value counts into
+          // one of COUNTER_LANES copies, picked by its doc's low bits, and the
+          // drain sums them. A remapped segment likewise counts dense local
+          // ords and drains them to global ords once; an identity segment with
+          // a single lane counts straight into the global vector.
           // TODO: we have a countVec, but if we wanted a map, that means we
           // should probably not do 2 pass.  Unclear how often this happens.
           // for single-valued, we could get away with int32_t
-          bool stage = mapping.bits != 0;
-          std::vector<int64_t> localCounts(stage ? segFieldInfo.nTerms : 0);
+          int64_t segTerms = segFieldInfo.nTerms;
+          int32_t laneMask =
+              segTerms * COUNTER_LANES * (int64_t)sizeof(int64_t)
+                      <= COUNTER_LANE_BYTES
+                  ? COUNTER_LANES - 1 : 0;
+          bool stage = mapping.bits != 0 || laneMask != 0;
+          std::vector<int64_t> localCounts(
+              stage ? (size_t)segTerms * (size_t)(laneMask + 1) : 0);
           int64_t* counts = stage ? localCounts.data() : countVec->data();
           facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
             stage ? OrdMap::SegToGlobal::identity() : mapping,
             [&](int32_t docid, int64_t ord) LUXIR_INLINE {
-              unused(docid);
-              counts[ord]++;
+              counts[(int64_t)(docid & laneMask) * segTerms + ord]++;
             });
           if (stage) {
-            forEachMappedOrd(localCounts.size(), [&](size_t localOrd, int64_t globalOrd) {
-              auto count = localCounts[localOrd];
+            forEachMappedOrd((size_t)segTerms,
+                             [&](size_t localOrd, int64_t globalOrd) {
+              int64_t count = 0;
+              for (int32_t lane = 0; lane <= laneMask; lane++) {
+                count += localCounts[(size_t)lane * (size_t)segTerms + localOrd];
+              }
               if (count > 0) {
                 (*countVec)[globalOrd] += count;
               }
