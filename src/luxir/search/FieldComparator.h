@@ -330,11 +330,19 @@ public:
   // segdoc(segment, doc) >= segdoc(segment, from). The boundary (equal to
   // bottom) term is excluded only for a sole-clause sort with an exact
   // bottom whose segdoc tie-break every remaining doc loses.
+  //
+  // The interval is anchored at the sort's best end: lo == 1 ascending,
+  // hi == nTerms descending. Within a segment only the other end moves, and
+  // only toward the anchor: the bottom only improves, and the boundary
+  // exclusion, once earned, holds for every later bottom (one with the same
+  // term has an earlier segdoc).
   enum class OrdIntervalStatus { UNSUPPORTED, PENDING, READY };
   struct CompetitiveOrdState {
     int64_t lo = 0;
     int64_t hi = -1;
     int64_t nTerms = 0;
+    // The anchored end: hi when descending, lo otherwise.
+    bool descending = false;
     PostingsReader* postingsReader = nullptr;
     const SegFieldInfo* fieldInfo = nullptr;
   };
@@ -849,6 +857,7 @@ public:
       out.hi = segmentMapping.numOrds;
     }
     out.nTerms = segmentMapping.numOrds;
+    out.descending = sortMultiplier < 0;
     out.postingsReader = postingsReader;
     out.fieldInfo = &fieldInfo;
     return OrdIntervalStatus::READY;
@@ -1058,6 +1067,7 @@ public:
       out.hi = nTerms;
     }
     out.nTerms = nTerms;
+    out.descending = sortMultiplier < 0;
     out.postingsReader = postingsReader;
     out.fieldInfo = &fieldInfo;
     return OrdIntervalStatus::READY;

@@ -169,8 +169,9 @@ public:
 
   // String-sort candidate pruning state, all segment-local. The union is a
   // conservative candidate superset built from the primary comparator's
-  // competitive ord interval; it and every allocation behind it live in
-  // segmentPool, which the dispatching op owns for the segment's lifetime.
+  // competitive ord interval; it, the activation gate's state, and every
+  // allocation behind them live in segmentPool, which the dispatching op
+  // owns for the segment's lifetime.
   static constexpr int32_t CANDIDATE_PROBE_INTERVAL = 4096;
   static constexpr int64_t CANDIDATE_COST_RATIO = 8;
   static constexpr int64_t CANDIDATE_STATE_BYTES = 8 << 20;
@@ -183,6 +184,17 @@ public:
   UnionHeapScorer* candidates = nullptr;
   int64_t candidateLo = 0;
   int64_t candidateHi = -1;
+  // The activation gate's docFreq totals, walked outward from the competitive
+  // interval's anchored end (CompetitiveOrdState): candidateDocFreqs[j] sums
+  // the docFreqs of the j + 1 ords nearest it, the first candidateReach of
+  // them filled. The interval only shrinks toward its anchor within a
+  // segment, so every later total is an entry here or, past the reach, at
+  // least the last one: no docFreq is read twice in a segment. The gate and
+  // the capture walk share candidateTerms; the comparator's own enum backs
+  // setBottom/copy caching and must not be repositioned here.
+  TermsEnum* candidateTerms = nullptr;
+  std::span<int64_t> candidateDocFreqs;
+  int64_t candidateReach = 0;
   int64_t segmentSourceCost = 0;
   // The docs a walk over the segment expects to collect (setWalkCard); 0
   // until a walk names it, when the source cost stands in.
@@ -290,6 +302,9 @@ public:
     candidates = nullptr;
     candidateLo = 0;
     candidateHi = -1;
+    candidateTerms = nullptr;
+    candidateDocFreqs = {};
+    candidateReach = 0;
     nextProbeDoc = 0;
     candidatesDisabled = false;
     segmentSourceCost = sourceCost;
@@ -966,12 +981,12 @@ private:
   }
 
   // The state-byte gate is free (interval width is known without touching
-  // the dictionary); the docFreq sum costs one stats decode per 128 terms
-  // and aborts at the profitability limit. The capture walk uses its own
-  // TermsEnum: the comparator's leaf enum backs setBottom/copy caching and
-  // must not be repositioned here.
+  // the dictionary); the docFreq total comes from candidateDocFreqs, which
+  // reads each ord's docFreq at most once per segment and stops past the
+  // profitability limit.
   LUXIR_NOINLINE bool tryActivateCandidates(
       const FieldComparator::CompetitiveOrdState& state, int32_t from) {
+    skipCount(SkipStats::fieldSortCandidateProbes);
     int64_t termCount = state.hi - state.lo + 1;
     if (segmentSourceCost < 0
         || termCount * (int64_t)sizeof(DocsOnlyEnum) > CANDIDATE_STATE_BYTES) {
@@ -984,14 +999,37 @@ private:
     int64_t remaining = segmentMaxDoc <= 0 ? 0
         : segmentSourceCost * ((int64_t)segmentMaxDoc - from) / segmentMaxDoc;
     int64_t limit = remaining / CANDIDATE_COST_RATIO;
-    int64_t sum = termCount * CANDIDATE_TERM_CAPTURE_COST;
-    if (sum > limit) return false;
-    TermsEnum te(*segmentPool, *state.postingsReader, *state.fieldInfo);
-    for (int64_t ord = state.lo; ord <= state.hi; ord++) {
-      te.seekOrd(ord - 1);
-      sum += te.docFreq();
-      if (sum > limit) return false;
+    int64_t capture = termCount * CANDIDATE_TERM_CAPTURE_COST;
+    if (capture > limit) return false;
+    // The interval only shrinks within a segment, so the first walk sized
+    // candidateDocFreqs for every later one. Should that ever break, give up
+    // on candidates for the segment, as candidateRange does when narrow()
+    // refuses, rather than walk past the span.
+    bool widened = candidateTerms != nullptr
+        && termCount > (int64_t)candidateDocFreqs.size();
+    assert(!widened);
+    if (widened) {
+      candidatesDisabled = true;
+      return false;
     }
+    bool profitable =
+        capture + candidateDocFreq(state, termCount, limit - capture) <= limit;
+#ifndef NDEBUG
+    {
+      // Check: the anchored totals reach the verdict a direct walk over the
+      // interval does.
+      MemPool::ScopeGuard scope(*segmentPool);
+      TermsEnum direct(*segmentPool, *state.postingsReader, *state.fieldInfo);
+      int64_t sum = capture;
+      for (int64_t ord = state.lo; ord <= state.hi && sum <= limit; ord++) {
+        direct.seekOrd(ord - 1);
+        sum += direct.docFreq();
+      }
+      assert((sum <= limit) == profitable);
+    }
+#endif
+    if (!profitable) return false;
+    TermsEnum& te = *candidateTerms;
     ChunkedArray<TermsEnum::PostingsState> states(*segmentPool, (size_t)termCount);
     states.reserve((size_t)termCount);
     for (int64_t i = 0; i < termCount; i++) {
@@ -1011,6 +1049,53 @@ private:
     candidates->narrow(candidateLo - 1, candidateHi - 1);
     skipCount(SkipStats::fieldSortCandidateActivations);
     return true;
+  }
+
+  // The docFreq total of the `count` ords nearest the anchored end of
+  // `state`'s interval, or, when that passes `budget`, a partial total that
+  // already does.
+  int64_t candidateDocFreq(const FieldComparator::CompetitiveOrdState& state,
+                           int64_t count, int64_t budget) {
+    assert(count > 0);
+    if (count > candidateReach
+        && (candidateReach == 0
+            || candidateDocFreqs[(size_t)candidateReach - 1] <= budget)) {
+      extendCandidateDocFreqs(state, count, budget);
+    }
+    return candidateDocFreqs[(size_t)std::min(count, candidateReach) - 1];
+  }
+
+  // Extends candidateDocFreqs outward from the anchor, one term block's
+  // stats decode at a time, until it covers `count` ords or its total passes
+  // `budget`. The first call sizes it: no later interval is wider.
+  LUXIR_NOINLINE void extendCandidateDocFreqs(
+      const FieldComparator::CompetitiveOrdState& state, int64_t count,
+      int64_t budget) {
+    assert(state.descending ? state.hi == state.nTerms : state.lo == 1);
+    if (candidateTerms == nullptr) {
+      candidateTerms = segmentPool->make<TermsEnum>(
+          *segmentPool, *state.postingsReader, *state.fieldInfo);
+      candidateDocFreqs = segmentPool->make_span<int64_t>((size_t)count);
+    }
+    assert(count <= (int64_t)candidateDocFreqs.size());
+    int64_t reach = candidateReach;
+    int64_t total = reach == 0 ? 0 : candidateDocFreqs[(size_t)reach - 1];
+    while (reach < count && total <= budget) {
+      // 0-based ord of the next term outward from the anchor.
+      int64_t ord = state.descending ? state.nTerms - 1 - reach : reach;
+      auto [firstOrd, docFreqs] = candidateTerms->docFreqBlock(ord);
+      int64_t i = ord - firstOrd;
+      int64_t step = state.descending ? -1 : 1;
+      for (; i >= 0 && i < (int64_t)docFreqs.size() && reach < count;
+           i += step) {
+        total += docFreqs[(size_t)i];
+        candidateDocFreqs[(size_t)reach++] = total;
+      }
+    }
+    if (SkipStats::enabled) {
+      SkipStats::fieldSortCandidateDocFreqs += reach - candidateReach;
+    }
+    candidateReach = reach;
   }
 
   // Grow every clause's slot storage in lockstep, doubling up to topCount.

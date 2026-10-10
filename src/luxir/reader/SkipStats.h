@@ -226,6 +226,10 @@ struct SkipStats {
   static inline int64_t fieldSortBlocksSkipped = 0;
   static inline int64_t fieldSortCandidateActivations = 0;
   static inline int64_t fieldSortCandidateTerminations = 0;
+  // String-sort candidate gate: activation attempts (tryActivateCandidates
+  // calls), and the term docFreqs they read (each at most once per segment).
+  static inline int64_t fieldSortCandidateProbes = 0;
+  static inline int64_t fieldSortCandidateDocFreqs = 0;
   static inline int64_t fieldSortBulkCollections = 0;
   // Field-sort pruning attribution: ranges issued before the heap filled
   // (the warmup transient, in key blocks) and competitive ranges issued after
@@ -542,6 +546,8 @@ struct SkipStats {
     fieldSortBlocksSkipped = 0;
     fieldSortCandidateActivations = 0;
     fieldSortCandidateTerminations = 0;
+    fieldSortCandidateProbes = 0;
+    fieldSortCandidateDocFreqs = 0;
     fieldSortBulkCollections = 0;
     fieldSortWarmupRanges = 0;
     fieldSortCompetitiveRanges = 0;

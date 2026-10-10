@@ -4813,6 +4813,83 @@ TEST_F(SortCollectorTest, stringCandidatePruningTwoSegments) {
   runStringCandidatePruning(2);
 }
 
+// The candidate gate reads each docFreq at most once per segment, however
+// many probes consult it. The first domain docs carry the ten best values in
+// either direction, so the bottom settles at once and every later probe sees
+// the same nine-term interval; each of those terms is heavy outside the 10%
+// domain, so the union never pays. Re-reading the interval per probe would
+// read at least one docFreq on every probe the capture charge admits.
+TEST_F(SortCollectorTest, stringCandidateGateReadsEachDocFreqOnce) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper;
+  constexpr int32_t kDocs = 65536;
+  constexpr int32_t kDomainEvery = 10;
+  SplitMix64 rng(42);
+  std::vector<Doc> docs;
+  docs.reserve(kDocs);
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    int32_t rank = docId / kDomainEvery;
+    bool inDomain = docId % kDomainEvery == 0;
+    std::string value;
+    if (inDomain && rank < 10) {
+      value = "a" + std::to_string(rank);
+    } else if (inDomain && rank < 20) {
+      value = "z" + std::to_string(rank - 10);
+    } else if (!inDomain && rng.rint(2) == 0) {
+      value = (rng.rint(2) == 0 ? "a" : "z") + std::to_string(rng.rint(10));
+    } else {
+      value = std::format("m{:05}", rng.rint(100000));
+    }
+    std::string id = std::to_string(docId);
+    docs.push_back(flatdoc("id_s", id, "body_w", inDomain ? "alpha" : "other",
+                           "rand_s", value));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT, false, 1).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t activations = 0;
+    int64_t probes = 0;
+    int64_t docFreqs = 0;
+  };
+  auto run = [&](bool disablePruning, bool forcePull, qb::SortDir dir) {
+    SortPruningGuard pruningGuard(disablePruning);
+    FieldSortBulkGuard bulkGuard(forcePull);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).fields({"id_s"});
+    cur.rawQuery() = qb::match(cur.mr(), "body_w", "alpha");
+    qb::sort(cur, "rand_s", dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Result result;
+    result.ids = resultIds(*req);
+    result.activations = SkipStats::fieldSortCandidateActivations;
+    result.probes = SkipStats::fieldSortCandidateProbes;
+    result.docFreqs = SkipStats::fieldSortCandidateDocFreqs;
+    return result;
+  };
+
+  for (qb::SortDir dir : {qb::ASC, qb::DESC}) {
+    for (bool forcePull : {false, true}) {
+      auto exhaustive = run(true, forcePull, dir);
+      auto pruned = run(false, forcePull, dir);
+      std::string context = "dir=" + std::to_string((int)dir)
+          + " forcePull=" + std::to_string(forcePull);
+      EXPECT_EQ(exhaustive.ids, pruned.ids) << context;
+      ASSERT_EQ(10u, pruned.ids.size()) << context;
+      EXPECT_EQ(0, pruned.activations) << context;
+      // A probe every 4096 docids past the heap fill, most of them within
+      // the capture charge's limit.
+      EXPECT_GE(pruned.probes, 12) << context;
+      EXPECT_LE(pruned.docFreqs, 9) << context;
+    }
+  }
+}
+
 TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
   CollectionHelper helper;
 
