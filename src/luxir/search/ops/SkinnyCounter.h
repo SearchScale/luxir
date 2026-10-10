@@ -24,8 +24,8 @@ public:
 
   void LUXIR_INLINE increment(KeyType key) {
     assert(key >=0 && (size_t)key < max);
-    if (++counts[key] == 0) {
-      overflow[key] += std::numeric_limits<SkinnyType>::max() + 1;
+    if (++counts[key] == 0) [[unlikely]] {
+      addOverflow(key, std::numeric_limits<SkinnyType>::max() + 1);
     };
   }
 
@@ -37,10 +37,16 @@ public:
       // just contains the high bits. This would exmand
       // the max val we could store.
       counts[key] = 0;
-      overflow[key] += tot;
+      addOverflow(key, (ValType)tot);
     } else {
       counts[key] = (SkinnyType)tot;
     }
+  }
+
+  // Out of line and by value: inlined, the map's by-reference key makes
+  // every increment spill the key to the stack, wrap or not.
+  LUXIR_NOINLINE void addOverflow(KeyType key, ValType val) {
+    overflow[key] += val;
   }
 
   /// Count for one key, without enumerating. Selected facet values are
