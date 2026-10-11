@@ -4759,11 +4759,13 @@ void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
     // Shallow high-cardinality sorts must activate the candidate union in
     // both directions and drivers; the sole-clause tie column empties its
     // interval and terminates instead of activating.
-    EXPECT_GT(run(false, true, true, randAsc, 9).activations, 0);
-    EXPECT_GT(run(false, true, true, randDesc, 9).activations, 0);
-    // The windowed (term query) route only clears the cost gate once the
-    // interval is very tight relative to the filtered remainder: k=1.
-    EXPECT_GT(run(false, false, false, randAsc, 1).activations, 0);
+    // Every segment: a later one starts with the bottom the earlier ones
+    // set, so it can activate at its first docid.
+    EXPECT_EQ(nSegs, run(false, true, true, randAsc, 9).activations);
+    EXPECT_EQ(nSegs, run(false, true, true, randDesc, 9).activations);
+    // So must the windowed (term query) route.
+    EXPECT_GT(run(false, false, false, randAsc, 9).activations, 0);
+    EXPECT_GT(run(false, false, false, randDesc, 9).activations, 0);
     auto ties = run(false, true, true, tiesAsc, 5);
     EXPECT_EQ(ties.activations, 0);
     EXPECT_GT(ties.terminations, 0);
@@ -4888,6 +4890,34 @@ TEST_F(SortCollectorTest, stringCandidateGateReadsEachDocFreqOnce) {
       EXPECT_LE(pruned.docFreqs, 9) << context;
     }
   }
+}
+
+// The candidate gate's budget waits while capture still shrinks with the
+// source docs seen, counts earlier segments' docs as seen, refuses where too
+// few docs are left, and stays in range for any source cost.
+TEST_F(SortCollectorTest, stringCandidateBudget) {
+  constexpr int32_t M = 1 << 20;
+  constexpr int64_t src = M / 10;
+  auto budget = &FieldSortCollector::candidateBudget;
+  // A wide interval at the first probe waits; the same interval pays later.
+  EXPECT_EQ(-1, budget(src, 0, M, 4096, 500));
+  EXPECT_GT(budget(src, 0, M, M / 4, 500), 0);
+  // A later segment can take over at docid 0; a first one cannot.
+  EXPECT_EQ(-1, budget(src, 0, M, 0, 50));
+  EXPECT_GT(budget(src, 10 * src, M, 0, 50), 0);
+  // Near the end the docs left bound it, however many were seen.
+  EXPECT_EQ(-1, budget(src, 100 * src, M, M - 4096, 50));
+  EXPECT_LE(budget(src, 100 * src, M, M / 2, 1), src);
+  EXPECT_LT(budget(src, 100 * src, M, M / 2, 1000),
+            budget(src, 100 * src, M, M / 2, 1));
+  // A disjunction's cost can exceed the segment's docs.
+  constexpr int32_t big = std::numeric_limits<int32_t>::max();
+  int64_t huge = int64_t{1} << 40;
+  int64_t wide = budget(huge, huge, big, big / 2, 1);
+  EXPECT_GT(wide, 0);
+  EXPECT_LE(wide, (int64_t)big);
+  EXPECT_EQ(-1, budget(huge, 0, big, big, 1));
+  EXPECT_EQ(-1, budget(-1, 0, M, M / 2, 1));
 }
 
 TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {

@@ -173,13 +173,15 @@ public:
   // allocation behind them live in segmentPool, which the dispatching op
   // owns for the segment's lifetime.
   static constexpr int32_t CANDIDATE_PROBE_INTERVAL = 4096;
-  static constexpr int64_t CANDIDATE_COST_RATIO = 8;
   static constexpr int64_t CANDIDATE_STATE_BYTES = 8 << 20;
-  // Docs-equivalent charge per captured term: the activation walk pays a
-  // dictionary seek, a stats decode, and a postings-state capture per term,
-  // and the union pays heap traffic per term after that. Charging it keeps
-  // wide intervals from activating against small filtered domains.
-  static constexpr int64_t CANDIDATE_TERM_CAPTURE_COST = 16;
+  // The union's costs in walked source docs: per captured term (a dictionary
+  // seek, a stats decode, a postings-state capture, and heap traffic after
+  // that) and per posting it reads (a heap cycle on sparse terms, a candidate
+  // consult on dense ones). Both sit above what they measure (about 1.5x
+  // and 2x), where activations fell closest to the measured best; an active
+  // union is never abandoned.
+  static constexpr int64_t CANDIDATE_TERM_CAPTURE_COST = 20;
+  static constexpr int64_t CANDIDATE_POSTING_COST = 8;
   MemPool* segmentPool = nullptr;
   UnionHeapScorer* candidates = nullptr;
   int64_t candidateLo = 0;
@@ -196,6 +198,9 @@ public:
   std::span<int64_t> candidateDocFreqs;
   int64_t candidateReach = 0;
   int64_t segmentSourceCost = 0;
+  // Source docs of the segments collected before this one: the heap's
+  // bottom already ranks k among them.
+  int64_t priorSourceDocs = 0;
   // The docs a walk over the segment expects to collect (setWalkCard); 0
   // until a walk names it, when the source cost stands in.
   int64_t segmentWalkCard = 0;
@@ -307,6 +312,9 @@ public:
     candidateReach = 0;
     nextProbeDoc = 0;
     candidatesDisabled = false;
+    if (segmentSourceCost > 0) {
+      priorSourceDocs += std::min<int64_t>(segmentSourceCost, segmentMaxDoc);
+    }
     segmentSourceCost = sourceCost;
     segmentWalkCard = 0;
     segmentMaxDoc = reader != nullptr ? reader->maxDoc() : 0;
@@ -980,27 +988,57 @@ private:
     return {c, c + 1};
   }
 
+public:
+  // The docFreq total a competitive interval of `termCount` terms may have
+  // for the postings union to take over at docid `from` of a segment of
+  // `maxDoc` docs whose source produces `sourceCost` docs, after `priorSource`
+  // source docs of earlier segments; -1 when no total qualifies. Costs are
+  // in walked source docs.
+  //
+  // By the next probe the heap has seen `seen` source docs: the earlier
+  // segments' and those walked here (on a sparse filtered domain, its
+  // cardinality, not the doc space, sets the pace). The bottom ranks k among
+  // them, so the interval's terms c and docFreq total S shrink about as
+  // 1/seen, and once active the union narrows behind the bottom as the walk
+  // would. Waiting for the next probe, a walk of s source docs, captures about
+  // c*s/seen fewer terms and skips the interval's S*s/sourceCost postings
+  // over it: worth it while those cost more than the walk, i.e. while
+  // K*S + CAP*c*sourceCost/seen > sourceCost. The union must also undercut
+  // walking the `left` source docs to the end without narrowing further,
+  // CAP*c + K*S*left/sourceCost <= left: the same form with `left` for
+  // `seen`, binding once fewer are left than seen.
+  static int64_t candidateBudget(int64_t sourceCost, int64_t priorSource,
+                                 int32_t maxDoc, int32_t from,
+                                 int64_t termCount) {
+    if (sourceCost <= 0 || maxDoc <= 0 || from >= maxDoc) return -1;
+    // A source cannot produce more docs than the segment holds; the clamp
+    // also keeps every product below within 2^62.
+    int64_t src = std::min<int64_t>(sourceCost, maxDoc);
+    int64_t next = std::min<int64_t>(
+        (int64_t)from + CANDIDATE_PROBE_INTERVAL, maxDoc);
+    int64_t seen = priorSource + src * next / maxDoc;
+    int64_t left = src * ((int64_t)maxDoc - from) / maxDoc;
+    int64_t m = std::min(seen, left);
+    int64_t capture = termCount * CANDIDATE_TERM_CAPTURE_COST;
+    if (capture >= m) return -1;
+    return src * (m - capture) / m / CANDIDATE_POSTING_COST;
+  }
+
+private:
   // The state-byte gate is free (interval width is known without touching
   // the dictionary); the docFreq total comes from candidateDocFreqs, which
   // reads each ord's docFreq at most once per segment and stops past the
-  // profitability limit.
+  // budget.
   LUXIR_NOINLINE bool tryActivateCandidates(
       const FieldComparator::CompetitiveOrdState& state, int32_t from) {
     skipCount(SkipStats::fieldSortCandidateProbes);
     int64_t termCount = state.hi - state.lo + 1;
-    if (segmentSourceCost < 0
-        || termCount * (int64_t)sizeof(DocsOnlyEnum) > CANDIDATE_STATE_BYTES) {
+    if (termCount * (int64_t)sizeof(DocsOnlyEnum) > CANDIDATE_STATE_BYTES) {
       return false;
     }
-    // Prorate the source estimate by the fraction of the segment left, then
-    // require the union (postings plus per-term capture) to undercut it by
-    // the cost ratio. The exhaustive baseline on a sparse filtered domain is
-    // its cardinality, not the doc space.
-    int64_t remaining = segmentMaxDoc <= 0 ? 0
-        : segmentSourceCost * ((int64_t)segmentMaxDoc - from) / segmentMaxDoc;
-    int64_t limit = remaining / CANDIDATE_COST_RATIO;
-    int64_t capture = termCount * CANDIDATE_TERM_CAPTURE_COST;
-    if (capture > limit) return false;
+    int64_t budget = candidateBudget(segmentSourceCost, priorSourceDocs,
+                                     segmentMaxDoc, from, termCount);
+    if (budget < 0) return false;
     // The interval only shrinks within a segment, so the first walk sized
     // candidateDocFreqs for every later one. Should that ever break, give up
     // on candidates for the segment, as candidateRange does when narrow()
@@ -1012,20 +1050,19 @@ private:
       candidatesDisabled = true;
       return false;
     }
-    bool profitable =
-        capture + candidateDocFreq(state, termCount, limit - capture) <= limit;
+    bool profitable = candidateDocFreq(state, termCount, budget) <= budget;
 #ifndef NDEBUG
     {
       // Check: the anchored totals reach the verdict a direct walk over the
       // interval does.
       MemPool::ScopeGuard scope(*segmentPool);
       TermsEnum direct(*segmentPool, *state.postingsReader, *state.fieldInfo);
-      int64_t sum = capture;
-      for (int64_t ord = state.lo; ord <= state.hi && sum <= limit; ord++) {
+      int64_t sum = 0;
+      for (int64_t ord = state.lo; ord <= state.hi && sum <= budget; ord++) {
         direct.seekOrd(ord - 1);
         sum += direct.docFreq();
       }
-      assert((sum <= limit) == profitable);
+      assert((sum <= budget) == profitable);
     }
 #endif
     if (!profitable) return false;
