@@ -4,7 +4,9 @@
 #pragma once
 #include <optional>
 #include <pthread.h>
+#include <algorithm>
 #include <oneapi/tbb/flow_graph.h>
+#include <oneapi/tbb/info.h>
 #include <oneapi/tbb/task_group.h>
 
 namespace luxir {
@@ -12,6 +14,14 @@ namespace luxir {
 /// Label the calling thread for ps/top/gdb (15-char kernel limit).
 inline void nameThisThread(const char* name) {
   pthread_setname_np(pthread_self(), name);
+}
+
+
+/// Threads that can compute at once in an arena of the given max_concurrency.
+/// The node arena also reserves a slot per transport thread (see LuxirNode),
+/// so its max_concurrency overstates parallelism; cap at the affinity width.
+inline int computeWidth(int arenaConcurrency) {
+  return std::max(1, std::min(arenaConcurrency, oneapi::tbb::info::default_concurrency()));
 }
 
 

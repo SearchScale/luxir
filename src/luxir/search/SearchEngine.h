@@ -35,10 +35,11 @@ public:
   std::vector<std::string> explain(const ReqProto& proto, std::string tenant);
 
   // Transport entry point: route the request by max_parallel, then submit().
-  // 0 (the default) executes inline on the calling thread (no cross-thread
-  // hop at all - the caller eats the query's latency); every non-zero value
-  // enqueues on the shared TBB task arena, where 1 runs without a task_group
-  // (serial) and -1 parallelizes.
+  // 0 (the default) executes serially inline on the calling thread (no
+  // cross-thread hop at all - the caller eats the query's latency); -1 also
+  // starts on the calling thread, entering the shared TBB task arena so arena
+  // workers parallelize it; 1 enqueues on the arena and runs serially there,
+  // off the calling thread.
   void dispatch(SearchRequest& req, int32_t maxParallel);
 
   // Synchronous execution on the calling thread (dispatch() routes here).

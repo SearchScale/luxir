@@ -472,15 +472,18 @@ TEST_F(ExecutionProfileTest, maxParallelZeroRunsInlineOnCallingThread) {
 
 namespace {
 
-// dispatch() is asynchronous for non-zero max_parallel; record the replying
-// thread and use the promise as a completion latch (reply() runs before
-// set_value, so the future's readiness orders `responses` for the test thread).
+// dispatch() is asynchronous for max_parallel=1; record the replying thread
+// and its arena width, and use the promise as a completion latch (reply() runs
+// before set_value, so the future's readiness orders `responses` for the test
+// thread).
 class DispatchReq : public LocalReq {
 public:
   std::promise<std::thread::id> replied;
+  int replyArenaConcurrency = 0;
   using LocalReq::LocalReq;
   ReplyStatus reply(SearchResponse& response) override {
     ReplyStatus status = LocalReq::reply(response);
+    replyArenaConcurrency = oneapi::tbb::this_task_arena::max_concurrency();
     replied.set_value(std::this_thread::get_id());
     return status;
   }
@@ -488,22 +491,42 @@ public:
 
 } // namespace
 
-TEST_F(ExecutionProfileTest, maxParallelNonZeroDispatchesOffCallingThread) {
+TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
   CollectionHelper helper("profile_pool");
   helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
 
-  for (int32_t maxParallel : {1, -1}) {
-    auto* arena = createArena();
-    auto req = LocalReqHandle(
-        luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
-    auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
-    req->collection("profile_pool").facet("cats", "cat_s").limit(-1);
-    helper.getSearchEngine().dispatch(*req.get(), maxParallel);
-    ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)))
-        << maxParallel;
-    EXPECT_NE(std::this_thread::get_id(), repliedOn.get()) << maxParallel;
-    ASSERT_OK(req);
+  auto* arena = createArena();
+  auto req = LocalReqHandle(
+      luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
+  auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
+  req->collection("profile_pool").facet("cats", "cat_s").limit(-1);
+  helper.getSearchEngine().dispatch(*req.get(), 1);
+  ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
+  EXPECT_NE(std::this_thread::get_id(), repliedOn.get());
+  ASSERT_OK(req);
+}
+
+TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) {
+  CollectionHelper helper("profile_parallel");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 32; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 4)));
+    if (i % 16 == 15) helper.indexAll(docs, UpdateMessage::COMMIT), docs.clear();
   }
+
+  auto* arena = createArena();
+  auto req = LocalReqHandle(
+      luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
+  auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
+  req->collection("profile_parallel").facet("cats", "cat_s").limit(-1);
+  helper.getSearchEngine().dispatch(*req.get(), -1);
+  // Completed inside dispatch(), on this thread, inside the (wider than
+  // default) node arena rather than this thread's implicit arena.
+  ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(0)));
+  EXPECT_EQ(std::this_thread::get_id(), repliedOn.get());
+  EXPECT_EQ(helper.getNode().getTaskArena().max_concurrency(),
+            static_cast<DispatchReq*>(req.get())->replyArenaConcurrency);
+  ASSERT_OK(req);
 }
 
 } // namespace luxir::test

@@ -435,6 +435,7 @@ public:
   int64_t enqueueLine(std::string line, bool last) {
     int64_t bytes = (int64_t)line.size();
     int64_t queued = queuedBytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    uint64_t ticket = lineTickets_.fetch_add(1, std::memory_order_relaxed);
     try {
       // The handler swallows every failure of its own (marking the connection
       // failed), so an exception reaching the catch below can only mean the
@@ -443,13 +444,20 @@ public:
       // shard) could propagate a post-queue failure into that catch and
       // double-subtract bytes a completion path subtracts again.
       net::dispatch(stream_.get_executor(),
-          [self = shared_from_this(), line = std::move(line), last]() mutable {
+          [self = shared_from_this(), ticket, line = std::move(line), last]() mutable {
             int64_t bytes = (int64_t)line.size();  // before the move below
+            if (!self->errored_ && self->ticketLost_.load(std::memory_order_relaxed)) {
+              self->failWrites(net::error::make_error_code(net::error::no_memory));
+            }
             if (self->errored_) {  // connection already failed; drop the line
               self->queuedBytes_.fetch_sub(bytes, std::memory_order_relaxed);
               return;
             }
             try {
+              if (ticket != self->nextLineTicket_) {  // a predecessor is still posted
+                self->earlyLines_.emplace(ticket, Pending{std::move(line), last});
+                return;
+              }
               self->pendingQ_.push_back(Pending{std::move(line), last});
             } catch (...) {
               // Allocation failed; the line was never queued.
@@ -457,6 +465,8 @@ public:
               self->failWrites(net::error::make_error_code(net::error::no_memory));
               return;
             }
+            self->nextLineTicket_++;
+            if (!self->releaseEarlyLines()) return;
             try {
               self->driveWrites();
             } catch (...) {
@@ -467,6 +477,7 @@ public:
       // The handler was never queued: roll the accounting back or the phantom
       // bytes would wedge flow control at the high-water mark forever.
       queuedBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      ticketLost_.store(true, std::memory_order_relaxed);
       throw;
     }
     return queued;
@@ -509,7 +520,20 @@ public:
   void respondErrorFromEngine(http::status status, std::string body) {
     net::post(stream_.get_executor(),
         [self = shared_from_this(), status, body = std::move(body)]() mutable {
-          if (self->errored_ || self->headerSent_) return;
+          if (self->errored_) return;
+          if (self->ticketLost_.load(std::memory_order_relaxed)) {
+            // The lost line never arrives, so this connection cannot stream in
+            // order again.  Mid-stream, fail it.  Before any output, still
+            // answer, then close: abandoning output first drops parked and
+            // later lines instead of failing the connection under the answer.
+            if (self->headerSent_) {
+              self->failWrites(net::error::make_error_code(net::error::no_memory));
+              return;
+            }
+            self->keepAlive_ = false;
+            self->abandonOutput();
+          }
+          if (self->headerSent_) return;
           self->respondJson(status, std::move(body));
         });
   }
@@ -612,9 +636,23 @@ private:
   bool pretty_ = false;  // fixed before submitting work for this request
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
-  // producers but not yet written to the socket (pendingQ_ + inflightLine_);
-  // it is the only cross-thread piece - everything else is shard-only.
+  // producers but not yet written to the socket (earlyLines_ + pendingQ_ +
+  // inflightLine_); it, the line-ordering atomics below and aborted_ are the
+  // only cross-thread pieces - everything else is shard-only.
   std::atomic<int64_t> queuedBytes_{0};
+  // Lines reach pendingQ_ in enqueueLine order.  enqueueLine's dispatch runs
+  // inline on the shard thread but posts from any other, so a request that
+  // produces on both (max_parallel=-1 runs on the shard while arena workers
+  // reply too) could queue a shard line ahead of an earlier posted one.  Each
+  // line takes a ticket; one that arrives before a predecessor waits in
+  // earlyLines_.
+  std::atomic<uint64_t> lineTickets_{0};
+  // Set when a line's handler could not be queued: its ticket never arrives,
+  // so the connection closes at its next shard handler instead of wedging
+  // (respondErrorFromEngine still answers if nothing has streamed).
+  std::atomic<bool> ticketLost_{false};
+  uint64_t nextLineTicket_ = 0;
+  std::map<uint64_t, Pending> earlyLines_;
   std::atomic<bool> aborted_{false};  // producer-visible mirror of errored_
   int64_t highWater_;
   int64_t lowWater_;
@@ -1602,7 +1640,8 @@ private:
 
     // Route by max_parallel: the default (0) deliberately runs the whole
     // query right here on the shard thread - serial, no scheduler, blocking
-    // this connection's io until it completes.  Non-zero values move the
+    // this connection's io until it completes.  -1 also runs here, entering
+    // the task arena so its workers parallelize the query.  1 moves the
     // synchronous engine.submit() onto the task arena so this io thread is
     // not occupied for the query's duration; reply() then posts results back
     // here.
@@ -2513,10 +2552,9 @@ private:
 
   void startStreamingUpdate(std::string coll, UpdateUrlParams url) {
     const auto& ingest = node_.getConfig().ingest;
-    std::size_t arenaConcurrency =
-        (std::size_t)std::max(1, node_.getTaskArena().max_concurrency());
+    std::size_t arenaWidth = (std::size_t)computeWidth(node_.getTaskArena().max_concurrency());
     std::size_t maxInFlight = ingest.max_inflight_batches == 0
-        ? arenaConcurrency + 2
+        ? arenaWidth + 2
         : (std::size_t)ingest.max_inflight_batches;
     auto state = std::make_shared<HttpStreamUpdateState>(
         (std::size_t)ingest.stream_batch_size,
@@ -3459,8 +3497,33 @@ private:
     finishResponse();
   }
 
+  // Shard only.  Moves early lines whose predecessors have all been queued to
+  // pendingQ_.  Returns false if the connection failed doing so.
+  bool releaseEarlyLines() {
+    while (!earlyLines_.empty() && earlyLines_.begin()->first == nextLineTicket_) {
+      try {
+        pendingQ_.push_back(std::move(earlyLines_.begin()->second));
+      } catch (...) {
+        failWrites(net::error::make_error_code(net::error::no_memory));  // drops earlyLines_ too
+        return false;
+      }
+      earlyLines_.erase(earlyLines_.begin());
+      nextLineTicket_++;
+    }
+    return true;
+  }
+
   void failWrites(beast::error_code ec) {
     LOG_TRACE("http write: {}", ec.message());
+    abandonOutput();
+    if (terminalStreamingFailure_) doTerminalStreamingClose();
+    else doClose();
+  }
+
+  // Shard only.  Marks the response stream failed without closing the
+  // connection: drops queued lines (later ones drop on arrival) and wakes
+  // paused producers.
+  void abandonOutput() {
     errored_ = true;
     aborted_.store(true, std::memory_order_relaxed);
     if (streamUpdate_ && !streamUpdate_->failed) {
@@ -3473,20 +3536,20 @@ private:
     int64_t dropped = 0;
     for (const auto& p : pendingQ_) dropped += (int64_t)p.line.size();
     pendingQ_.clear();
+    for (const auto& [ticket, p] : earlyLines_) dropped += (int64_t)p.line.size();
+    earlyLines_.clear();
     queuedBytes_.fetch_sub(dropped, std::memory_order_relaxed);
     // Wake paused producers so their requests can finish (and be freed); their
     // next reply() observes CANCEL via aborted_.
     maybeFireDrainWaiters();
-    if (terminalStreamingFailure_) doTerminalStreamingClose();
-    else doClose();
   }
 
   // Shard only. Fires parked producer resumes once the queue has drained
   // below low-water (or unconditionally after an error).  Resumes are POSTED
   // to this connection's shard, not invoked: an already-drained park must not
   // recurse into produce(), and running production here keeps a default-lane
-  // request on the thread that owns it (arena-lane requests re-enqueue
-  // themselves - see HttpSearchRequest::resumeWhenDrained).
+  // request on the thread that owns it (max_parallel=-1 re-enters the arena
+  // here and 1 re-enqueues - see HttpSearchRequest::resumeWhenDrained).
   // Must not throw: it runs inside io handlers (ioc->run() has no catch), and
   // a lost waiter strands its request forever - so a post allocation failure
   // falls back to running the resume inline.
@@ -3736,8 +3799,16 @@ void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
-  if (maxParallel != 0) {
-    // The request opted its query work off the io plane (max_parallel != 0),
+  if (maxParallel == -1) {
+    // The parallel lane runs on this shard inside the arena (see
+    // SearchEngine::dispatch), and so does resumed production: its per-batch
+    // task groups must spawn into the node arena, not this thread's implicit
+    // one.
+    resume = [&node = session->node(), resume = std::move(resume)] {
+      node.executeIsolated(resume);
+    };
+  } else if (maxParallel != 0) {
+    // The request opted its query work off the io plane (max_parallel=1),
     // so resumed production belongs on the arena too.  The wrapper runs on
     // the shard (see maybeFireDrainWaiters) and must not throw: fall back to
     // producing inline rather than stranding the stream.
@@ -3754,7 +3825,8 @@ void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
 
 HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes,
                        std::chrono::milliseconds shardIdlePeriod)
-  : node(node), nthreads(threads), requestedPort(port),
+  : node(node), nthreads(threads > 0 ? threads : std::max(1, oneapi::tbb::info::default_concurrency())),
+    arenaEntrants(node, nthreads, "HttpServer"), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
@@ -3768,15 +3840,13 @@ HttpServer::~HttpServer() { shutdown(); }
 void HttpServer::start() {
   if (started) return;
   shutdownRequested.store(false, std::memory_order_release);
-  int n = nthreads > 0 ? nthreads
-                       : std::max(1, oneapi::tbb::info::default_concurrency());
 
   std::string host = requestedPort == 0 ? "127.0.0.1" : "0.0.0.0";
   tcp::endpoint ep(net::ip::make_address(host), (unsigned short)requestedPort);
 
   registry = std::make_shared<HttpSessionRegistry>();
-  shards.reserve(n);
-  for (int i = 0; i < n; i++) {
+  shards.reserve(nthreads);
+  for (int i = 0; i < nthreads; i++) {
     shards.push_back(std::make_shared<HttpIoShard>());
   }
 

@@ -345,7 +345,7 @@ private:
   void emit(std::span<Point> points) {
     uint32_t nextLeaf = 0;
     size_t ntokens = (size_t)4
-                   * (size_t)oneapi::tbb::this_task_arena::max_concurrency();
+                   * (size_t)computeWidth(oneapi::tbb::this_task_arena::max_concurrency());
     oneapi::tbb::parallel_pipeline(
         ntokens,
         oneapi::tbb::make_filter<void, uint32_t>(

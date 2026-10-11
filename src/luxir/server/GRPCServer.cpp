@@ -45,7 +45,8 @@ namespace luxir {
 // #define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBufferBytes)
-  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port),
+  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads),
+    arenaEntrants(node, nthreads, "GRPCServer"), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
@@ -683,7 +684,8 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // query serially right here on this completion-queue thread - the cheapest
   // path, accepting that this cq's other calls wait for the query's duration
   // (a paused streaming producer parks and returns, so flow control still
-  // advances).  Non-zero values run on the task arena instead, keeping this
+  // advances).  -1 also runs here, entering the task arena so its workers
+  // parallelize the query; 1 runs on the task arena instead, keeping this
   // cq thread free to process completions.  The call outlives the request
   // because its outstanding-response count stays positive until the final
   // reply, and requestActive keeps pipelined requests on this stream ordered.

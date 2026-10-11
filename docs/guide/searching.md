@@ -612,9 +612,11 @@ beside `ops` in the full form:
   executes serially on the transport thread that received it, with no
   scheduler handoff. `1` moves the request onto the
   shared work-stealing scheduler, still serial, so an expensive query does
-  not occupy its connection thread. `-1` removes the cap and lets the request
-  parallelize across segments and operations. The path collection overrides
-  any collection target in the HTTP body.
+  not occupy its connection thread. `-1` removes the cap: the request starts
+  on the receiving thread and shared workers join in, parallelizing across
+  segments and operations; like the default, it occupies the receiving
+  thread for its duration. The path collection overrides any collection
+  target in the HTTP body.
 - `profile: true` returns an execution profile on the final response.
 
 Profiling is opt-in and request-wide, and operations adopt instrumentation

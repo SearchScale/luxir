@@ -6,11 +6,31 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/log.h"
 
 namespace luxir {
 
+// One arena slot per thread that enters the task arena from outside: each
+// HTTP shard and gRPC thread the configured servers run, plus the embedding
+// (main or test) thread.
+static int reservedArenaSlots(const LuxirConfig& config) {
+  const auto& server = config.server;
+  return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+}
+
+LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view server)
+  : node(node), n(n) {
+  int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
+  if (total > node.reservedSlots) {
+    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
+             "server.http.threads and server.grpc.threads; excess entrants can block behind arena work",
+             server, n, total, node.reservedSlots);
+  }
+}
+
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
-  : config(std::move(config)) {
+  : config(std::move(config)), reservedSlots(reservedArenaSlots(this->config)),
+    taskArena(std::max(1, oneapi::tbb::info::default_concurrency() - 1) + reservedSlots, reservedSlots) {
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers

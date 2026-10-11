@@ -90,6 +90,31 @@ public:
     return taskArena;
   }
 
+  // Runs f on the calling thread inside the task arena, in one of the slots
+  // reserved for threads entering from outside.  Tasks f spawns are stealable
+  // by the arena's workers, and f's waits run only tasks spawned within f
+  // (isolation): a transport thread never picks up a merge or another
+  // request's work while its connections wait.
+  template <typename F>
+  void executeIsolated(const F& f) {
+    taskArena.execute([&] { oneapi::tbb::this_task_arena::isolate(f); });
+  }
+
+  // Counts a transport server's threads against the task arena's reserved
+  // slots for the holder's lifetime.  Warns when entrants outnumber the slots
+  // (servers run with more threads than the config the node was built from):
+  // the excess take worker slots, or when none is free hand their work to the
+  // arena and block behind its backlog.
+  class ArenaEntrants {
+    LuxirNode& node;
+    int n;
+  public:
+    ArenaEntrants(LuxirNode& node, int n, std::string_view server);
+    ~ArenaEntrants() { node.arenaEntrants.fetch_sub(n, std::memory_order_relaxed); }
+    ArenaEntrants(const ArenaEntrants&) = delete;
+    ArenaEntrants& operator=(const ArenaEntrants&) = delete;
+  };
+
   IndexRamBudget& getIndexRamBudget() {
     return indexRamBudget;
   }
@@ -111,26 +136,37 @@ private:
   std::unique_ptr<ReplicationFollower> follower;
   std::unique_ptr<SearchEngine> searchEngine;
 
+  // Query and index work.  Workers: the affinity width less one, as a default
+  // arena has, but at least one slot even on a single CPU: an arena of only
+  // reserved slots never serves enqueued tasks.  Plus a reserved slot per
+  // thread that enters from outside (each configured HTTP shard and gRPC
+  // thread, and the embedding thread), so an execute() from a transport thread
+  // always finds a free slot instead of handing its functor to the arena and
+  // blocking behind arena backlog.  Reserved slots are seats, not threads:
+  // they add no workers.
+  int reservedSlots;
+  std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;
 
   // Labels arena worker threads for ps/top/gdb. Masters (transport threads
   // executing in the arena) keep their own names. Declared after taskArena:
   // observation detaches before the arena tears down.
   class ArenaThreadNamer : public oneapi::tbb::task_scheduler_observer {
+    int reservedSlots;  // workers occupy the slots after these
   public:
-    explicit ArenaThreadNamer(oneapi::tbb::task_arena& arena)
-      : oneapi::tbb::task_scheduler_observer(arena) {
+    ArenaThreadNamer(oneapi::tbb::task_arena& arena, int reservedSlots)
+      : oneapi::tbb::task_scheduler_observer(arena), reservedSlots(reservedSlots) {
       observe(true);
     }
     void on_scheduler_entry(bool worker) override {
       if (!worker) return;
       char name[16];
       snprintf(name, sizeof(name), "luxir_tbb_%d",
-               oneapi::tbb::this_task_arena::current_thread_index());
+               oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
       nameThisThread(name);
     }
   };
-  ArenaThreadNamer arenaThreadNamer{taskArena};
+  ArenaThreadNamer arenaThreadNamer{taskArena, reservedSlots};
 };
 
 }

@@ -147,11 +147,17 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
     // wakes - the transport accepts that this thread is occupied for the
     // query's duration.
     submit(req, maxParallel);
+  } else if (maxParallel == -1) {
+    // Parallel lane: the request starts right here, inside the arena, so it
+    // pays no handoff; arena workers steal the tasks it spawns and this thread
+    // helps in its own waits.  Entry takes a reserved slot (never queues
+    // behind arena backlog).  Like the default lane, this transport thread is
+    // occupied for the query's (now parallel) duration.
+    node.executeIsolated([&] { submit(req, maxParallel); });
   } else {
-    // Every explicit non-zero value is an arena contract: 1 = serial off the
-    // receiving thread, -1 = unlimited intra-request parallelism (>1 reserved
-    // for a bounded width budget).  Query work stays inside the TBB-governed
-    // thread set either way.
+    // 1 = serial off the receiving thread: the escape hatch for a query
+    // expected to be expensive, so it does not occupy this transport thread.
+    // Other values are rejected in prepare(), on the arena like 1.
     node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
   }
 }

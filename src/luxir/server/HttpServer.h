@@ -60,6 +60,7 @@ public:
 private:
   LuxirNode& node;
   int nthreads;
+  LuxirNode::ArenaEntrants arenaEntrants;
   int requestedPort;
   int64_t streamBufferBytes_;
   std::chrono::milliseconds shardIdlePeriod;

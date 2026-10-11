@@ -246,18 +246,24 @@ to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 
 `--server.http.threads` sets the number of shards, not the total HTTP thread
 count; each shard owns one `io_context` and one runner. Connections are
-assigned round-robin at accept and remain pinned to their shard. These and the
+assigned round-robin at accept and remain pinned to their shard.
+
 Search requests default to serial execution directly on the transport thread
 that received them (an HTTP io shard or gRPC completion-queue thread). This
 avoids a scheduler handoff and idle-worker wakeups but occupies that
-connection's thread for the query's duration. The request-level `max_parallel`
-moves a request onto the shared work-stealing scheduler instead: `1` runs it
-serially there (use this for requests expected to be expensive, so they do not
-delay other traffic on the same connection thread), `-1` runs it with
-unlimited intra-request parallelism, and values above `1` are reserved for a
-bounded parallelism budget and not implemented yet. The current gRPC unary
-update handler waits for indexing on its completion-queue thread; streaming
-update and search use their separate flow-control paths.
+connection's thread for the query's duration. The request-level
+`max_parallel` changes that: `1` moves the request onto the shared
+work-stealing scheduler, still serial (use this for requests expected to be
+expensive, so they do not delay other traffic on the same connection thread);
+`-1` keeps the request on its transport thread but lets the scheduler's
+workers join in with unlimited intra-request parallelism; values above `1` are
+reserved for a bounded parallelism budget and not implemented yet. No setting
+runs a request in parallel off its transport thread. Two paths leave the
+transport thread whatever the setting: a request with `min_commit` continues on
+a shared worker once its commit wait ends, and a gRPC search stream paused by
+flow control resumes on one. The current gRPC unary update handler waits for
+indexing on its completion-queue thread; streaming update and search use their
+separate flow-control paths.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above

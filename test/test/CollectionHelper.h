@@ -369,6 +369,7 @@ public:
   }
 
   SearchEngine& getSearchEngine() { return node_->getSearchEngine(); }
+  LuxirNode& getNode() { return *node_; }
 
   /// Given nDocs, mergeFactor, and a base-36 "shape" string, fill docsPerSeg with
   /// per-segment doc counts (largest to smallest). For reusing a prior test/bench index.

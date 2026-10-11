@@ -76,11 +76,13 @@ One request contains:
 - `freshness_ms` and `time_zone`: request-level view/date controls.
 - `profile`: include instrumented per-segment execution details on the final
   response; string field facets are currently instrumented.
-- `max_parallel`: maximum intra-request parallelism on the shared worker
-  pool - `1` for serial, `-1` for unlimited. `0` (the default) lets the
-  engine decide; today that runs the request serially, inline on the
-  completion-queue thread that received it (no scheduler handoff; occupies
-  that thread for the request's duration). Larger values are reserved.
+- `max_parallel`: maximum intra-request parallelism - `1` for serial on the
+  shared worker pool, `-1` for unlimited (starts on the completion-queue
+  thread that received it, with shared workers joining in). `0` (the
+  default) lets the engine decide; today that runs the request serially,
+  inline on the completion-queue thread that received it (no scheduler
+  handoff). `0` and `-1` occupy that thread for the request's duration.
+  Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line
