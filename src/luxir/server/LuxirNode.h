@@ -143,7 +143,9 @@ private:
   // thread, and the embedding thread), so an execute() from a transport thread
   // always finds a free slot instead of handing its functor to the arena and
   // blocking behind arena backlog.  Reserved slots are seats, not threads:
-  // they add no workers.
+  // they add no workers.  Workers that run out of work leave at once
+  // (leave_policy::fast) instead of yielding for up to a millisecond first:
+  // with request-sized fan-outs the linger burned far more CPU than the work.
   int reservedSlots;
   std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;

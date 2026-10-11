@@ -293,6 +293,10 @@ list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
 add_library(luxir_lib STATIC ${Proj_SOURCES})
 target_compile_definitions(luxir_lib PUBLIC
+  # oneTBB preview API for task_arena::leave_policy (LuxirNode). Global so
+  # every translation unit, and the precompiled headers that include
+  # task_arena.h, sees the same TBB declarations.
+  TBB_PREVIEW_PARALLEL_PHASE=1
   # GCC -Og cannot honor xxHash's always_inline AVX-512 accumulator through
   # its function-pointer dispatch. Keep header inlining in optimized builds,
   # but use the linked implementation in Debug.

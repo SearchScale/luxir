@@ -30,7 +30,8 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   : config(std::move(config)), reservedSlots(reservedArenaSlots(this->config)),
-    taskArena(std::max(1, oneapi::tbb::info::default_concurrency() - 1) + reservedSlots, reservedSlots) {
+    taskArena(std::max(1, oneapi::tbb::info::default_concurrency() - 1) + reservedSlots, reservedSlots,
+              oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast) {
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
