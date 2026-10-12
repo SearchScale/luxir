@@ -18,11 +18,10 @@ namespace luxir {
  * of std::shared_ptr<Value>
  *
  * This map allows multiple threads to concurrently request a value for a key.
- * If the value doesn't exist, one thread will be chosen to create it
- * (the "builder" thread), while other threads requesting the same key
- * (the "waiter" threads) will block using tbb::task_group::wait().
- * This allows TBB's work-stealing scheduler to pick up other tasks
- * while the waiter threads are blocked.
+ * If the value doesn't exist, the first requesting thread creates it on its
+ * own stack (the "builder"), while other threads requesting the same key
+ * (the "waiters") block using tbb::task_group::wait(), which lets TBB's
+ * work-stealing scheduler pick up other tasks while they are blocked.
  *
  * @tparam Key The type of the keys in the map. Must be copy-constructible,
  * copy-assignable, and comparable (e.g., via operator< or std::hash).
@@ -91,6 +90,7 @@ public:
   Pointer getOrCreate(const Key& key, CreateFunc&& createFunc) {
     Pointer result;
     std::shared_ptr<tbb::task_group> tg;
+    tbb::task_handle build;
     bool foundPointer = false;
 
     // insert with the task_group alternative.
@@ -99,10 +99,14 @@ public:
         // LOG_DEBUG("CREATE {}", key);
         tg = std::make_shared<tbb::task_group>();
         elem.second = tg;
-        // must create the task when inserting the task_group to prevent race conditions,
-        // otherwise another thread could wait on the task group before we add the create task.
-        // Capture by ref for everything is fine here since all callers will wait on tg.
-        tg->run([&]() {
+        // Create the task when inserting the task_group so no waiter can find
+        // the group without it.  Deferred, not run: the handle holds the
+        // group's wait open, and this thread runs it below.  A spawned task
+        // could sit in a deque behind higher-priority work (index merges run
+        // as critical tasks), out of reach of a waiter whose wait is isolated
+        // or in another arena.  Capture by ref is fine: the builder runs it
+        // before returning.
+        build = tg->defer([&]() {
           try {
             // we aren't allowed to call dataMap methods inside another dataMap method,
             // but this is guaranteed to execute outside/after the try_emplace_and_cvisit method.
@@ -140,11 +144,15 @@ public:
       return std::move(result);
     }
 
-    // If the task_group is present, then wait on it.
+    // If the task_group is present, then build or wait on it.
     if (!tg) {
       return nullptr;
     }
-    tg->wait();
+    if (build) {
+      tg->run_and_wait(std::move(build));
+    } else {
+      tg->wait();
+    }
 
     MapVal outVal;
     auto visited = dataMap.cvisit(key, [&outVal](const auto& elem) {

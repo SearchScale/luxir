@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include <oneapi/tbb/task_arena.h>
 #include "test/LuxirTest.h"
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/StrRef.h"
@@ -69,6 +70,19 @@ TEST_F(UtilTest, packedTermHash128Format) {
       EXPECT_EQ(prefix, PackedTerm::fitPrefix(TermPolicy::HASH128, value));
     }
   }
+}
+
+TEST_F(UtilTest, lazyMapBuildsOnRequestingThread) {
+  // The builder runs creation itself rather than leaving it in a deque that
+  // idle workers (or nobody) might pick up.
+  SharedLazyMap<int, std::thread::id> map;
+  oneapi::tbb::task_arena arena;
+  arena.execute([&] {
+    for (int key = 0; key < 100; key++) {
+      auto builtOn = map.getOrCreate(key, [] { return std::make_shared<std::thread::id>(std::this_thread::get_id()); });
+      ASSERT_EQ(std::this_thread::get_id(), *builtOn);
+    }
+  });
 }
 
 TEST_F(UtilTest, lazyMap) {
