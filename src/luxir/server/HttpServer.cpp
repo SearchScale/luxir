@@ -1214,6 +1214,7 @@ private:
                                          json, overlay, err)) return false;
 
     appendStringParam(params, "query", true, json, overlay);
+    appendStringParam(params, "collapse", true, json, overlay);
     if (!appendIntegerParam<std::int64_t>(params, "limit",
                                          "signed 64-bit decimal integer", true,
                                          json, overlay, err) ||

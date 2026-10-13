@@ -83,6 +83,7 @@ defaults and constraints are described in the comments and guides.
 - [`ColInt`](#message-luxir.colint)
 - [`ColStr`](#message-luxir.colstr)
 - [`ColVector`](#message-luxir.colvector)
+- [`Collapse`](#message-luxir.collapse)
 - [`CollectionCacheControl`](#message-luxir.collectioncachecontrol)
 - [`CollectionCommit`](#message-luxir.collectioncommit)
 - [`CollectionStats`](#message-luxir.collectionstats)
@@ -113,6 +114,8 @@ defaults and constraints are described in the comments and guides.
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
+- [`GroupComponent`](#message-luxir.groupcomponent)
+- [`GroupKey`](#message-luxir.groupkey)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
 - [`JemallocStats`](#message-luxir.jemallocstats)
@@ -495,6 +498,19 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 |---|---|---|---|---|
 | <a id="field-luxir.colvector.v"></a>[`v`](#field-luxir.colvector.v) | 1 | [`Vector`](#message-luxir.vector) | repeated |  |
 
+<a id="message-luxir.collapse"></a>
+
+### luxir.Collapse
+
+Partition matching documents by an exact, single-valued key.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.collapse.field"></a>[`field`](#field-luxir.collapse.field) | 1 | `string` | repeated | One field, or an exact tuple. Uses value binding. |
+| <a id="field-luxir.collapse.missing"></a>[`missing`](#field-luxir.collapse.missing) | 2 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
+
 <a id="message-luxir.collectioncachecontrol"></a>
 
 ### luxir.CollectionCacheControl
@@ -647,6 +663,8 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Exact match count when get\_number was requested. For Fusion, counts distinct documents in the union of source ranked lists, before paging. |
+| <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when get\_number was requested, after missing=drop. |
+| <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupKey`](#message-luxir.groupkey) | repeated | Collapse only: exactly row\_count identities aligned with head rows. |
 | <a id="field-luxir.doclist.columns"></a>[`columns`](#field-luxir.doclist.columns) | 3 | map&lt;`string`, [`Column`](#message-luxir.column)&gt; | map | Dense columns; each has exactly row\_count slots. |
 | <a id="field-luxir.doclist.docs"></a>[`docs`](#field-luxir.doclist.docs) | 5 | [`Map`](#message-luxir.map) | repeated | Per-document field maps. When present: exactly row\_count entries; docs\[i\] holds the fields of document i not represented as a dense column. A field name never appears in both columns and docs\[i\]. |
 | <a id="field-luxir.doclist.row_count"></a>[`row_count`](#field-luxir.doclist.row_count) | 6 | `int32` | singular | Number of documents in this batch, including rows with no returned fields. A count-only response has row\_count=0. |
@@ -948,6 +966,36 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.geodistancequery.lat"></a>[`lat`](#field-luxir.geodistancequery.lat) | 2 | `double` | singular | center latitude, degrees in \[-90, 90\] |
 | <a id="field-luxir.geodistancequery.lon"></a>[`lon`](#field-luxir.geodistancequery.lon) | 3 | `double` | singular | center longitude, degrees in \[-180, 180\] |
 | <a id="field-luxir.geodistancequery.radius_meters"></a>[`radius_meters`](#field-luxir.geodistancequery.radius_meters) | 4 | `double` | singular | inclusive radius, finite and non-negative |
+
+<a id="message-luxir.groupcomponent"></a>
+
+### luxir.GroupComponent
+
+Typed collapse identity. Component types follow the resolved schema fields.
+
+[Source](../../protos/luxir_types.proto)
+
+<a id="oneof-luxir.groupcomponent.value"></a>
+
+**oneof `value`:** at most one member can be set.
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.groupcomponent.type"></a>[`type`](#field-luxir.groupcomponent.type) | 1 | [`GroupComponent.Type`](#enum-luxir.groupcomponent.type) | singular |  |
+| <a id="field-luxir.groupcomponent.null"></a>[`null`](#field-luxir.groupcomponent.null) | 2 | [`google.protobuf.NullValue`](#enum-google.protobuf.nullvalue) | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
+| <a id="field-luxir.groupcomponent.s"></a>[`s`](#field-luxir.groupcomponent.s) | 3 | `string` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
+| <a id="field-luxir.groupcomponent.i"></a>[`i`](#field-luxir.groupcomponent.i) | 4 | `sint64` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
+
+<a id="message-luxir.groupkey"></a>
+
+### luxir.GroupKey
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.groupkey.component"></a>[`component`](#field-luxir.groupkey.component) | 1 | [`GroupComponent`](#message-luxir.groupcomponent) | repeated |  |
+| <a id="field-luxir.groupkey.singleton"></a>[`singleton`](#field-luxir.groupkey.singleton) | 2 | `uint64` | optional | Present for missing=expand: reader-local document identity, not a key value. |
 
 <a id="message-luxir.indexramstats"></a>
 
@@ -1683,6 +1731,7 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
+| <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
 
 <a id="message-luxir.updaterequest"></a>
@@ -1815,11 +1864,13 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 ## Enums
 
 - [`CalendarGap.Unit`](#enum-luxir.calendargap.unit)
+- [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy)
 - [`DocFormat`](#enum-luxir.docformat)
 - [`Error.Kind`](#enum-luxir.error.kind)
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
+- [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
@@ -1845,6 +1896,18 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 | <a id="value-luxir.calendargap.unit.month"></a>[`MONTH`](#value-luxir.calendargap.unit.month) | 3 |  |
 | <a id="value-luxir.calendargap.unit.quarter"></a>[`QUARTER`](#value-luxir.calendargap.unit.quarter) | 4 |  |
 | <a id="value-luxir.calendargap.unit.year"></a>[`YEAR`](#value-luxir.calendargap.unit.year) | 5 |  |
+
+<a id="enum-luxir.collapse.missingpolicy"></a>
+
+### luxir.Collapse.MissingPolicy
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.collapse.missingpolicy.expand"></a>[`EXPAND`](#value-luxir.collapse.missingpolicy.expand) | 0 | Each document missing any component is a tagged singleton. |
+| <a id="value-luxir.collapse.missingpolicy.group"></a>[`GROUP`](#value-luxir.collapse.missingpolicy.group) | 1 | Preserve present tuple components and tag missing ones as null. |
+| <a id="value-luxir.collapse.missingpolicy.drop"></a>[`DROP`](#value-luxir.collapse.missingpolicy.drop) | 2 | Exclude documents missing any component. |
 
 <a id="enum-luxir.docformat"></a>
 
@@ -1922,6 +1985,19 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.fielddef.longterms.truncate"></a>[`TRUNCATE`](#value-luxir.fielddef.longterms.truncate) | 0 | keep a UTF-8-safe prefix of at most 255 bytes; values may merge |
 | <a id="value-luxir.fielddef.longterms.reject"></a>[`REJECT`](#value-luxir.fielddef.longterms.reject) | 1 | reject overlong terms |
 | <a id="value-luxir.fielddef.longterms.hash128"></a>[`HASH128`](#value-luxir.fielddef.longterms.hash128) | 2 | prefix of at most 230 bytes plus 25 base36 hash digits |
+
+<a id="enum-luxir.groupcomponent.type"></a>
+
+### luxir.GroupComponent.Type
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.groupcomponent.type.string"></a>[`STRING`](#value-luxir.groupcomponent.type.string) | 0 |  |
+| <a id="value-luxir.groupcomponent.type.id"></a>[`ID`](#value-luxir.groupcomponent.type.id) | 1 |  |
+| <a id="value-luxir.groupcomponent.type.int"></a>[`INT`](#value-luxir.groupcomponent.type.int) | 2 |  |
+| <a id="value-luxir.groupcomponent.type.date"></a>[`DATE`](#value-luxir.groupcomponent.type.date) | 3 |  |
 
 <a id="enum-luxir.linearfusion.normalization"></a>
 

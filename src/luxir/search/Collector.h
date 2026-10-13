@@ -11,6 +11,7 @@
 
 #include "luxir/query/Query.h"
 #include "luxir/search/DocSet.h"
+#include "luxir/search/Collapse.h"
 
 namespace luxir {
 
@@ -49,15 +50,36 @@ public:
 
 
 
-class TopDocsCollector {
+struct NoCollapseAdmission {};
+
+template <bool Collapsed = false>
+class ScoreCollector {
   public:
 
   // Having this packed helped both memory and CPU (presumably better cache hits?)
   LUXIR_UNALIGNED_START
-  struct ScoreDoc {
+  struct DocScore {
     float score;
     segdoc doc;
   } LUXIR_UNALIGNED_END;
+  struct GroupScore {
+    float score;
+    segdoc doc;
+    size_t slot;
+  };
+  using ScoreDoc = std::conditional_t<Collapsed, GroupScore, DocScore>;
+
+  [[no_unique_address]] std::conditional_t<Collapsed,
+      std::unique_ptr<CollapseAdmission>, NoCollapseAdmission> groups;
+
+  struct GroupComparator {
+    const ScoreCollector* collector;
+    bool operator()(const ScoreDoc& a, const ScoreDoc& b) const {
+      return a.score == b.score
+          ? collector->groups->keys[(size_t)a.slot] < collector->groups->keys[(size_t)b.slot]
+          : a.score > b.score;
+    }
+  };
 
 
   int64_t hitCount = 0;
@@ -79,41 +101,85 @@ class TopDocsCollector {
   // The storage expands on demand: topCount bounds the heap but is not allocated up
   // front, which matters for deep or unbounded limits (limit=-1 maps to maxDoc) and for
   // the per-slice collectors that never see topCount hits.
-  ExpandingPQ<ScoreDoc, decltype(scoreAndDocComp)> pq;
+  using Comparator = std::conditional_t<Collapsed, GroupComparator, decltype(scoreAndDocComp)>;
+  ExpandingPQ<ScoreDoc, Comparator, Collapsed> pq;
 
-  TopDocsCollector(int64_t topCount)
-      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0)) {
+  static Comparator comparator(const ScoreCollector* collector) {
+    if constexpr (Collapsed) return {collector};
+    else { unused(collector); return scoreAndDocComp; }
+  }
+
+  ScoreCollector(int64_t topCount, const CollapsePlan* collapse = nullptr)
+      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0), comparator(this)) {
+    if constexpr (Collapsed) groups = std::make_unique<CollapseAdmission>(*collapse);
+    else unused(collapse);
     // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
     // empty and collect() only counts.  Negative counts are a bug in the caller.
     assert(topCount >= 0);
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
-    hitCount++;
+    if constexpr (Collapsed) {
+      const auto* key = groups->reader.read(segment, docid);
+      if (key == nullptr) return;
+      hitCount++;
+      groups->count(*key);
+      offer(*key, segdoc(segment, docid), score);
+    } else {
+      hitCount++;
 
-    // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so any
-    // insert/top() would be out of bounds).  hitCount above still yields an accurate
-    // total, so get_number and sub-op domains are unaffected.
-    if (topCount == 0) {
-      return;
-    }
+      // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so any
+      // insert/top() would be out of bounds).  hitCount above still yields an accurate
+      // total, so get_number and sub-op domains are unaffected.
+      if (topCount == 0) {
+        return;
+      }
 
-    // Admit anything that can match OR beat the k-th best score (>=, not >): a doc whose
-    // score ties the k-th score is still competitive if its (seg, docid) sorts ahead of the
-    // current worst tied doc.  insertWithOverflow resolves that via the (score, then doc)
-    // heap comparator, so a losing tie is a cheap no-op insert and a winning tie evicts the
-    // worst.  This is what makes the kept top-K order-independent (collection, merge, slice).
-    if (score >= minCompetitiveVal) {
-      pq.insertWithOverflow({score, segdoc(segment, docid)});
-      // Once the heap holds topCount docs, its root (a min-heap on score) is the k-th best
-      // so far - the competitive threshold a later doc must beat to enter.  Publish it as
-      // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
-      // sorted / clustered input never evicts, so the old "update on overflow only" left the
-      // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
-      if (pq.size() >= topCount) {
-        minCompetitiveVal = pq.top().score;
+      // Admit anything that can match OR beat the k-th best score (>=, not >): a doc whose
+      // score ties the k-th score is still competitive if its (seg, docid) sorts ahead of the
+      // current worst tied doc.  insertWithOverflow resolves that via the (score, then doc)
+      // heap comparator, so a losing tie is a cheap no-op insert and a winning tie evicts the
+      // worst.  This is what makes the kept top-K order-independent (collection, merge, slice).
+      if (score >= minCompetitiveVal) {
+        pq.insertWithOverflow({score, segdoc(segment, docid)});
+        // Once the heap holds topCount docs, its root (a min-heap on score) is the k-th best
+        // so far - the competitive threshold a later doc must beat to enter.  Publish it as
+        // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
+        // sorted / clustered input never evicts, so the old "update on overflow only" left the
+        // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
+        if (pq.size() >= topCount) {
+          minCompetitiveVal = pq.top().score;
+        }
       }
     }
+  }
+
+  void setSegment(int32_t segment) requires Collapsed {
+    groups->reader.setSegment(segment);
+  }
+
+  void offer(const CollapseKey& key, segdoc doc, float score) requires Collapsed {
+    if (topCount == 0 || score < minCompetitiveVal) return;
+    auto found = groups->retained.find(key);
+    if (found != groups->retained.end()) {
+      size_t slot = found->second;
+      auto& member = pq.atSlot((size_t)slot);
+      // Group rank ties use the key; member ties still use the document.
+      if (score < member.score || (score == member.score && doc >= member.doc)) return;
+      member = {score, doc, slot};
+      pq.updateSlot((size_t)slot);
+    } else if (pq.size() < (size_t)topCount) {
+      size_t slot = groups->retain(key, pq.size());
+      pq.insert({score, doc, slot});
+    } else {
+      const auto& bottom = pq.top();
+      if (score < bottom.score || (score == bottom.score
+          && key >= groups->keys[(size_t)bottom.slot])) return;
+      size_t slot = groups->retain(key, bottom.slot);
+      pq.top() = {score, doc, slot};
+      pq.updateTop();
+    }
+    if (pq.size() == (size_t)topCount) minCompetitiveVal = pq.top().score;
   }
 
   // The heap floor stays inclusive because an equal-scoring doc with a
@@ -124,6 +190,9 @@ class TopDocsCollector {
     if (topCount == 0 || pq.size() < topCount) {
       return std::numeric_limits<float>::lowest();
     }
+    // A later segdoc can carry a smaller group key at this score. The
+    // document stream's one-ULP shortcut is therefore unsound for groups.
+    if constexpr (Collapsed) { unused(segment, docid); return minCompetitiveVal; }
     const ScoreDoc& floor = pq.top();
     if (segdoc(segment, docid) > floor.doc) {
       return std::nextafter(floor.score, std::numeric_limits<float>::infinity());
@@ -140,20 +209,30 @@ class TopDocsCollector {
   }
 
   // merge other into this.
-  void merge(TopDocsCollector& other) {
+  void merge(ScoreCollector& other) {
     // Self-merge would iterate a span that collect() can reallocate out from under us.
     assert(this != &other);
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
-    auto newHitCount = hitCount + other.hitCount;
-    std::span<ScoreDoc> otherDocs = other.pq.span();
-    // Since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
-    // Future possible optimization: if we do a whole level of a min-tree without any insertions, we could stop early.
-    for (int64_t i = (int64_t)otherDocs.size() - 1; i >= 0; i--) {
-      collect(otherDocs[i].doc.segment(), otherDocs[i].doc.docId(), otherDocs[i].score);
+    if constexpr (Collapsed) {
+      hitCount += other.hitCount;
+      groups->mergeCounts(*other.groups);
+      // Local top-L groups suffice globally: an omitted group has L local
+      // groups ahead of its best local witness, hence L global groups ahead.
+      for (const auto& member : other.pq.span()) {
+        offer(other.groups->keys[(size_t)member.slot], member.doc, member.score);
+      }
+    } else {
+      auto newHitCount = hitCount + other.hitCount;
+      std::span<ScoreDoc> otherDocs = other.pq.span();
+      // Since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
+      // Future possible optimization: if we do a whole level of a min-tree without any insertions, we could stop early.
+      for (int64_t i = (int64_t)otherDocs.size() - 1; i >= 0; i--) {
+        collect(otherDocs[i].doc.segment(), otherDocs[i].doc.docId(), otherDocs[i].score);
+      }
+      hitCount = newHitCount;
     }
-    hitCount = newHitCount;
   }
 
   // Since we use min-heap comparators in our priority queues, the list will be reverse-sorted (smallest last)
@@ -162,7 +241,7 @@ class TopDocsCollector {
     // sort_heap must use the same comparator the heap was built with (scoreAndDocComp),
     // which also gives the stable response order: score desc, then (seg, docid) asc at ties.
     std::span<ScoreDoc> docs = pq.span();
-    std::sort_heap(docs.begin(), docs.end(), scoreAndDocComp);
+    std::sort_heap(docs.begin(), docs.end(), comparator(this));
     return docs;
   }
 
@@ -171,6 +250,9 @@ class TopDocsCollector {
   }
 };
 
+
+using TopDocsCollector = ScoreCollector<false>;
+using GroupScoreCollector = ScoreCollector<true>;
 
 // A different way to get top-k results: Collect results in an array until we have 2k of them.
 // The find the median (kth value), and drop all values less than the median. Repeat collection more results.
@@ -676,7 +758,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
 }
 
 inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
-                                     DocSet* filter, TopDocsCollector& collector,
+                                     DocSet* filter, auto& collector,
                                      int64_t topCount) {
   assert(scorer != nullptr);
   assert(topCount > 0);
@@ -718,7 +800,7 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
 
 inline void collectConstantTopKAndDomain(
     int32_t segnum, Query::Scorer* scorer, DocSet* filter,
-    DocSetBuilder& builder, TopDocsCollector& collector) {
+    DocSetBuilder& builder, auto& collector) {
   assert(scorer != nullptr);
   assert(collector.topCount > 0);
   skipCount(SkipStats::constantPullDomainCollections);
@@ -781,7 +863,7 @@ inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
 
 inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
                                  DocSetBuilder* builder,
-                                 TopDocsCollector& collector, int32_t maxDoc) {
+                                 auto& collector, int32_t maxDoc) {
   assert(bulk != nullptr);
   assert(collector.topCount == 0);
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
@@ -801,7 +883,7 @@ enum class ConstantScoreDrain : uint8_t {
 // scores match what a pull scorer from the same weight returns.
 inline void collectFirstKConstantWindowed(
     int32_t segnum, BulkScorer* bulk, DocSet* filter, DocSetBuilder* builder,
-    TopDocsCollector& collector, int32_t maxDoc,
+    auto& collector, int32_t maxDoc,
     ConstantScoreDrain drain) {
   assert(bulk != nullptr);
   assert(collector.topCount > 0);

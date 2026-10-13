@@ -63,6 +63,7 @@ namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
+struct Collapse; struct GroupComponent; struct GroupKey;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
@@ -96,6 +97,8 @@ enum class Kind {
 };
 }
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
+namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
+namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace CalendarGap_ {
@@ -524,6 +527,10 @@ struct Filter {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const std::string_view> except_ops;
 };
+struct Collapse {
+  std::span<const std::string_view> field;
+  Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
+};
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Filter> filter;
@@ -533,6 +540,7 @@ struct TopDocs {                                                 // all indirect
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   int32_t batch_size = 0;
+  ::hpp_proto::optional_indirect_view<Collapse> collapse;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
@@ -597,8 +605,18 @@ struct SearchRequest {
   bool json_shorthand = false;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
+struct GroupComponent {
+  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t> value;
+  GroupComponent_::Type type = GroupComponent_::Type::STRING;
+};
+struct GroupKey {
+  std::span<const GroupComponent> component;
+  std::optional<uint64_t> singleton;
+};
 struct DocList {                                                // needs Column (map by value)
   std::optional<std::int64_t> found;
+  std::optional<std::int64_t> found_docs;
+  std::span<const GroupKey> groups;
   map_view<std::string_view, Column> columns;
   // Per-document field maps: docs[i] holds document i's fields not in
   // columns (row_count entries when present).  See the .proto contract.
@@ -756,6 +774,7 @@ struct UpdateRequest {                                         // needs CommitPa
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
+LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
@@ -798,6 +817,7 @@ LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) 
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
 LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
+LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent) LUXIR_ENTRY(GroupKey)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)

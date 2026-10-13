@@ -731,6 +731,9 @@ inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnFiel
 // destroyed with the bucket.  The final batch is assembled into req.lastResponse
 // but NOT sent here - the completion protocol on SearchRequest (streamEnded /
 // bodyDone) decides who sends it.  All but the final response have more=true.
+using DocBatchMetadata = std::function<void(luxir::api::DocList&, int64_t, int64_t,
+                                           std::pmr::memory_resource&)>;
+
 class DocEmitter {
 public:
   virtual void produce() = 0;
@@ -746,6 +749,7 @@ public:
   GetScore getScore;
   int64_t numCollected;
   int64_t totalHits;
+  DocBatchMetadata metadata;
   std::span<ReturnField> fields;  // resolved selectors, each carrying its placement
   int32_t maxBatchSize;
   int64_t offset;
@@ -767,10 +771,10 @@ public:
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool getNumber, bool getScores,
-                 bool scoresInRows, bool parallel, size_t colCap, size_t rowCap)
+                 bool scoresInRows, bool parallel, size_t colCap, size_t rowCap, DocBatchMetadata metadata)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
+        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
         getScores(getScores), scoresInRows(scoresInRows),
         parallel(parallel), colCap(colCap), rowCap(rowCap),
         batchStart(std::min(offset, numCollected)) {}
@@ -858,6 +862,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       resolveReturnFieldMetadata(*req.reader, fields);
       fieldMetadataResolved = true;
     }
+    if (metadata) metadata(docListProto, batchStart, batchEnd, mr);
 
     // An isolated context: cancellation of the request group, or of whatever
     // context a resumed emitter runs in, must not skip loaders and leave a
@@ -1258,7 +1263,8 @@ void emitDocsResponse(SearchRequest& req,
                       bool getNumber,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
-                      DocEmission emission)
+                      DocEmission emission,
+                      DocBatchMetadata metadata = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1311,7 +1317,7 @@ void emitDocsResponse(SearchRequest& req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, getNumber, getScores, scoresInRows,
-      /*parallel=*/req.tg != nullptr, colCap, rowCap);
+      /*parallel=*/req.tg != nullptr, colCap, rowCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();
 }

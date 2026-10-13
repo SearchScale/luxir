@@ -4200,4 +4200,50 @@ TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
   EXPECT_FALSE(eof["commits"]["kept"].contains("error"));
 }
 
+TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z", "key_s", "z"),
+      flatdoc("id", "b", "key_s", "a"), flatdoc("id", "c", "key_s", "a"),
+      flatdoc("id", "missing")}, UpdateMessage::COMMIT).success);
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&collapse=key_s", R"({"collapse":{"field":"id","missing":"drop"}})");
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 canonical;
+  ASSERT_FALSE(glz::read_json(canonical, echo.body()));
+  auto& collapse = canonical["ops"]["q"]["top_docs"]["collapse"];
+  EXPECT_EQ("key_s", collapse["field"].get_array()[0].get_string());
+  EXPECT_FALSE(collapse.contains("missing")); // default expand
+  for (std::string format : {"rows", "columns"}) {
+    auto response = httpRequest(port(), http::verb::post,
+        "/collections/main/_search?collapse=key_s",
+        R"({"fields":["id"],"get_number":true,"batch_size":2,"document_format":")" + format + "\"}");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    std::vector<std::string> ids;
+    for (const auto& line : splitLines(response.body())) {
+      glz::generic_i64 body;
+      ASSERT_FALSE(glz::read_json(body, line));
+      EXPECT_EQ(3, body["found"].get<int64_t>());
+      EXPECT_EQ(4, body["found_docs"].get<int64_t>());
+      for (const auto& row : body["docs"].get_array()) {
+        ids.push_back(row["id"].get_string());
+        EXPECT_TRUE(row.contains("_group_"));
+      }
+    }
+    EXPECT_EQ((std::vector<std::string>{"b", "z", "missing"}), ids);
+  }
+  auto response = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs&collapse=key_s",
+      R"({"fields":["id"],"get_number":true,"batch_size":1})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  auto lines = splitLines(response.body());
+  ASSERT_EQ(4, lines.size());
+  glz::generic_i64 header;
+  ASSERT_FALSE(glz::read_json(header, lines[0]));
+  EXPECT_EQ(3, header["_header_"]["found"].get<int64_t>());
+  EXPECT_EQ(4, header["_header_"]["found_docs"].get<int64_t>());
+  glz::generic_i64 singleton;
+  ASSERT_FALSE(glz::read_json(singleton, lines.back()));
+  EXPECT_TRUE(singleton["_group_"]["val"].is_null());
+  EXPECT_TRUE(singleton["_group_"]["singleton"].get<bool>());
+}
+
 } // namespace luxir::test

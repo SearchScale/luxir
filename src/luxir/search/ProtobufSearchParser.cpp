@@ -412,6 +412,10 @@ public:
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
+        if (topDocs.collapse && (placement == OpsPlacement::FACET_BUCKET
+                                 || placement == OpsPlacement::FUSION)) {
+          throw RequestError("collapse is not supported under a facet bucket or Fusion.ops");
+        }
         auto placement = depth == 1 ? TopDocsPlacement::ROOT_OP
                                     : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, placement);
@@ -1369,6 +1373,49 @@ public:
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
       : req.requestPool.make<AllQuery>();
+    CollapsePlan* collapse = nullptr;
+    if (topDocsReq.collapse) {
+      if (placement == TopDocsPlacement::FUSION_SOURCE) {
+        throw RequestError("collapse is not supported on a fusion source");
+      }
+      if (!topDocsReq.ops.empty()) {
+        throw RequestError("ops under collapse require group counting support");
+      }
+      const auto& spec = *topDocsReq.collapse;
+      using Missing = luxir::api::Collapse_::MissingPolicy;
+      if (spec.missing != Missing::EXPAND && spec.missing != Missing::GROUP
+          && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
+      if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
+      collapse = luxir::arenaCreate<CollapsePlan>(
+          req.arena, *req.reader, spec.missing, topDocsReq.get_number);
+      std::unordered_set<std::string> resolved;
+      for (std::string_view name : spec.field) {
+        auto field = req.schema->resolveFor(name, OpClass::VALUE);
+        auto& type = *field.fieldType;
+        if (type.multiValued() || !type.hasColumn()) {
+          throw RequestError("collapse key must be single-valued with a column: " + std::string(name));
+        }
+        if (!resolved.insert(field.physicalName).second) {
+          throw RequestError("duplicate resolved collapse field: " + std::string(name));
+        }
+        using Type = luxir::api::GroupComponent_::Type;
+        Type wireType;
+        switch (type.type()) {
+          case FieldType::STRING: wireType = Type::STRING; break;
+          case FieldType::ID: wireType = Type::ID; break;
+          case FieldType::INT: wireType = Type::INT; break; // Luxir integers are signed int64.
+          case FieldType::DATE: wireType = Type::DATE; break;
+          default: throw RequestError("unsupported collapse key type: " + std::string(name));
+        }
+        bool ordinal = type.type() == FieldType::STRING || type.type() == FieldType::ID;
+        if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
+          throw RequestError("string collapse key must be indexed: " + std::string(name));
+        }
+        collapse->fields.push_back({field.physicalName, wireType,
+            ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
+            req.reader->field(field.physicalName)});
+      }
+    }
     Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
     if (offset < 0) {
@@ -1456,6 +1503,12 @@ public:
     }
 
     auto parsedSorts = parseSorts(topDocsReq.sort);
+    if (collapse != nullptr && parsedSorts.useFieldSort) {
+      // Field-sort collapse needs group admission and inclusive key bounds.
+      // Until proved, this excludes every document-only field arm, including
+      // exact-domain leaf termination, gathered admission and seeding.
+      throw RequestError("field-sort collapse is not supported yet");
+    }
     auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
       req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
       &req.warnings,
@@ -1516,11 +1569,13 @@ public:
       requestFlags |= Query::ALLOW_PRUNING;
     }
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
-    bool exactCountTopK = requirements.needRankedDocs
+    // Document cardinality is not a distinct-group count; collapse totals
+    // read every eligible key through the normal exhaustive driver.
+    bool exactCountTopK = collapse == nullptr && requirements.needRankedDocs
         && requirements.needExactCount && !requirements.needExactDomain
         && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
-    bool pureCountShape = !QueryPrep::disableWholeMembershipPlanForTests
+    bool pureCountShape = collapse == nullptr && !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
         && (foldFilters || filters.empty());
@@ -1866,6 +1921,7 @@ public:
       domainQuery, domainQueryWeight,
       domainFilterWeights, residentExactDomainUses);
 
+    qr->collapse = collapse;
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }

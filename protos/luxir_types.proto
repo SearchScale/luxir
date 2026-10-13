@@ -93,6 +93,17 @@ enum DocFormat {
   COLUMNS = 2;
 }
 
+// Partition matching documents by an exact, single-valued key.
+message Collapse {
+  repeated string field = 1; // One field, or an exact tuple. Uses value binding.
+  enum MissingPolicy {
+    EXPAND = 0; // Each document missing any component is a tagged singleton.
+    GROUP = 1;  // Preserve present tuple components and tag missing ones as null.
+    DROP = 2;   // Exclude documents missing any component.
+  }
+  MissingPolicy missing = 2;
+}
+
 message TopDocs {
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
@@ -123,6 +134,8 @@ message TopDocs {
   // batches. Ignored beneath a facet bucket, where all rows return together.
   int32 batch_size = 9;
   DocFormat document_format = 10;  // rows vs columns placement of returned fields (see DocFormat)
+
+  Collapse collapse = 11; // limit, offset and found count groups; found_docs counts eligible documents.
 
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
 }
@@ -722,6 +735,22 @@ message SearchResponse {
 }
 
 
+// Typed collapse identity. Component types follow the resolved schema fields.
+message GroupComponent {
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; } // INT carries signed int64 values.
+  Type type = 1;
+  oneof value {
+    google.protobuf.NullValue null = 2;
+    string s = 3;
+    sint64 i = 4;
+  }
+}
+message GroupKey {
+  repeated GroupComponent component = 1;
+  // Present for missing=expand: reader-local document identity, not a key value.
+  optional uint64 singleton = 2;
+}
+
 // A batch of returned documents.  Document i is the merge of columns row i
 // and docs[i]; all-columns (docs absent) and all-docs (columns empty) are
 // just the degenerate cases.  Which fields land where is a function of the
@@ -730,6 +759,8 @@ message DocList {
   // Exact match count when get_number was requested. For Fusion, counts
   // distinct documents in the union of source ranked lists, before paging.
   optional sint64 found = 1;
+  optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
+  repeated GroupKey groups = 7; // Collapse only: exactly row_count identities aligned with head rows.
 
   // Dense columns; each has exactly row_count slots.
   map<string, Column> columns = 3;

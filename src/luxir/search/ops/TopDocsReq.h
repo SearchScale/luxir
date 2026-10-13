@@ -557,6 +557,7 @@ public:
     return admitted;
   }
 
+  CollapsePlan* collapse = nullptr;
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::PlanningContext& planning;
   Query::Context* weightContext;
@@ -636,7 +637,7 @@ public:
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         auto* collector = new MergeableCollector(
             op.topCount, op.sortPlan, op.req.reader.get(),
-            op.requestNeedsScores);
+            op.requestNeedsScores, op.collapse);
         if (collector->useFieldSort) {
           collector->fieldCollector->primaryValues = op.sortValues;
         }
@@ -794,7 +795,7 @@ public:
     }
 
     ConstantScoreDisposition constantScoreDisposition(
-        const TopDocsCollector& collector,
+        const auto& collector,
         DocSetBuilder* builder) noexcept {
       const auto& op = thisOp();
       if (collector.topCount <= 0 || op.weight == nullptr
@@ -863,7 +864,7 @@ public:
     void collectKnownCountTopK(
         MemPool& pool, int32_t segnum, int64_t count,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
-        TopDocsCollector& collector,
+        auto& collector,
         int32_t maxDoc, bool allowPruning,
         BulkScorer* exactScorer = nullptr) {
       int64_t before = collector.totalHits();
@@ -903,7 +904,7 @@ public:
     void countThenCollectTopK(
         MemPool& pool, int32_t segnum, BulkScorer* countBulk,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
-        DocSetBuilder* builder, TopDocsCollector& collector,
+        DocSetBuilder* builder, auto& collector,
         int32_t maxDoc, bool allowPruning,
         BulkScorer* exactScorer = nullptr) {
       int64_t count = countMatchesWindowed(
@@ -917,7 +918,7 @@ public:
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& scoringSupplier,
         Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
-        TopDocsCollector& collector, int32_t maxDoc) {
+        auto& collector, int32_t maxDoc) {
       Query::ScorerSupplier::BulkScorerContext bulkContext;
       auto scoringPlan = scoringSupplier.planBulk(
           Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
@@ -969,7 +970,7 @@ public:
     bool countThenCollectConstantTopK(
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
-        TopDocsCollector& collector, int32_t maxDoc) {
+        auto& collector, int32_t maxDoc) {
       auto constant = QueryPrep::supplierCount(&countSupplier);
       int64_t count = collectorFilter == nullptr ? constant.value_or(-1) : -1;
 
@@ -1743,7 +1744,16 @@ public:
       op.releaseSegmentState(segment);
     }
 
-    void doCollect(
+    void doCollect(oneapi::tbb::task_group* tg, int32_t segnum,
+                   DomainHandle domainHandle) {
+      if (thisOp().collapse != nullptr) doCollectPolicy<true>(tg, segnum, std::move(domainHandle));
+      else doCollectPolicy<false>(tg, segnum, std::move(domainHandle));
+    }
+
+    // One collection ladder, specialized once per segment. Document requests
+    // instantiate their original admission loop without per-hit group checks.
+    template <bool Collapsed>
+    void doCollectPolicy(
         oneapi::tbb::task_group* tg, int32_t segnum,
         DomainHandle domainHandle) {
       auto& op = thisOp();
@@ -1757,7 +1767,9 @@ public:
       // scorer, so the whole collection ladder below is skipped.  (Scores must
       // be constant for doc order to be the ranking; a rescore over a
       // match-all matches everything but reorders it.)
-      bool matchEverything = op.weight != nullptr && op.weight->matchesAllDocs()
+      // Constant-score first-K and cardinality shortcuts rank documents.
+      // Groups require reading keys, including equal-score groups after K.
+      bool matchEverything = !Collapsed && op.weight != nullptr && op.weight->matchesAllDocs()
         && op.weight->isConstantScoring() && op.filterWeights.empty();
       std::unique_ptr<MergeableCollector> data;
       std::optional<RoutedProduction> routedProduction;
@@ -1779,6 +1791,8 @@ public:
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         // Keep ownership until release so a scoring error cannot orphan it.
         data.reset(collectorMerger.obtain());
+        auto* scoreCollector = data->template scores<Collapsed>();
+        if constexpr (Collapsed) scoreCollector->setSegment(segnum);
 
         // Field-sorted ranking is the one thing a match-all still has to
         // iterate for: it orders by column values the domain says nothing
@@ -1838,7 +1852,7 @@ public:
         // A root, non-prepared filter-only Boolean can expose its one cached
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
-        if (!exactDomain && !wholeMembershipAvailable
+        if (!Collapsed && !exactDomain && !wholeMembershipAvailable
             && op.weight != nullptr && !requiresWholeIndexPrepare
             && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
@@ -1859,7 +1873,7 @@ public:
             && routedProduction->inheritReady;
         bool routedDefaultIdentity = routedDomainsReady
             && (op.weight->isConstantScoring() || data->topCount() == 0);
-        bool identityResult =
+        bool identityResult = !Collapsed &&
             ((wholeMembershipAvailable && !wholeTopKCountAvailable
                                        && !wholeFieldSortAvailable)
              || exactDomain || matchEverything
@@ -1875,9 +1889,11 @@ public:
           builder.emplace(seg.maxDoc());
         }
 
-        if (wholeTopKCountAvailable) {
+        // Known document counts cannot supply distinct-group totals or
+        // missing=drop eligibility. Those plans are disabled at parse time.
+        if (!Collapsed && wholeTopKCountAvailable) {
           assert(rankFromDocOrder);
-          assert(data->scoreCollector->topCount > 0);
+          assert(scoreCollector->topCount > 0);
           if (op.wholeConstantRanking) {
             int64_t ranked = 0;
             if (wholeMembershipResult.count > 0) {
@@ -1893,13 +1909,13 @@ public:
                 if (rankingSupplier != nullptr) {
                   scorer = buildBoundedConstantScorer(
                       poolGuard.pool(), *rankingSupplier, collectorFilter,
-                      data->scoreCollector->topCount);
+                      scoreCollector->topCount);
                 }
               }
               if (scorer != nullptr) {
                 ranked = collectFirstKConstant(
                     segnum, scorer, collectorFilter,
-                    *data->scoreCollector, data->scoreCollector->topCount);
+                    *scoreCollector, scoreCollector->topCount);
               }
             }
             assert(wholeMembershipResult.count >= ranked);
@@ -1916,7 +1932,7 @@ public:
                 poolGuard.pool(), seg);
             collectKnownCountTopK(
                 poolGuard.pool(), segnum, wholeMembershipResult.count,
-                rankingSupplier, domain, *data->scoreCollector,
+                rankingSupplier, domain, *scoreCollector,
                 seg.maxDoc(), op.wholeRankingWeight->allowsPruning());
           }
         } else if (identityResult) {
@@ -1955,7 +1971,7 @@ public:
             if (scorer != nullptr) {
               ranked = collectFirstKConstant(
                   segnum, scorer, collectorFilter,
-                  *data->scoreCollector, data->topCount());
+                  *scoreCollector, data->topCount());
             }
           }
           assert(total >= ranked);
@@ -1996,27 +2012,27 @@ public:
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
               : filter;
-          // A constant-count plan satisfies this segment without constructing
-          // an executor.
+          // A constant-count plan satisfies document totals without an
+          // executor. Collapse must enumerate identities instead.
           bool counted = false;
-          if (!requiresWholeIndexPrepare && builderPtr == nullptr && filter == nullptr
-              && !data->useFieldSort && data->scoreCollector->topCount == 0) {
+          if (!Collapsed && !requiresWholeIndexPrepare && builderPtr == nullptr && filter == nullptr
+              && !data->useFieldSort && scoreCollector->topCount == 0) {
             if (auto count = QueryPrep::supplierCount(supplier)) {
-              data->scoreCollector->hitCount += *count;
+              scoreCollector->hitCount += *count;
               counted = true;
             }
           }
           if (counted) {
             // fall through to the sub-calc/merge tail below
-          } else if (routedDomainsReady && !data->useFieldSort
+          } else if (!Collapsed && routedDomainsReady && !data->useFieldSort
                      && op.requirements.needExactCount
-                     && data->scoreCollector->topCount > 0) {
+                     && scoreCollector->topCount > 0) {
             int64_t count = routedProduction->domains[0].get() == nullptr
                 ? seg.maxDoc()
                 : routedProduction->domains[0].get()->card();
             collectKnownCountTopK(
                 poolGuard.pool(), segnum, count, supplier, collectorFilter,
-                *data->scoreCollector, seg.maxDoc(),
+                *scoreCollector, seg.maxDoc(),
                 op.weight->allowsPruning());
           } else if (data->useFieldSort) {
             // Ranking permission and completeness production are separate
@@ -2304,19 +2320,20 @@ public:
             // or supplied by an exhaustive count/domain pass or an already-known
             // domain. Without pruning, windowed scoring still beats the
             // doc-at-a-time heap disjunction by using per-clause window drives.
-            bool allowPruning = op.weight->allowsPruning();
+            bool allowPruning = op.weight->allowsPruning()
+                && (!Collapsed || !op.requirements.needExactCount);
             BulkScorer* bulk = nullptr;
             bool composedExactCountTopK = false;
             ConstantScoreDisposition constantRoute =
-                constantScoreDisposition(
-                    *data->scoreCollector, builderPtr);
+                Collapsed ? ConstantScoreDisposition::NOT_CONSTANT_TOP_K
+                    : constantScoreDisposition(*scoreCollector, builderPtr);
             ExactCountTopKRoute exactCountTopKRoute =
                 constantRoute
                         == ConstantScoreDisposition::NOT_CONSTANT_TOP_K
                     ? ExactCountTopKRoute::EXACT_CANDIDATE_SCORING
                     : ExactCountTopKRoute::CONSTANT_FIRST_K;
-            if (builderPtr == nullptr
-                && data->scoreCollector->topCount > 0
+            if (!Collapsed && builderPtr == nullptr
+                && scoreCollector->topCount > 0
                 && op.countWeight != nullptr && op.rankingWeight != nullptr) {
               auto* countSupplier = op.countWeight->scorerSupplier(
                   poolGuard.pool(), seg);
@@ -2329,12 +2346,12 @@ public:
                         composeVariableScoreExactCountTopK(
                             poolGuard.pool(), segnum, *supplier,
                             *countSupplier, collectorFilter,
-                            *data->scoreCollector, seg.maxDoc());
+                            *scoreCollector, seg.maxDoc());
                     break;
                   case ExactCountTopKRoute::CONSTANT_FIRST_K:
                     composedExactCountTopK = countThenCollectConstantTopK(
                         poolGuard.pool(), segnum, *countSupplier,
-                        collectorFilter, *data->scoreCollector,
+                        collectorFilter, *scoreCollector,
                         seg.maxDoc());
                     break;
                 }
@@ -2348,18 +2365,21 @@ public:
               }
             }
             bool useSparseConstantPull =
-                builderPtr != nullptr && !captureSharedRaw
-                && data->scoreCollector->topCount > 0
+                !Collapsed && builderPtr != nullptr && !captureSharedRaw
+                && scoreCollector->topCount > 0
                 && op.weight->isConstantScoring()
                 && op.weight->prefersPullForSparseArrayDomain()
                 && supplier->cost() <= DocSetBuilder::arrayLimitFor(seg.maxDoc());
             auto buildDeclaredBulk = [&]() -> BulkScorer* {
-              if (captureSharedRaw) return nullptr;
-              Query::ScorerSupplier::BulkUse use =
+              // Count-only bulk windows omit document identities. Group
+              // totals must visit every key, even at limit zero.
+              if (captureSharedRaw || (Collapsed && scoreCollector->topCount == 0)) return nullptr;
+              Query::ScorerSupplier::BulkUse use = Collapsed
+                  ? Query::ScorerSupplier::BulkUse::SCORED_WINDOWS :
                   constantRoute
                           == ConstantScoreDisposition::LIMIT_ONLY
                       ? Query::ScorerSupplier::BulkUse::SCORED_WINDOWS
-                      : data->scoreCollector->topCount == 0
+                      : scoreCollector->topCount == 0
                               || op.weight->isConstantScoring()
                               || builderPtr != nullptr
                           ? Query::ScorerSupplier::BulkUse::COUNT_WINDOWS
@@ -2381,15 +2401,15 @@ public:
               if (scorer != nullptr) {
                 collectConstantTopKAndDomain(
                     segnum, scorer, collectorFilter, *builder,
-                    *data->scoreCollector);
+                    *scoreCollector);
               }
             } else if ((bulk = buildDeclaredBulk()) != nullptr) {
-              if (data->scoreCollector->topCount == 0) {
+              if (scoreCollector->topCount == 0) {
                 // limit 0: the collector keeps nothing but the total, so count
                 // windows without materializing docs or scores.
-                collectCountWindowed(bulk, collectorFilter, builderPtr, *data->scoreCollector,
+                collectCountWindowed(bulk, collectorFilter, builderPtr, *scoreCollector,
                                      seg.maxDoc());
-              } else if (op.weight->isConstantScoring()
+              } else if (!Collapsed && op.weight->isConstantScoring()
                          && !disableConstantWindowCaptureForTests) {
                 // Equal scores reduce ranking to doc order: the segment's top
                 // K docs are the first K matches, captured straight off this
@@ -2399,12 +2419,12 @@ public:
                 // scan per build).
                 collectFirstKConstantWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
-                    *data->scoreCollector, seg.maxDoc(),
+                    *scoreCollector, seg.maxDoc(),
                     constantRoute
                             == ConstantScoreDisposition::LIMIT_ONLY
                         ? ConstantScoreDrain::LIMIT_ONLY
                         : ConstantScoreDrain::COMPLETE);
-              } else if (op.weight->isConstantScoring()) {
+              } else if (!Collapsed && op.weight->isConstantScoring()) {
                 // In the test-forced arrangement, the bulk scorer drives the
                 // exhaustive count/domain and an independent scorer visits only
                 // this segment's first K matches.
@@ -2416,22 +2436,22 @@ public:
                   if (captureScorer != nullptr) {
                     captured = collectFirstKConstant(
                         segnum, captureScorer, collectorFilter,
-                        *data->scoreCollector, data->scoreCollector->topCount);
+                        *scoreCollector, scoreCollector->topCount);
                   }
                 }
                 int64_t count = countMatchesWindowed(
                     bulk, collectorFilter, builderPtr, seg.maxDoc());
                 assert(count >= captured);
-                data->scoreCollector->hitCount += count - captured;
+                scoreCollector->hitCount += count - captured;
               } else if (builderPtr != nullptr) {
                 auto* rankingSupplier = mainScorerSupplier(poolGuard.pool(), seg);
                 countThenCollectTopK(
                     poolGuard.pool(), segnum, bulk, rankingSupplier,
-                    collectorFilter, builderPtr, *data->scoreCollector,
+                    collectorFilter, builderPtr, *scoreCollector,
                     seg.maxDoc(), allowPruning);
               } else {
                 collectTopKWindowed(
-                    segnum, bulk, collectorFilter, *data->scoreCollector,
+                    segnum, bulk, collectorFilter, *scoreCollector,
                     allowPruning ? &scoreAccumulator : nullptr,
                     seg.maxDoc(), allowPruning);
               }
@@ -2440,19 +2460,19 @@ public:
                       == ConstantScoreDisposition::LIMIT_ONLY
                   ? buildBoundedConstantScorer(
                         poolGuard.pool(), *supplier, collectorFilter,
-                        data->scoreCollector->topCount)
+                        scoreCollector->topCount)
                   : buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
                 if (constantRoute
                     == ConstantScoreDisposition::LIMIT_ONLY) {
                   collectFirstKConstant(
                       segnum, scorer, collectorFilter,
-                      *data->scoreCollector,
-                      data->scoreCollector->topCount);
+                      *scoreCollector,
+                      scoreCollector->topCount);
                 } else {
                   collectTopK(
                       segnum, scorer, collectorFilter, builderPtr,
-                      *data->scoreCollector, allowPruning,
+                      *scoreCollector, allowPruning,
                       &scoreAccumulator,
                       captureSharedRaw
                           ? DomainBuildMode::RAW_QUERY_MATCHES
@@ -2676,7 +2696,10 @@ public:
       docListProto.offset = qr.topDocsProto.offset;
       // found is opt-in (see emitDocsResponse): only populate it when the
       // count was requested, so an empty index matches the non-empty contract.
-      if (qr.topDocsProto.get_number) docListProto.found = 0;
+      if (qr.topDocsProto.get_number) {
+        docListProto.found = 0;
+        if (qr.collapse != nullptr) docListProto.found_docs = 0;
+      }
       return;
     }
 
@@ -2703,6 +2726,27 @@ public:
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
         emission);
+    } else if (qr.collapse != nullptr) {
+      auto& collector = *mergeableCollector->groupScoreCollector;
+      auto scoreDocs = collector.sort();
+      auto metadata = [&collector, scoreDocs](luxir::api::DocList& list,
+          int64_t begin, int64_t end, std::pmr::memory_resource& mr) {
+        if (collector.groups->plan.getNumber) list.found_docs = collector.totalHits();
+        auto* keys = build::allocArray(list.groups, (size_t)(end - begin), mr);
+        MemPool pool;
+        for (int64_t i = begin; i < end; i++) {
+          collector.groups->plan.emit(keys[i - begin],
+              collector.groups->keys[(size_t)scoreDocs[(size_t)i].slot], mr, pool);
+        }
+      };
+      emitDocsResponse(qr.req, getDocList,
+        (int64_t)scoreDocs.size(),
+        [scoreDocs](int64_t i) { return scoreDocs[(size_t)i].doc; },
+        [scoreDocs](int64_t i) { return scoreDocs[(size_t)i].score; },
+        collector.groups->totalGroups(), qr.topDocsProto.fields,
+        qr.topDocsProto.batch_size, qr.topDocsProto.offset,
+        qr.topDocsProto.get_number, qr.topDocsProto.get_scores,
+        qr.topDocsProto.document_format, emission, std::move(metadata));
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();

@@ -22,13 +22,16 @@ namespace luxir {
 class MergeableCollector : public MergeableData {
 public:
   std::unique_ptr<TopDocsCollector> scoreCollector;
+  std::unique_ptr<GroupScoreCollector> groupScoreCollector;
   std::unique_ptr<FieldSortCollector> fieldCollector;
   bool useFieldSort;
 
   MergeableCollector(size_t topCount, const SortPlan& sortPlan,
-                     IndexReader* reader, bool needsScores)
+                     IndexReader* reader, bool needsScores, const CollapsePlan* collapse = nullptr)
     : useFieldSort(sortPlan.useFieldSort) {
-    if (!useFieldSort) {
+    if (collapse != nullptr) {
+      groupScoreCollector = std::make_unique<GroupScoreCollector>(topCount, collapse);
+    } else if (!useFieldSort) {
       scoreCollector = std::make_unique<TopDocsCollector>(topCount);
     } else {
       fieldCollector = std::make_unique<FieldSortCollector>(
@@ -36,15 +39,24 @@ public:
     }
   }
 
+  template <bool Collapsed>
+  auto* scores() {
+    if constexpr (Collapsed) return groupScoreCollector.get();
+    else return scoreCollector.get();
+  }
+
   /// Number of docs the active arm keeps; 0 for a count-only collection.
   int64_t topCount() const {
+    if (groupScoreCollector) return groupScoreCollector->topCount;
     return useFieldSort ? fieldCollector->topCount : scoreCollector->topCount;
   }
 
   /// Add matches the active arm did not see individually, for callers that
   /// derive part of the count instead of collecting it doc by doc.
   void addHits(int64_t hits) {
-    if (useFieldSort) {
+    if (groupScoreCollector) {
+      groupScoreCollector->hitCount += hits;
+    } else if (useFieldSort) {
       fieldCollector->hitCount += hits;
     } else {
       scoreCollector->hitCount += hits;
@@ -54,7 +66,10 @@ public:
   static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
     // merge the smaller collector into the larger collector, or if both the same size, merge
     // the less competitive collector into the more competitive collector.
-    if (a->useFieldSort) {
+    if (a->groupScoreCollector) {
+      if (a->groupScoreCollector->size() < b->groupScoreCollector->size()) std::swap(a, b);
+      a->groupScoreCollector->merge(*b->groupScoreCollector);
+    } else if (a->useFieldSort) {
       if (a->fieldCollector->size() < b->fieldCollector->size()) {
         std::swap(a, b);
       }

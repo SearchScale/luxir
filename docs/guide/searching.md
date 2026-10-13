@@ -152,6 +152,59 @@ POST /collections/books/_search
 }
 ```
 
+## Collapsing results
+
+`collapse` returns one head document per distinct key. In this initial
+implementation the list is ordered by score: each group's head is its best
+matching member, with document ties broken by the reader's document order.
+Groups with equal scores compare by key (null before a value, tuples
+lexicographically, ordinary keys before singleton groups). For example:
+
+```json
+{
+  "query": "title_t:jacket",
+  "collapse": "product_id_s",
+  "limit": 10,
+  "get_number": true,
+  "fields": ["id", "title_t"]
+}
+```
+
+`limit` and `offset` count groups. `get_number` returns exact `found` (groups)
+and `found_docs` (eligible matching documents before paging). `limit: 0`
+returns totals only; `limit: -1` returns all groups and retains O(groups)
+ranking state. Counts require reading every eligible key; without counts,
+competitive-score pruning remains enabled.
+
+A key uses value binding and must be a single-valued STRING or ID with an
+index and column, an INT (signed 64-bit), or a DATE with a column. Tuples
+preserve each component's exact identity:
+
+```json
+"collapse": {"field": ["shop_s", "product_i"], "missing": "group"}
+```
+
+`missing` defaults to `expand`: any missing component makes the document its
+own singleton group. `group` retains present tuple components and tags missing
+components as null, so `["shop-A", null]` and `["shop-B", null]` differ. `drop`
+excludes documents missing any component, including from `found_docs`.
+
+Every JSON head row has `_group_`: `{"val":"P17"}` for one field,
+`{"val":["shop-A",null]}` for a tuple, or
+`{"val":null,"singleton":true}` for an expand singleton. Keys use indexed
+string values and integer/date values (dates are epoch milliseconds).
+The protobuf `DocList.groups` table carries typed identities aligned with
+its head rows, independently of rows/columns projection. Streaming batches
+keep that alignment. `format=docs` includes `_group_` on each document and
+`found`/`found_docs` in `_header_` when requested.
+
+`collapse=<field>` is also a URL overlay targeting `q`; `explain=request`
+shows the canonical object form. FLOAT/DOUBLE, TEXT, vector, and multi-valued
+keys are rejected. Field-sort collapse, ops under a collapsed list, collapse
+on fusion sources, and collapse under fusion or facet buckets are currently
+rejected. kNN still selects `k` documents before collapse, so repeated keys
+can produce fewer than `k` groups.
+
 ## One request, several results
 
 Add `ops` beside the query when the response should include analytics as well
@@ -559,6 +612,7 @@ The recognized top-document parameters are:
 | Parameter | Value |
 |---|---|
 | `query` | Expression query string, exactly like a JSON string in the body `query` position. |
+| `collapse` | One key field, replacing the body collapse specification. |
 | `limit`, `offset` | Signed 64-bit decimal integer. |
 | `fields` | Comma-separated field names. An empty value clears the body list. |
 | `sort` | One sort clause per parameter, in the body's string form: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
