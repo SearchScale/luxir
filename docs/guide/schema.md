@@ -300,7 +300,7 @@ A text analyzer is one tokenizer followed by a list of filters:
 | `unicode_word` | Tokenizer: Unicode word segmentation (UAX#29). |
 | `whitespace` | Tokenizer: split on whitespace. The default when an analyzer lists filters but no tokenizer. |
 | `keyword` | Tokenizer: the whole value as one token. |
-| `nfkc_cf` | Filter: NFKC case folding, normalized to a fixpoint. |
+| `nfkc_cf` | Filter: Unicode NFKC_Casefold, including default-ignorable removal. |
 | `lowercase` | Filter: Unicode lowercasing only. |
 | `fold` | Filter: accent and diacritic folding. |
 | `english_possessive` | Filter: remove a trailing `'s`. |
@@ -308,7 +308,12 @@ A text analyzer is one tokenizer followed by a list of filters:
 
 Prefer `nfkc_cf` to `lowercase` on Unicode-segmented text: bare lowercasing
 leaves equal-looking strings unequal (composed versus decomposed forms, final
-sigma), while NFKC case folding makes them compare equal.
+sigma), while NFKC case folding makes them compare equal. It also removes
+invisible default-ignorable characters such as soft hyphens, ZWJ/ZWNJ, and
+variation selectors: `co<U+00AD>operate` matches `cooperate`. Tokens that become
+empty are dropped without a position gap. Normalization uses Unicode 15.1.0
+mapping tables followed by stream-safe NFC; runs exceeding 30 non-starters in
+NFKD receive U+034F (CGJ), so those adversarial inputs can differ from ICU.
 
 `kstem` implements Bob Krovetz's dictionary-based English stemming algorithm:
 `ponies` becomes `pony`, while recognized dictionary words are preserved or

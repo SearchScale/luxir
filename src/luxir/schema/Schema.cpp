@@ -958,8 +958,9 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   // Text suffixes, from raw to folded and stemmed. In the whitespace
   // family a trailing `l` means "plus lowercase"; the unicode family uses `n`
   // for NFKC_CF ("normalize": casefold + compatibility forms + canonical
-  // equivalence), because bare lowercase on unicode-segmented text leaves
-  // equal-looking strings unequal (NFC vs NFD, final sigma) and is a trap.
+  // equivalence + default-ignorable removal), because bare lowercase on
+  // unicode-segmented text leaves equal-looking strings unequal (NFC vs NFD,
+  // final sigma) and is a trap.
   //   _w   raw whitespace tokens (case- and accent-sensitive)
   //   _wl  whitespace + Unicode lowercase: touch nothing but case (for
   //        identifier-ish or pre-normalized content)

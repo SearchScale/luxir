@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <uni_algo/case.h>
+#include <uni_algo/conv.h>
 #include <uni_algo/norm.h>
 #include <uni_algo/ranges_word.h>
 
@@ -362,23 +363,35 @@ TEST_F(AnalysisTest, analyzerOutlivesDefinition) {
 }
 
 // ---------------------------------------------------------------------------
-// Unicode conformance spike (uni-algo, vendored, Unicode 15.1.0).
+// Unicode conformance (uni-algo and NFKC_CF tables, Unicode 15.1.0).
 //
-// Gates the analysis stack before the real UnicodeWordTokenizer / NFKC_CF filter
-// are built on top of uni-algo: validates that the pinned library actually
-// passes UAX#29 word segmentation and Unicode full case folding, plus a few
-// shipped-behavior sanity checks. The two file-driven tests consume the official
+// Gates UAX#29 word segmentation, Unicode full case folding and NFKC_CF,
+// including the pinned library's independent normalization and folding data.
+// The file-driven tests consume the official
 // Unicode data files that cmake downloads into the build tree; they GTEST_SKIP when
 // the files are absent (offline) rather than fail.
 // ---------------------------------------------------------------------------
 namespace {
 namespace fs = std::filesystem;
 
-// toNFKC_Casefold approximation for the spike: case-fold, then NFKC. The
-// single-pass NFKC_CF mapping is a later optimization; this two-pass form
-// matches it for the cases exercised here.
+// The previous implementation, retained only as an independent reference for
+// non-empty scalar mappings. Its stop rule handles fold/NFKC recomposition.
+std::string oldNfkcCf(std::string_view s) {
+  std::string out = una::norm::to_nfkc_utf8(una::cases::to_casefold_utf8(s));
+  for (;;) {
+    std::string folded = una::cases::to_casefold_utf8(out);
+    if (folded == out) return out;
+    std::string next = una::norm::to_nfkc_utf8(folded);
+    if (next == out) return out;
+    out = std::move(next);
+  }
+}
+
 std::string nfkc_cf(std::string_view s) {
-  return una::norm::to_nfkc_utf8(una::cases::to_casefold_utf8(s));
+  auto filter = makeNfkcCasefoldFilter(std::make_unique<KeywordTokenizer>());
+  std::string out(s);
+  filter->normalizeTerm(out);
+  return out;
 }
 
 // Append code point cp to out as UTF-8.
@@ -562,21 +575,161 @@ TEST_F(AnalysisTest, foldVsPreserveAccents) {
   EXPECT_EQ((std::vector<std::string>{"café"}), analyze(*preserving.createAnalyzer("un"), "Café").terms);
 }
 
-// NFKC_CF must reach the fold/normalize fixpoint: NFKC of U+03D3 (ϓ) is U+038E,
-// an UPPERCASE Ύ, so a single casefold-then-NFKC pass would leave uppercase in
-// the "casefolded" index and canonically-equivalent query forms would miss.
-TEST_F(AnalysisTest, nfkcCfReachesFixpoint) {
+// Compatibility forms must fold even when compatibility normalization would
+// expose an uppercase letter after casefolding (U+03D3 -> U+038E -> U+03CD).
+TEST_F(AnalysisTest, nfkcCfFoldsCompatibilityUppercase) {
   TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
   auto out = analyze(*ft.createAnalyzer("t"), "ϓ Ύ ύ");  // U+03D3, U+038E, U+03CD
   EXPECT_EQ((std::vector<std::string>{"ύ", "ύ", "ύ"}), out.terms);  // all fold to U+03CD
 }
 
-// Casefolding splits ῆ (U+1FC6) into η + U+0342, and NFKC rejoins them.
-// Avoid an infinite loop by stopping when casefolding + NFKC, as a single step, settles.
-TEST_F(AnalysisTest, nfkcCfTerminatesWhenCasefoldDecomposes) {
+// Polytonic Greek retains its composed accents under table mapping plus NFC.
+TEST_F(AnalysisTest, nfkcCfPolytonicGreek) {
   TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
-  auto out = analyze(*ft.createAnalyzer("t"), "τῆς Ἰησοῦ ǰ");  // U+1FC6, U+1F38 U+1FE6, U+01F0
-  EXPECT_EQ((std::vector<std::string>{"τῆσ", "ἰησοῦ", "ǰ"}), out.terms);  // stay precomposed
+  auto out = analyze(*ft.createAnalyzer("t"), "\u03c4\u1fc6\u03c2 \u1f38\u03b7\u03c3\u03bf\u1fe6 \u01f0 \u03b1\u1f50\u03c4\u03cc\u03c2");  // U+1FC6, U+1F38 U+1FE6, U+01F0
+  EXPECT_EQ((std::vector<std::string>{"\u03c4\u1fc6\u03c3", "\u1f30\u03b7\u03c3\u03bf\u1fe6", "\u01f0", "\u03b1\u1f50\u03c4\u03cc\u03c3"}), out.terms);  // stay precomposed
+}
+
+// Exhaustive independent gate: parse the pinned UCD rather than the generated
+// header, then cross-check every non-empty mapping against the old algorithm.
+TEST_F(AnalysisTest, nfkcCfUcdScalarGate) {
+  fs::path path = testDataPath("DerivedNormalizationProps-15.1.0.txt");
+  std::ifstream in(path, std::ios::binary);
+  if (!in) GTEST_SKIP() << "missing " << path << " (reconfigure cmake to download)";
+  std::vector<std::string> mapping(0x110000);
+  std::vector<bool> listed(0x110000);
+  for (std::string line; std::getline(in, line);) {
+    line.resize(line.find('#') == std::string::npos ? line.size() : line.find('#'));
+    std::istringstream fields(line);
+    std::string range, prop, value;
+    if (!std::getline(fields, range, ';') || !std::getline(fields, prop, ';')) continue;
+    std::istringstream property(prop);
+    property >> prop;
+    if (prop != "NFKC_CF") continue;
+    std::getline(fields, value, ';');
+    std::istringstream cps(value);
+    std::string mapped;
+    for (std::string cp; cps >> cp;) utf8Append(mapped, (uint32_t) std::stoul(cp, nullptr, 16));
+    uint32_t first = (uint32_t) std::stoul(range, nullptr, 16);
+    size_t dots = range.find("..");
+    uint32_t last = dots == std::string::npos ? first : (uint32_t) std::stoul(range.substr(dots + 2), nullptr, 16);
+    for (uint32_t cp = first; cp <= last; ++cp) {
+      listed[cp] = true;
+      mapping[cp] = mapped;
+    }
+  }
+  auto filter = makeNfkcCasefoldFilter(std::make_unique<KeywordTokenizer>());
+  int identity = 0, nonempty = 0, empty = 0;
+  for (uint32_t cp = 0; cp <= 0x10FFFF; ++cp) {
+    if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+    std::string scalar;
+    utf8Append(scalar, cp);
+    std::string expected = listed[cp] ? mapping[cp] : scalar;
+    if (!listed[cp]) ++identity;
+    else if (expected.empty()) ++empty;
+    else ++nonempty;
+    std::string actual = scalar;
+    filter->normalizeTerm(actual);
+    ASSERT_EQ(una::norm::to_nfc_utf8(expected), actual) << "scalar " << cp;
+    if (!expected.empty()) {
+      ASSERT_EQ(oldNfkcCf(scalar), actual) << "reference scalar " << cp;
+    }
+  }
+  EXPECT_EQ(6317, nonempty);
+  EXPECT_EQ(4174, empty);
+  RecordProperty("nfkc_cf_identity", identity);
+}
+
+TEST_F(AnalysisTest, nfkcCfStringsAndIdempotence) {
+  std::vector<std::pair<std::string, std::string>> cases = {
+      {"\u0315\u0316", "\u0316\u0315"},
+      {"a\u0315\u0316", "a\u0316\u0315"},
+      {"cafe\u0301", "caf\u00e9"}, {"caf\u00e9", "caf\u00e9"},
+      {"co\u00adoperate", "cooperate"}, {"co\u200doperate", "cooperate"},
+      {"co\u200coperate", "cooperate"}, {"co\ufe0foperate", "cooperate"},
+      {"e\u200d\u0301", "\u00e9"},
+      {"a\u0315\u034f\u0316", "a\u0316\u0315"},
+      {"\u3164", ""}, {"\U000e0000\U000e0fff", ""},
+      {"\u03b1\u1f50\u03c4\u03cc\u03c2", "\u03b1\u1f50\u03c4\u03cc\u03c3"},
+      {"\u03c4\u1fc6\u03c2", "\u03c4\u1fc6\u03c3"},
+  };
+  std::string marks, safe;
+  for (int i = 0; i < 65; ++i) {
+    marks += "\u0315";  // NFC_QC=Yes: ordering alone must not bypass stream safety
+    if (i && i % 30 == 0) safe += "\u034f";
+    safe += "\u0315";
+  }
+  cases.emplace_back(marks, safe);
+  EXPECT_EQ(safe, una::norm::to_nfc_utf8(marks));
+  // U+0344's NFKD has two non-starters; counts must not use ccc alone.
+  std::string doubleMarks;
+  for (int i = 0; i < 20; ++i) doubleMarks += "\u0344";
+  cases.emplace_back(doubleMarks, una::norm::to_nfc_utf8(doubleMarks));
+  cases.emplace_back("\u00e1" + marks, una::norm::to_nfc_utf8("\u00e1" + marks));
+  for (const auto& [input, expected] : cases) {
+    std::string actual = nfkc_cf(input);
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(actual, nfkc_cf(actual));
+  }
+}
+
+TEST_F(AnalysisTest, nfkcCfDropsInvisibleTokensWithoutPositionGap) {
+  std::string input = "\u3164 before \u3164 \u3164 co\u00adoperate after \u3164";
+  for (bool fused : {false, true}) {
+    std::unique_ptr<Tokenizer> head = fused ? makeStandardTokenizer() : makeUnicodeWordTokenizer();
+    Tokenizer& tokenizer = *head;
+    std::unique_ptr<TokenStream> tail = fused ? std::move(head) : makeNfkcCasefoldFilter(std::move(head));
+    TokenChain chain(tokenizer, std::move(tail), true);
+    auto out = analyze(chain, input);
+    EXPECT_EQ((std::vector<std::string>{"before", "cooperate", "after"}), out.terms);
+    EXPECT_EQ((std::vector<int>{0, 1, 2}), out.positions);
+    EXPECT_EQ((std::vector<int>{4, 19, 31}), out.starts);
+    EXPECT_EQ((std::vector<int>{10, 30, 36}), out.ends);
+    out = analyze(chain, "co\u00adoperate co\u200doperate co\ufe0foperate");
+    EXPECT_EQ((std::vector<std::string>{"cooperate", "cooperate", "cooperate"}), out.terms);
+    EXPECT_EQ((std::vector<int>{0, 1, 2}), out.positions);
+  }
+}
+
+TEST_F(AnalysisTest, nfkcCfUnicodeQuickCheckBorrowsInput) {
+  auto head = std::make_unique<KeywordTokenizer>();
+  Tokenizer& tokenizer = *head;
+  auto filter = makeNfkcCasefoldFilter(std::move(head));
+  for (std::string_view input : {"lowercase", "caf\u00e9", "\u5168\u6587", "a\u0316\u0315"}) {
+    tokenizer.setValue(input);
+    ASSERT_TRUE(filter->incrementToken());
+    EXPECT_EQ(input.data(), tokenizer.getToken().text.data());
+  }
+}
+
+TEST_F(AnalysisTest, nfkcCfIllFormedUtf8) {
+  auto filter = makeNfkcCasefoldFilter(std::make_unique<KeywordTokenizer>());
+  auto check = [&](const std::string& input) {
+    std::string actual = input;
+    filter->normalizeTerm(actual);
+    if (!una::is_valid_utf8(input)) {
+      EXPECT_EQ(oldNfkcCf(input), actual);
+    }
+    EXPECT_EQ(actual, nfkc_cf(actual));
+  };
+  // All one- and two-byte strings, including truncated sequences, overlongs,
+  // stray continuations, valid pairs, and embedded NULs.
+  for (int first = 0; first < 256; ++first) {
+    check(std::string(1, (char) first));
+    for (int second = 0; second < 256; ++second) check(std::string{(char) first, (char) second});
+  }
+  for (std::string input : {"\xe1\x80", "\xe1\x80Z", "\xf0\x90\x80", "\xed\xa0\x80",
+                            "\xf4\x90\x80\x80", "\xe0\x80\x80", "\xf0\x80\x80\x80"}) check(input);
+  EXPECT_EQ("\ufffdz", nfkc_cf("\xe1\x80Z"));
+  EXPECT_EQ("\ufffd\ufffd\ufffd", nfkc_cf("\xed\xa0\x80"));
+  for (int i = 0; i < 1000; ++i) {
+    std::string bytes;
+    for (int j = 0; j < 32; ++j) bytes += (char) rng.rint(256);
+    // Independently repair with uni-algo's conversion API; arbitrary bytes may
+    // also contain valid default-ignorables, so the old fold is no oracle here.
+    std::string repaired = una::utf32to8(una::utf8to32u(bytes));
+    EXPECT_EQ(nfkc_cf(repaired), nfkc_cf(bytes));
+  }
 }
 
 // The fused StandardTokenizer (swapped in for unicode_word + nfkc_cf) must produce
@@ -602,7 +755,7 @@ TEST_F(AnalysisTest, standardFusionMatchesComposedChain) {
 }
 
 namespace {
-// Build the composed reference chain (unicode_word + nfkc_cf, pure uni-algo)
+// Build the composed reference chain (unicode_word + nfkc_cf)
 // and the fused StandardTokenizer (region dispatch + ASCII DFA + bulk
 // lowercase), and return both term lists for `v`. The fast paths are correct
 // iff these are always identical.

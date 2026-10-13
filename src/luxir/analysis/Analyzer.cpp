@@ -3,6 +3,7 @@
 
 #include "luxir/analysis/Analyzer.h"
 #include "luxir/analysis/KStemmer.h"
+#include "luxir/analysis/NfkcCfData.h"
 
 #include <algorithm>
 #include <memory>
@@ -18,6 +19,8 @@
 #include <uni_algo/case.h>
 #include <uni_algo/norm.h>
 #include <uni_algo/ranges_word.h>
+#include <uni_algo/ranges_conv.h>
+#include <uni_algo/version.h>
 
 // The uni-algo dependency is confined to this translation unit; the rest of the
 // codebase sees only the factory functions declared in Analyzer.h. uni-algo is
@@ -26,6 +29,9 @@
 namespace luxir {
 
 namespace {
+
+static_assert(UNI_ALGO_UNICODE_VERSION == nfkc_cf_data::unicodeVersion,
+              "Regenerate NFKC_CF tables when upgrading uni-algo's Unicode data");
 
 // UAX#29 word-boundary tokenizer. Emits word-like segments only (letters,
 // numbers, ideographs, ...); punctuation and whitespace runs are dropped, like
@@ -56,15 +62,40 @@ public:
   }
 };
 
-// Apply NFKC_CF (toNFKC_Casefold) to `in`, using `buf` as scratch only when a
-// rewrite is needed. Returns a view of the result - which is `in` itself for the
-// common pure-lowercase-ASCII case (zero copy). Tiered fast path:
-//   * pure lowercase ASCII -> return `in` unchanged
-//   * ASCII with uppercase -> plain ASCII lowercase into buf (NFKC is a no-op on
-//     ASCII, casefold on ASCII is lowercase)
-//   * any non-ASCII byte    -> full NFKC_CF via uni-algo
-// (toNFKC_Casefold is approximated as casefold-then-NFKC; a single-pass NFKC_CF
-// mapping is a later optimization. Conformance is gated in AnalysisTest.)
+// Conservative NFC + stream-safe quick check. Counts use NFKD, as required
+// by the Stream-Safe Text Process (and by uni-algo), rather than just ccc != 0.
+struct NfcQuickCheck {
+  unsigned lastCcc = 0;
+  unsigned nonstarters = 0;
+  bool yes = true;
+
+  void add(const nfkc_cf_data::Record& record) {
+    unsigned props = record.props;
+    unsigned ccc = props & 255;
+    unsigned lead = (props >> 9) & 3;
+    nonstarters = lead ? nonstarters + lead : (props >> 11);
+    if ((props & 256) || (ccc && ccc < lastCcc) || nonstarters > 30) yes = false;
+    lastCcc = ccc;
+  }
+};
+
+bool isNfcQuickYes(std::string_view in) {
+  NfcQuickCheck check;
+  for (char32_t cp : una::views::utf8(in)) {
+    check.add(nfkc_cf_data::lookup((uint32_t) cp));
+    if (!check.yes) return false;
+  }
+  return true;
+}
+
+// Unicode 15.1.0 toNFKC_Casefold: map each scalar through NFKC_CF (including
+// default-ignorable removal), then NFC. No iteration. uni-algo's NFC is
+// stream-safe: it inserts CGJ U+034F when NFKD would exceed 30 non-starters.
+// Such adversarial runs are deterministic and idempotent, but can differ from
+// ICU's bytes. Decoding uses uni-algo's bounded UTF-8 view, with U+FFFD per
+// maximal subpart on ill-formed input, just like its normalization routines.
+// Returns `in` itself when unchanged and NFC quick-check Yes in canonical order
+// and stream-safe. Keep the common ASCII tiers independent of Unicode tables.
 std::string_view applyNfkcCf(std::string_view in, std::string& buf) {
   bool hasUpper = false, hasNonAscii = false;
   for (unsigned char c : in) {
@@ -72,19 +103,33 @@ std::string_view applyNfkcCf(std::string_view in, std::string& buf) {
     if (c >= 'A' && c <= 'Z') hasUpper = true;
   }
   if (hasNonAscii) {
-    buf = una::norm::to_nfkc_utf8(una::cases::to_casefold_utf8(in));
-    // NFKC can surface fresh uppercase (e.g. U+03D3 -> U+038E), so one pass is
-    // not the NFKC_CF fixpoint; re-fold until stable (typically zero iterations:
-    // casefold of already-folded text is the identity, so the loop is one
-    // compare in the common case). Casefold can also decompose what NFKC
-    // recomposes (U+1FC6), so break when casefold + NFKC, as a unit, settles.
-    for (;;) {
-      std::string refolded = una::cases::to_casefold_utf8(buf);
-      if (refolded == buf) break;
-      std::string next = una::norm::to_nfkc_utf8(refolded);
-      if (next == buf) break;
-      buf = std::move(next);
+    NfcQuickCheck check;
+    bool rewritten = false;
+    auto decoded = una::views::utf8(in);
+    for (auto it = decoded.begin(); it != decoded.end(); ++it) {
+      uint32_t cp = (uint32_t) *it;
+      const auto& record = nfkc_cf_data::lookup(cp);
+      if (!rewritten && check.yes) check.add(record);
+      std::string_view bytes(it.begin(), (size_t) (it.end() - it.begin()));
+      bool invalid = cp == 0xFFFD && bytes != "\xef\xbf\xbd";
+      if (record.mapping || invalid) {
+        if (!rewritten) {
+          buf.assign(in.data(), (size_t) (it.begin() - in.begin()));
+          rewritten = true;
+        }
+        if (invalid) buf.append("\xef\xbf\xbd");
+        else buf.append((const char*) nfkc_cf_data::utf8 + (record.mapping & 0xFFFFFF),
+                        (record.mapping >> 24) & 127);
+      } else if (rewritten) {
+        buf.append(bytes);
+      }
     }
+    if (rewritten) {
+      if (!isNfcQuickYes(buf)) buf = una::norm::to_nfc_utf8(buf);
+      return buf;
+    }
+    if (check.yes) return in;
+    buf = una::norm::to_nfc_utf8(in);
     return buf;
   }
   if (hasUpper) {
@@ -219,6 +264,7 @@ public:
                           (int) (w.data() + w.size() - loweredBase));
           token.text = applyNfkcCf(w, buf);
           ++it;
+          if (token.text.empty()) continue;  // invisible words consume no position
           return true;
         }
         view.reset();
@@ -305,9 +351,18 @@ public:
   NfkcCasefoldFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
 
   bool incrementToken() override {
-    if (!source().incrementToken()) return false;
-    token.text = applyNfkcCf(token.text, buf);
-    return true;
+    // A dropped (all-ignorable) token takes no position of its own, but any
+    // gap an upstream stage put before it still applies to the next token.
+    int gap = 0;
+    while (source().incrementToken()) {
+      token.text = applyNfkcCf(token.text, buf);
+      if (!token.text.empty()) {
+        token.positionIncrement += gap;
+        return true;
+      }
+      gap += token.positionIncrement - 1;
+    }
+    return false;
   }
 
   void normalizeTerm(std::string& term) override {

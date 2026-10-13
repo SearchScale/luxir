@@ -86,3 +86,4 @@ download("${LUXIR_TEST_DATA_DIR}/book.txt" https://www.gutenberg.org/files/2600/
 # If a download fails (offline), the conformance tests GTEST_SKIP rather than fail.
 download("${LUXIR_TEST_DATA_DIR}/WordBreakTest-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/auxiliary/WordBreakTest.txt 69506b2253b8defb1f15b1476397376285cfda3bafd9304ee50d48bbfa0a2ab4)
 download("${LUXIR_TEST_DATA_DIR}/CaseFolding-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/CaseFolding.txt 4e55acfdc32825a22e87670e9056a3bf94ad7c5400065778e9e10f8314372bcf)
+download("${LUXIR_TEST_DATA_DIR}/DerivedNormalizationProps-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/DerivedNormalizationProps.txt 8875dccee2bc1a7c1fe568a3b502a9e78c9e0495afd96b6568b4294d0ed1f7e1)

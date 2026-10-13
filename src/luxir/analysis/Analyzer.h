@@ -272,8 +272,11 @@ public:
 };
 
 // UAX#29 word-boundary tokenizer and NFKC_CF (toNFKC_Casefold) fold filter, built
-// on uni-algo. Defined in Analyzer.cpp so uni-algo's heavy Unicode headers stay
-// out of this widely-included header. The unicode_word tokenizer is stateful (it
+// on pinned Unicode 15.1.0 tables and uni-algo NFC. NFKC_CF removes default-
+// ignorables; empty tokens are dropped without a position gap. NFC is stream-
+// safe (CGJ after 30 NFKD non-starters), so adversarial runs can differ from ICU
+// but remain deterministic and idempotent. Defined in Analyzer.cpp so uni-algo's
+// headers and the generated tables stay out of this widely-included header. The unicode_word tokenizer is stateful (it
 // carries a segmentation cursor and rebuilds it in reset()), so a chain using it
 // must be constructed with stateful=true.
 std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer();

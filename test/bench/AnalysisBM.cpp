@@ -25,10 +25,20 @@ using namespace luxir;
 //                          every offset. Upper bound on the offset cost.
 template <bool ConsumeOffset>
 static void BM_Tokenize(benchmark::State& state, std::string tokenizer,
-                        std::vector<std::string> filters, std::optional<bool> possessive = std::nullopt) {
-  Book& book = TestData::data->getBook();
-  if (skipBenchIfDataMissing(state, !book.text().empty(), "book.txt")) return;
-  std::string_view text = book.text();
+                        std::vector<std::string> filters, std::optional<bool> possessive = std::nullopt,
+                        bool multilingual = false) {
+  std::string_view text;
+  std::string synthetic;
+  if (multilingual) {
+    for (int i = 0; i < 4096; ++i)
+      synthetic += "CAF\u00c9 Stra\u00dfe \u03b1\u1f50\u03c4\u03cc\u03c2 \u03c4\u1fc6\u03c2 "
+                   "\u0411\u041e\u041b\u042c\u0428\u041e\u0419 \u5168\u6587 \uff21\uff22\uff23 ";
+    text = synthetic;
+  } else {
+    Book& book = TestData::data->getBook();
+    if (skipBenchIfDataMissing(state, !book.text().empty(), "book.txt")) return;
+    text = book.text();
+  }
 
   std::pmr::monotonic_buffer_resource arena;
   api::AnalyzerDef def;
@@ -68,6 +78,10 @@ TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, whitespace_text, "whitespace", std:
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, whitespace_off, "whitespace", std::vector<std::string>{})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, standard_text, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, standard_off, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, multilingual, "unicode_word",
+    std::vector<std::string>{"nfkc_cf"}, std::nullopt, true)->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, multilingual_fold_only, "whitespace",
+    std::vector<std::string>{"nfkc_cf"}, std::nullopt, true)->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, folded_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold"})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, kstem_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold", "kstem"}, false)->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, possessive_separate, "unicode_word",
