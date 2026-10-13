@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <typeinfo>
 
-#include <boost/sort/spreadsort/string_sort.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/task_group.h>
 #include "luxir/api/luxir_index.hpp"

@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <boost/sort/spreadsort/string_sort.hpp>
 #include "luxir/index/Inverter.h"
 #include "luxir/index/OrdCollector.h"
 #include "luxir/index/OrdColWriter.h"
@@ -199,9 +198,7 @@ private:
 
   static SortResult sortAndDetach(TermValHash<IdEntry>& hash) {
     int32_t count = (int32_t)hash.size();
-    auto* terms = hash.destructiveCompress();
-    boost::sort::spreadsort::string_sort(terms, terms + count, TermRef::bracket(), TermRef::getsize(),
-                                         TermRef::lessthan());
+    auto* terms = hash.destructiveSort();
 
     uint64_t minV = terms[0].val().version;
     uint64_t maxV = minV;
@@ -227,9 +224,7 @@ public:
     if (uniqueVals > 0) {
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
-      auto terms = termsHash.destructiveCompress();
-      boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),
-                                           TermRef::lessthan());
+      auto terms = termsHash.destructiveSort();
 
       auto nDocs = inverter.getMaxDoc();
       auto guard = MemPool::threadLocalPoolGuard();

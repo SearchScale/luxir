@@ -167,28 +167,8 @@ public:
     auto sz = termsHash.size();
     if (numDocsWithField == 0) return;
 
-    // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
-    // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
-    auto terms = termsHash.destructiveCompress();
-
-    // Sorting this with std::sort took ~7.3ms out of a total of ~22ms for inversion and 38ms for inversion+postings_writing!
-    // There were only 41991 unique terms... how can sort be so slow? Cache misses?
-    // For cache misses, we could try using a string type with a short-string optimization, or try packing all the strings
-    // for a field together (would need to know what fields have many terms though.)
-    // If strings are short on average, try an inline memcmp!
-    // pdqsort == 6.8ms
-    // spread_sort::string_sort == 3.9ms
-
-    // std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
-    // std::sort(terms, terms+sz);
-    // boost::sort::pdqsort(terms, terms+sz);
-    if (sz > 0) {
-      boost::sort::spreadsort::string_sort(terms, terms + sz, TermRef::bracket(), TermRef::getsize(),
-                                           TermRef::lessthan());
-    }
-    // auto endTime = std::chrono::high_resolution_clock::now();
-    // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
-    // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
+    // Sorting terms per field could run in parallel across fields.
+    auto terms = termsHash.destructiveSort();
 
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();

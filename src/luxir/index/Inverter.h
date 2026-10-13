@@ -31,8 +31,6 @@ struct GeoPoint {
 // Handlers take a `const IndexVal&` and dispatch on its `kind` std::variant.
 using IndexVal = luxir::api::Val;
 
-using std::iter_swap; // for boost string_sort
-
 
 class CommitInfo;
 

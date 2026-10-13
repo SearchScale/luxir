@@ -5,6 +5,7 @@
 
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/util/TermSort.h"
 #include <functional>
 #include "boost/iterator/filter_iterator.hpp"
 
@@ -76,15 +77,10 @@ public:
 };
 
 
-// FUTURE OPT: Sorting the terms when serializing may have pretty bad locality.
-// We could use a custom string_view class that is a single pointer that
-// inlines (short string optimization) up to 7 bytes
-// if we were dealing with a pool that was always 64 byte aligned, then
-// we could normally tell without storing any extra info (or we could just use
-// the extra bits we know will always be 0)
-// Or a custom string_view class could optionally pack up to 15 chars locally.
-// Some of this might be very useful for short english words (the majority), but
-// not useful with unique ids (which may represent the bulk of unique terms?)
+// FUTURE OPT: flush sorts entries with sortTerms, which first gathers an 8-byte
+// prefix per term. Keeping that prefix in the slot ({prefix, ptr}) would skip
+// the gather (~10 ns/term at 1M terms) and let probes reject most mismatches
+// without touching the pool, at 8 more bytes per slot.
 
 // A map that is implemented more like a set.
 // It wraps a T in a TermValRef, storing them together in the MemPool.
@@ -190,15 +186,10 @@ public:
     }
   }
 
-  // Some heterogeneous lookup support.  We could support it as a template param if needed.
-  template<typename... Args>
-  std::pair<entry_type, bool> try_emplace(const std::string& s, Args &&... args) {
-    return try_emplace(s.data(), s.size(), std::forward<Args>(args)...);
-  }
-
   // Packs all values into the start of the internal array and returns a pointer to the beginning.
-  // Additions, lookups, or other hash operations will be undefined after this point.  The purpose of this
-  // method is to avoid an extra (potentially large) allocation just to copy the values to sort.
+  // Additions, lookups, or other hash operations will be undefined after this point.  The packed entries
+  // are sorted in place (destructiveSort) and may be detached with the table (SortedDeletes), so no
+  // separate array of entries is allocated.
   // The memory pointed at is still owned by this table and should not be accessed after it has been destructed.
   iterator destructiveCompress() {
     auto sz = size();
@@ -213,6 +204,13 @@ public:
       // not necessary to actually "empty" the occupied slot we copied.
     }
     return table_;
+  }
+
+  // destructiveCompress, then sort the entries into term order.
+  iterator destructiveSort() {
+    auto terms = destructiveCompress();
+    sortTerms(terms, size());
+    return terms;
   }
 
   friend std::ostream& operator<<(std::ostream &out, const TermValHash &tvh) {

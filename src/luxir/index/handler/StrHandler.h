@@ -140,9 +140,7 @@ public:
     auto guard = MemPool::threadLocalPoolGuard();
 
 
-    auto terms = termsHash.destructiveCompress();
-    boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),
-                                         TermRef::lessthan());
+    auto terms = termsHash.destructiveSort();
 
     // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
     TextWriter textWriter(inverter.getPostingsWriter());

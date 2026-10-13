@@ -13,33 +13,26 @@
 #include <stdexcept>
 #include <vector>
 
-#include <boost/sort/spreadsort/integer_sort.hpp>
-
 #include "luxir/codec/Codec.h"
 #include "luxir/store/OutputStream.h"
+#include "luxir/util/IntegerSort.h"
 
 namespace luxir {
 
 // Canonical (value, docid) point sort shared by the flush and merge builders.
-// Two-level: radix by value, then re-sort each equal-value run by docid.
-// integer_sort's comparator MUST order exactly by the shifted key - it never
-// runs the comparator inside equal-key buckets, so a docid tie-break in the
-// comparator is silently ignored (measured output mismatch on low-cardinality
-// data, 2026-07-10). Never slower than std::sort in the flush-shape
-// microbench; 7.7x on docid-correlated values.
+// Two-level: radix by value, then re-sort each equal-value run by docid (a
+// docid tie-break cannot ride in the value sort; see integerSortByKey). Never
+// slower than std::sort in the flush-shape microbench; 7.7x on
+// docid-correlated values.
 template <class Point>
 void sortPointsByValueDocid(std::span<Point> points) {
-  boost::sort::spreadsort::integer_sort(points.begin(), points.end(),
-      [](const Point& p, unsigned offset) { return p.value >> offset; },
-      [](const Point& a, const Point& b) { return a.value < b.value; });
+  integerSortByKey(points.begin(), points.end(), [](const Point& p) { return p.value; });
   auto runBegin = points.begin();
   while (runBegin != points.end()) {
     auto runEnd = runBegin + 1;
     while (runEnd != points.end() && runEnd->value == runBegin->value) ++runEnd;
     if (runEnd - runBegin > 1) {
-      boost::sort::spreadsort::integer_sort(runBegin, runEnd,
-          [](const Point& p, unsigned offset) { return p.docid >> offset; },
-          [](const Point& a, const Point& b) { return a.docid < b.docid; });
+      integerSortByKey(runBegin, runEnd, [](const Point& p) { return p.docid; });
     }
     runBegin = runEnd;
   }
