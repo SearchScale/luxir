@@ -571,6 +571,14 @@ TEST_F(AnalysisTest, nfkcCfReachesFixpoint) {
   EXPECT_EQ((std::vector<std::string>{"ύ", "ύ", "ύ"}), out.terms);  // all fold to U+03CD
 }
 
+// Casefolding splits ῆ (U+1FC6) into η + U+0342, and NFKC rejoins them.
+// Avoid an infinite loop by stopping when casefolding + NFKC, as a single step, settles.
+TEST_F(AnalysisTest, nfkcCfTerminatesWhenCasefoldDecomposes) {
+  TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto out = analyze(*ft.createAnalyzer("t"), "τῆς Ἰησοῦ ǰ");  // U+1FC6, U+1F38 U+1FE6, U+01F0
+  EXPECT_EQ((std::vector<std::string>{"τῆσ", "ἰησοῦ", "ǰ"}), out.terms);  // stay precomposed
+}
+
 // The fused StandardTokenizer (swapped in for unicode_word + nfkc_cf) must produce
 // byte-identical tokens to the explicit two-stage chain - the optimization is
 // behavior-preserving.

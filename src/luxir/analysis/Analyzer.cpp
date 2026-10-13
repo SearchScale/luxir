@@ -76,11 +76,14 @@ std::string_view applyNfkcCf(std::string_view in, std::string& buf) {
     // NFKC can surface fresh uppercase (e.g. U+03D3 -> U+038E), so one pass is
     // not the NFKC_CF fixpoint; re-fold until stable (typically zero iterations:
     // casefold of already-folded text is the identity, so the loop is one
-    // compare in the common case).
+    // compare in the common case). Casefold can also decompose what NFKC
+    // recomposes (U+1FC6), so break when casefold + NFKC, as a unit, settles.
     for (;;) {
       std::string refolded = una::cases::to_casefold_utf8(buf);
       if (refolded == buf) break;
-      buf = una::norm::to_nfkc_utf8(refolded);
+      std::string next = una::norm::to_nfkc_utf8(refolded);
+      if (next == buf) break;
+      buf = std::move(next);
     }
     return buf;
   }
