@@ -168,7 +168,7 @@ public:
     if (numDocsWithField == 0) return;
 
     // Sorting terms per field could run in parallel across fields.
-    auto terms = termsHash.destructiveSort();
+    auto terms = sortForFlush(inverter, termsHash);
 
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();

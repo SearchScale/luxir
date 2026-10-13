@@ -599,7 +599,6 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   if (!inverter) {
     auto newInverter = std::make_unique<Inverter>(
         dir, ++lastSegId, pinned, indexRamBudget);
-    newInverter->ramGuard = IndexRamBudget::Guard(*indexRamBudget, 0);
     inverter = newInverter.get();
     busyInverters.emplace(inverter, std::move(newInverter));
   }

@@ -142,3 +142,29 @@ TEST(IndexRamBudgetTest, DrainingDiscountsPressureUntilReservationRelease) {
   EXPECT_EQ(0, budget.drainingBytesCount());
   EXPECT_EQ(1, admissionPings.load(std::memory_order_relaxed));
 }
+
+TEST(IndexRamBudgetTest, DrainingGrowthCountsForAdmissionNotPressure) {
+  IndexRamBudget budget(10);
+  std::atomic<int> admissionPings = 0;
+  std::atomic<int> pressurePings = 0;
+  auto demand = budget.registerMergeDemand([&]() { admissionPings.fetch_add(1, std::memory_order_relaxed); });
+  auto pressure = budget.registerPressureListener([&]() { pressurePings.fetch_add(1, std::memory_order_relaxed); });
+  demand.publish(2);
+  auto guard = budget.forceAcquire(8);
+  guard.markDraining();
+
+  guard.growDraining(5);
+  EXPECT_EQ(13, guard.size());
+  EXPECT_EQ(13, budget.reservedBytes());
+  EXPECT_EQ(13, budget.drainingBytesCount());
+  EXPECT_FALSE(budget.pressureNeeded());
+  EXPECT_FALSE(budget.tryAcquireGuard(2).has_value());
+  EXPECT_EQ(0, admissionPings.load(std::memory_order_relaxed));
+  EXPECT_EQ(0, pressurePings.load(std::memory_order_relaxed));
+
+  guard.release();
+  EXPECT_EQ(0, budget.reservedBytes());
+  EXPECT_EQ(0, budget.drainingBytesCount());
+  EXPECT_EQ(1, admissionPings.load(std::memory_order_relaxed));
+  EXPECT_EQ(0, pressurePings.load(std::memory_order_relaxed));
+}

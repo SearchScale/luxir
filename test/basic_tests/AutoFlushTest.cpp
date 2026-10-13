@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -473,4 +474,34 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   EXPECT_EQ(0, budget.pendingMergeDemandBytes());
   budget.setTotalBytes(0);
   iw.commit();
+}
+
+// A flush grows the draining reservation to its largest workspace: here a
+// sparse multi-valued string field's ord slots, rank->docid table and spilled
+// ords (its 1000 terms sort in place), held until the inverter is destroyed.
+TEST(FlushWorkspaceTest, flushGrowsDrainingReservation) {
+  IndexRamBudget budget;
+  RAMDir dir;
+  {
+    Inverter inverter(dir, 1, Schema::createDefaultSchema(), &budget);
+    auto& tags = inverter.getIndexHandler("tags_ss");
+    for (int d = 0; d < 1000; d++) {
+      inverter.startDoc();
+      if (d % 2 == 0) {
+        std::string a = "a" + std::to_string(d), b = "b" + std::to_string(d);
+        std::string_view vals[] = {a, b};
+        tags.index(inverter, std::span<const std::string_view>(vals));
+      }
+      inverter.finishDoc();
+    }
+    inverter.ramGuard.forceResize((int64_t)inverter.memSize());
+    inverter.ramGuard.markDraining();
+    int64_t atDrain = inverter.ramGuard.size();
+    inverter.flush();
+    EXPECT_GT(inverter.ramGuard.size() - atDrain, 500 * (int64_t)(sizeof(uint32_t) + sizeof(int32_t)));
+    EXPECT_EQ(inverter.ramGuard.size(), budget.reservedBytes());
+    EXPECT_EQ(inverter.ramGuard.size(), budget.drainingBytesCount());
+  }
+  EXPECT_EQ(0, budget.reservedBytes());
+  EXPECT_EQ(0, budget.drainingBytesCount());
 }

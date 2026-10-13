@@ -140,7 +140,7 @@ public:
     auto guard = MemPool::threadLocalPoolGuard();
 
 
-    auto terms = termsHash.destructiveSort();
+    auto terms = sortForFlush(inverter, termsHash);
 
     // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
     TextWriter textWriter(inverter.getPostingsWriter());
@@ -160,6 +160,7 @@ public:
     }
 
     OrdCollector ords(guard.pool(), nDocsWithField);
+    size_t poolStart = guard.pool().size();
 
     textWriter.startField(&fieldInfo);
     for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
@@ -176,6 +177,10 @@ public:
     }
     textWriter.endField();
     termsHash.free();
+    // Ord workspace at its peak; the pool's growth counts the spilled
+    // multi-valued ords to within a block.
+    inverter.noteFlushWorkspace(ords.slotBytes() + rankToDoc.capacity() * sizeof(int32_t)
+                                + (guard.pool().size() - poolStart));
 
     OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
     ordsWriter.finish(rankToDoc);

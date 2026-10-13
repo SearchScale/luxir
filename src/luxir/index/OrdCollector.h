@@ -72,6 +72,11 @@ public:
     return docsWithValue_;
   }
 
+  // heap bytes of the slots (multi-valued ords spill into the pool)
+  size_t slotBytes() const {
+    return ords.size() * sizeof(uint32_t);
+  }
+
   // number of index slots (maxDoc for docid-indexed, docsWithValue for rank-indexed)
   int32_t size() const {
     return (int32_t)ords.size();

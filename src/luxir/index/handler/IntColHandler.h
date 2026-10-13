@@ -190,6 +190,7 @@ public:
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({geo::unpackLatitude(value),
                             geo::unpackLongitude(value), 0});
@@ -204,6 +205,7 @@ public:
       } else {
         std::vector<FlushPoint> points;
         points.reserve((size_t)numVals);
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({value, 0});
         });
@@ -345,6 +347,7 @@ public:
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({geo::unpackLatitude(value),
                             geo::unpackLongitude(value), 0});
@@ -366,6 +369,7 @@ public:
       } else {
         std::vector<FlushPoint> points;
         points.reserve((size_t)numVals);
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({value, 0});
         });

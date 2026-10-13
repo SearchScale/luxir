@@ -196,9 +196,9 @@ private:
     uint64_t maxVersion;
   };
 
-  static SortResult sortAndDetach(TermValHash<IdEntry>& hash) {
+  static SortResult sortAndDetach(Inverter& inverter, TermValHash<IdEntry>& hash) {
     int32_t count = (int32_t)hash.size();
-    auto* terms = hash.destructiveSort();
+    auto* terms = sortForFlush(inverter, hash);
 
     uint64_t minV = terms[0].val().version;
     uint64_t maxV = minV;
@@ -224,7 +224,7 @@ public:
     if (uniqueVals > 0) {
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
-      auto terms = termsHash.destructiveSort();
+      auto terms = sortForFlush(inverter, termsHash);
 
       auto nDocs = inverter.getMaxDoc();
       auto guard = MemPool::threadLocalPoolGuard();
@@ -238,6 +238,7 @@ public:
       fieldInfo.flags = fieldType->segmentFlags();
 
       OrdCollector ords(guard.pool(), nDocs);
+      inverter.noteFlushWorkspace(ords.slotBytes());
 
       textWriter.startField(&fieldInfo);
       for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
@@ -283,7 +284,7 @@ public:
     }
 
     if (hasDeletes) {
-      auto result = sortAndDetach(*deleteHash);
+      auto result = sortAndDetach(inverter, *deleteHash);
       sortedDeletes->addList(std::move(result.entries), result.count, result.minVersion, result.maxVersion);
     }
 

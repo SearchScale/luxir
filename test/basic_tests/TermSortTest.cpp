@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
@@ -16,16 +17,22 @@ using namespace luxir;
 
 namespace {
 
-// Sorts the (unique) strings as pool terms in shuffled order and checks byte order.
+// Sorts the (unique) strings as pool terms in shuffled order, with the sort's
+// pairs allocated and then built in place, and checks byte order.
 void checkSort(const std::set<std::string>& unique) {
   MemPool pool;
-  std::vector<PackedTerm> terms;
-  for (auto& s : unique) terms.emplace_back(pool, s);
-  std::shuffle(terms.begin(), terms.end(), std::mt19937_64(1));
-  sortTerms(terms.data(), terms.size());
-  auto it = unique.begin();
-  for (size_t i = 0; i < terms.size(); i++, it++) {
-    ASSERT_EQ(std::string_view(terms[i]), *it) << "at " << i;
+  std::vector<PackedTerm> shuffled;
+  for (auto& s : unique) shuffled.emplace_back(pool, s);
+  std::shuffle(shuffled.begin(), shuffled.end(), std::mt19937_64(1));
+  size_t n = shuffled.size();
+  for (size_t capacity : {n, 2 * n}) {
+    auto terms = std::make_unique<PackedTerm[]>(capacity);
+    std::copy(shuffled.begin(), shuffled.end(), terms.get());
+    sortTerms(terms.get(), n, capacity);
+    auto it = unique.begin();
+    for (size_t i = 0; i < n; i++, it++) {
+      ASSERT_EQ(std::string_view(terms[i]), *it) << "at " << i << " capacity " << capacity;
+    }
   }
 }
 
@@ -67,20 +74,25 @@ TEST(TermSort, trailingZeroChain) {
   checkSort(unique);
 }
 
+// Both tables have 32K slots: the free tail holds the pairs of 16K terms but
+// not of 20K, which the sort allocates.
 TEST(TermSort, termValHashKeepsValues) {
-  MemPool pool;
-  TermValHash<int32_t> hash(pool, 4);
-  std::vector<std::string> inserted;
-  for (int i = 0; i < 20'000; i++) {
-    inserted.push_back("term" + std::to_string(i * 37 % 20'011));
-    hash.try_emplace(inserted.back(), i);
-  }
-  auto* terms = hash.destructiveSort();
-  ASSERT_EQ(hash.size(), inserted.size());
-  for (size_t i = 0; i < hash.size(); i++) {
-    if (i > 0) {
-      ASSERT_LT(terms[i - 1], terms[i]);
+  for (int count : {16'000, 20'000}) {
+    MemPool pool;
+    TermValHash<int32_t> hash(pool, 4);
+    std::vector<std::string> inserted;
+    for (int i = 0; i < count; i++) {
+      inserted.push_back("term" + std::to_string(i * 37 % 20'011));
+      hash.try_emplace(inserted.back(), i);
     }
-    ASSERT_EQ(std::string_view(terms[i]), inserted[(size_t)terms[i].val()]);
+    EXPECT_EQ(hash.sortScratchBytes(), count == 16'000 ? 0 : (size_t)count * 16);
+    auto* terms = hash.destructiveSort();
+    ASSERT_EQ(hash.size(), inserted.size());
+    for (size_t i = 0; i < hash.size(); i++) {
+      if (i > 0) {
+        ASSERT_LT(terms[i - 1], terms[i]);
+      }
+      ASSERT_EQ(std::string_view(terms[i]), inserted[(size_t)terms[i].val()]);
+    }
   }
 }

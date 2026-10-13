@@ -78,9 +78,11 @@ public:
 
 
 // FUTURE OPT: flush sorts entries with sortTerms, which first gathers an 8-byte
-// prefix per term. Keeping that prefix in the slot ({prefix, ptr}) would skip
-// the gather (~10 ns/term at 1M terms) and let probes reject most mismatches
-// without touching the pool, at 8 more bytes per slot.
+// prefix per term into {prefix, ptr} pairs (in the table itself when the load
+// is <= 0.5, else in a 16 byte/term allocation). Keeping that prefix in
+// the slot would skip the gather (~10 ns/term at 1M terms), never allocate, and
+// let probes reject most mismatches without touching the pool, at 8 more bytes
+// per slot for the table's whole life.
 
 // A map that is implemented more like a set.
 // It wraps a T in a TermValRef, storing them together in the MemPool.
@@ -209,8 +211,13 @@ public:
   // destructiveCompress, then sort the entries into term order.
   iterator destructiveSort() {
     auto terms = destructiveCompress();
-    sortTerms(terms, size());
+    sortTerms(terms, size(), tableSize_);
     return terms;
+  }
+
+  // Bytes destructiveSort allocates beyond the table.
+  [[nodiscard]] size_t sortScratchBytes() const {
+    return sortTermsScratchBytes<entry_type>(size(), tableSize_);
   }
 
   friend std::ostream& operator<<(std::ostream &out, const TermValHash &tvh) {

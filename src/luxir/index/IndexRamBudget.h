@@ -270,6 +270,18 @@ public:
       return true;
     }
 
+    // Grows a draining reservation, e.g. by a flush's transient workspace.
+    // Admission counts it, but pressure discounts it with the rest of the
+    // flushing inverter: it is gone before shedding another inverter could
+    // help.  Pressure is unchanged, so nothing is notified.
+    void growDraining(int64_t delta) {
+      assert(budget != nullptr);
+      assert(draining);
+      assert(delta >= 0);
+      budget->growDraining(delta);
+      bytes += delta;
+    }
+
     void clearDraining() noexcept {
       assert(budget != nullptr);
       assert(draining);
@@ -436,6 +448,12 @@ private:
     return true;
   }
 
+  void growDraining(int64_t delta) {
+    const std::lock_guard<std::mutex> lock(registryMutex);
+    reserved.fetch_add(delta, std::memory_order_relaxed);
+    drainingBytes += delta;
+  }
+
   void clearDraining(int64_t bytes) noexcept {
     CallbackList pressure;
     try {
@@ -557,7 +575,8 @@ public:
   // demand under headroom) - it gates the probe, never decides a shed.  Safe
   // against staleness: same-thread reservation growth is visible to a
   // subsequent read, and cross-thread growth or demand publication pings the
-  // pressure listeners, which re-enter the gated path with the gate true.
+  // pressure listeners, which re-enter the gated path with the gate true
+  // (draining growth does not ping: it cannot create pressure).
   bool pressurePossible() const {
     int64_t cap = total.load(std::memory_order_relaxed);
     if (cap == 0) return false;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <type_traits>
@@ -78,24 +79,45 @@ void sortTermDigits(KeyedTerm<T>* a, size_t n, uint32_t off) {
 
 }  // namespace detail
 
+/// Bytes sortTerms allocates for n terms when `capacity` slots of T are
+/// writable at the terms: none when they can hold its {digit, term} pairs.
+template <class T>
+size_t sortTermsScratchBytes(size_t n, size_t capacity) {
+  if (n < detail::TERM_SORT_MIN_RADIX || capacity * sizeof(T) >= n * sizeof(detail::KeyedTerm<T>)) return 0;
+  return n * sizeof(detail::KeyedTerm<T>);
+}
+
 /// Sorts terms (PackedTerm, or a TermValRef over one) into byte order.
-/// MSD radix on 8-byte digits held in a side array of {digit, term}: the pool
-/// is visited once per digit level (plus compares within small tied runs),
+/// MSD radix on 8-byte digits held in {digit, term} pairs: the pool is
+/// visited once per digit level (plus compares within small tied runs),
 /// where spreadsort::string_sort chases every term pointer on each one-byte
 /// pass. That chase dominates once the terms outgrow cache (standalone, on
 /// natural-language and id-like term sets: 2.5-4.5x at 0.6-1M terms).
-/// Allocates 16 bytes per term while sorting.
+/// The pairs take 16 bytes per term. They are built in place when the
+/// `capacity` slots writable at `terms` (e.g. a compressed hash table, at
+/// load <= 0.5) can hold them, else allocated (see sortTermsScratchBytes).
 template <class T>
   requires std::is_base_of_v<PackedTerm, T>
-void sortTerms(T* terms, size_t n) {
+void sortTerms(T* terms, size_t n, size_t capacity) {
+  using Keyed = detail::KeyedTerm<T>;
+  static_assert(std::is_trivially_copyable_v<T> && alignof(Keyed) == alignof(T));
+  // In place, each move's source and destination are then disjoint.
+  static_assert(sizeof(T) <= offsetof(Keyed, term));
   if (n < detail::TERM_SORT_MIN_RADIX) {
     boost::sort::pdqsort(terms, terms + n, PackedTerm::lessthan());
     return;
   }
-  auto keyed = std::make_unique_for_overwrite<detail::KeyedTerm<T>[]>(n);
-  for (size_t i = 0; i < n; i++) keyed[i].term = terms[i];
-  detail::sortTermDigits(keyed.get(), n, 0);
-  for (size_t i = 0; i < n; i++) terms[i] = keyed[i].term;
+  std::unique_ptr<Keyed[]> scratch;
+  auto* keyed = reinterpret_cast<Keyed*>(terms);
+  if (sortTermsScratchBytes<T>(n, capacity) != 0) {
+    scratch = std::make_unique_for_overwrite<Keyed[]>(n);
+    keyed = scratch.get();
+  }
+  // In place, pair i overlaps only terms at or past i, so spread back to
+  // front and gather front to back. memcpy because the slots change type.
+  for (size_t i = n; i-- > 0;) std::memcpy((void*)&keyed[i].term, &terms[i], sizeof(T));
+  detail::sortTermDigits(keyed, n, 0);
+  for (size_t i = 0; i < n; i++) std::memcpy((void*)&terms[i], &keyed[i].term, sizeof(T));
 }
 
 }  // namespace luxir

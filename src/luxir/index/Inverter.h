@@ -68,12 +68,15 @@ public:
   // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
   CommitInfo* commitInfo = nullptr;
 
-  // This inverter's share of the global indexing RAM budget. Bound (at zero bytes)
-  // by the IndexWriter when it creates the inverter; IndexWriter::releaseInverter
-  // resyncs it to memSize() once per batch; the guard's destructor returns the bytes when
-  // the inverter is destroyed (after its flush completes, or at writer close), so flushing
-  // inverters stay counted until their RAM is actually freed. Not used by the Inverter itself.
+  // This inverter's share of the global indexing RAM budget, bound (at zero bytes) to the
+  // constructor's budget. IndexWriter::releaseInverter resyncs it to memSize() once per
+  // batch; a flush grows it by noteFlushWorkspace; the guard's destructor returns the bytes
+  // when the inverter is destroyed (after its flush completes, or at writer close), so
+  // flushing inverters stay counted until their RAM is actually freed.
   IndexRamBudget::Guard ramGuard;
+
+  // High-water mark of transient flush memory charged to ramGuard.
+  size_t flushWorkspaceBytes = 0;
 
   // The lowest and highest update numbers for this inverter, including deletes.
   // Should be updated by calls to updateVersions() after obtaining the inverter.
@@ -105,9 +108,20 @@ public:
 
   Inverter(luxir::Directory& dir, uint64_t segId, std::shared_ptr<Schema> schema,
            IndexRamBudget* ramBudget = nullptr)
-      : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)) {}
+      : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)),
+        ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
+
+  // Charges transient flush memory a handler holds at once (sort scratch,
+  // uninverted ords, point buffers) to the draining reservation. Handlers
+  // flush one at a time and the reservation is held until the inverter is
+  // destroyed, so it grows to the largest such peak, never shrinking per field.
+  void noteFlushWorkspace(size_t bytes) {
+    if (bytes <= flushWorkspaceBytes) return;
+    if (ramGuard) ramGuard.growDraining((int64_t)(bytes - flushWorkspaceBytes));
+    flushWorkspaceBytes = bytes;
+  }
 
   // An exception that escapes request processing makes this append-only
   // segment unsafe to reuse. The flush pipeline consumes the failed inverter
@@ -225,6 +239,14 @@ public:
     void accountExtraRam(Inverter& inverter, size_t nowBytes) {
       inverter.addExtraRam((int64_t)nowBytes - (int64_t)lastExtraBytes_);
       lastExtraBytes_ = nowBytes;
+    }
+
+    // TermValHash::destructiveSort, with any scratch beyond the table charged
+    // as flush workspace.
+    template <class Hash>
+    static auto sortForFlush(Inverter& inverter, Hash& hash) {
+      inverter.noteFlushWorkspace(hash.sortScratchBytes());
+      return hash.destructiveSort();
     }
 
     friend std::ostream& operator<<(std::ostream &out, const IndexHandler &sf) {
