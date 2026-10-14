@@ -613,13 +613,12 @@ public:
         calcSegment(tg, -1, {});
         return;
       }
-      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
-        DomainHandle domain = domains[(size_t)segnum];
-        assert(domain.isDeliverable());
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          calcSegment(tg, segnum, domain);
-        });
-      }
+      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+        return [this, tg, segnum, domain = domains[segnum]]() {
+          assert(domain.isDeliverable());
+          calcSegment(tg, (int32_t)segnum, domain);
+        };
+      });
     }
 
 

@@ -1,17 +1,22 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include <atomic>
 #include <functional>
+#include <future>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 #include <oneapi/tbb/task_arena.h>
 #include "test/LuxirTest.h"
+#include "test/TaskSpawnCounter.h"
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/log.h"
 #include "luxir/util/proto.h"
+#include "luxir/util/thread.h"
 
 using namespace luxir;
 
@@ -83,6 +88,113 @@ TEST_F(UtilTest, lazyMapBuildsOnRequestingThread) {
       ASSERT_EQ(std::this_thread::get_id(), *builtOn);
     }
   });
+}
+
+TEST_F(UtilTest, taskFanoutKeepsLastOnCaller) {
+  auto caller = std::this_thread::get_id();
+  std::array<std::thread::id, 4> threads, madeOn;
+  std::array<int, 4> values;
+  int64_t spawns;
+  {
+    TaskGroupRunner runner;
+    luxir::test::TaskSpawnCounter counter;
+    task_group_fanout(runner.group(), threads.size(),
+        [&, state = std::make_unique<int>(0)](size_t i) mutable {
+      madeOn[i] = std::this_thread::get_id();
+      int value = ++*state;
+      return [&, i, value]() {
+        threads[i] = std::this_thread::get_id();
+        values[i] = value;
+      };
+    });
+    EXPECT_EQ(caller, threads.back());
+    runner.join();
+    spawns = counter.count();
+  }
+  EXPECT_EQ(3, spawns);
+  for (auto thread : madeOn) EXPECT_EQ(caller, thread);
+  EXPECT_EQ((std::array<int, 4>{1, 2, 3, 4}), values);
+
+  std::vector<int> order;
+  task_group_fanout(nullptr, 4, [&](size_t i) {
+    return [&, i]() { order.push_back((int)i); };
+  });
+  EXPECT_EQ((std::vector<int>{0, 1, 2, 3}), order);
+}
+
+TEST_F(UtilTest, taskFanoutEmptyAndUnaryStayOnCaller) {
+  int completed = 0;
+  auto caller = std::this_thread::get_id();
+  int64_t spawns;
+  {
+    TaskGroupRunner runner;
+    luxir::test::TaskSpawnCounter counter;
+    task_group_fanout(runner.group(), 0, [&](size_t) {
+      ADD_FAILURE() << "empty fan-out invoked its factory";
+      return [&]() { completed++; };
+    });
+    EXPECT_EQ(0, completed);
+    task_group_fanout(runner.group(), 1, [&](size_t i) {
+      EXPECT_EQ(0u, i);
+      EXPECT_EQ(caller, std::this_thread::get_id());
+      return [&]() {
+        EXPECT_EQ(caller, std::this_thread::get_id());
+        completed++;
+      };
+    });
+    runner.join();
+    spawns = counter.count();
+  }
+  EXPECT_EQ(1, completed);
+  EXPECT_EQ(0, spawns);
+}
+
+TEST_F(UtilTest, taskGroupRunnerForksAreNotCounted) {
+  std::atomic<int> completed{0};
+  int64_t spawns;
+  {
+    TaskGroupRunner runner;
+    luxir::test::TaskSpawnCounter counter;
+    runner.run(true, [&] { completed.fetch_add(1); });
+    runner.join();
+    spawns = counter.count();
+  }
+  EXPECT_EQ(1, completed.load());
+  EXPECT_EQ(0, spawns);
+}
+
+TEST_F(UtilTest, taskFanoutInlineFailureDrainsSiblings) {
+  for (bool failFactory : {false, true}) {
+    SCOPED_TRACE(failFactory);
+    std::promise<void> started, release;
+    auto starting = started.get_future();
+    auto released = release.get_future();
+    std::atomic<bool> completed{false};
+    oneapi::tbb::task_arena arena(2);
+    arena.execute([&] {
+      auto fail = [&] {
+        EXPECT_EQ(std::future_status::ready, starting.wait_for(std::chrono::seconds(10)));
+        release.set_value();
+        throw std::runtime_error("stop");
+      };
+      EXPECT_THROW({
+        TaskGroupRunner runner;
+        task_group_fanout(runner.group(), 2, [&](size_t i) {
+          if (failFactory && i == 1) fail();
+          return [&, i]() {
+            if (i == 0) {
+              started.set_value();
+              released.wait();
+              completed.store(true);
+            } else {
+              fail();
+            }
+          };
+        });
+      }, std::runtime_error);
+    });
+    EXPECT_TRUE(completed.load());
+  }
 }
 
 TEST_F(UtilTest, lazyMap) {

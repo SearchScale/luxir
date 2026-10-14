@@ -1895,27 +1895,23 @@ public:
             [limit = request.candidates]() { return new ScanAccumulator(limit); },
             [](ScanAccumulator* acc) { delete acc; });
           // Each search() round is a barrier: the host's deepen decision
-          // needs the whole merged pool.  TaskGroupRunner runs every unit
-          // inline when not spawning (serial requests take the same code
-          // path and produce the same result), and its destructor owns the
-          // unwind: if an inline unit throws, it cancels and drains the
-          // spawned tasks without double-throwing.
+          // needs the whole merged pool. The caller runs the final unit;
+          // TaskGroupRunner cancels and drains siblings if it throws.
           bool spawnTasks = parallel && units.size() > 1;
           if (spawnTasks) {
             parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
           }
           TaskGroupRunner runner;
-          for (const auto& unit : units) {
-            runner.run(spawnTasks, [this, &unit, &request, &merger]() {
+          task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(),
+              [&](size_t i) {
+            return [this, unit = units[i], &request, &merger]() {
               VectorSearchResult part = scanUnit(unit, request);
-              // unique_ptr guards the obtained accumulator: a throw between
-              // obtain and release would otherwise orphan it (the merger
-              // only frees what is parked in its slot).
+              // Guard the accumulator until it is parked in the merger.
               std::unique_ptr<ScanAccumulator> acc(merger.obtain());
               foldPart(*acc, part);
               merger.release(acc.release());
-            });
-          }
+            };
+          });
           runner.join();
 
           ScanAccumulator* acc = merger.getData();
@@ -2241,23 +2237,23 @@ private:
       merger.release(acc.release());
     };
 
-    // TaskGroupRunner owns the unwind path: if an inline (under-grain)
-    // bucket throws while spawned buckets are in flight, its destructor
-    // cancels and drains them instead of letting ~task_group double-throw.
-    TaskGroupRunner runner;
+    // Cancel and drain published buckets if a caller-side bucket throws.
     int64_t grain = std::max<int64_t>(1, rescoreTaskGrainCandidates);
+    std::vector<std::pair<size_t, size_t>> tasks, local;
     for (size_t b = 0; b < candidates.size();) {
-      int32_t segOrd = candidates[b].segOrd;
       size_t e = b + 1;
-      while (e < candidates.size() && candidates[e].segOrd == segOrd) e++;
-      // A bucket spawns only above the grain, and never when it is the whole
-      // pool (a single bucket gains nothing from a worker hand-off).
-      bool spawn = parallel
-        && (int64_t)(e - b) >= grain
-        && !(b == 0 && e == candidates.size());
-      runner.run(spawn, [&rescoreBucket, b, e]() { rescoreBucket(b, e); });
+      while (e < candidates.size() && candidates[e].segOrd == candidates[b].segOrd) e++;
+      if (!parallel) rescoreBucket(b, e);
+      else if ((int64_t)(e - b) >= grain || e == candidates.size()) tasks.emplace_back(b, e);
+      else local.emplace_back(b, e);
       b = e;
     }
+    TaskGroupRunner runner;
+    task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(), [&](size_t i) {
+      auto [b, e] = tasks[i];
+      return [&rescoreBucket, b, e]() { rescoreBucket(b, e); };
+    });
+    for (auto [b, e] : local) rescoreBucket(b, e);
     runner.join();
 
     RescoreAccumulator* acc = merger.getData();

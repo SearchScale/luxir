@@ -337,6 +337,10 @@ public:
       return parent;
     }
 
+    // calc and calcAll execute their own work synchronously. Only sibling
+    // fan-outs through task_group_fanout publish work. Published tasks own
+    // their captures or reference calculator members that outlive the
+    // request group.
     // If domain.get()==nullptr, then the domain consists of all documents in
     // the segment. Non-null domains crossing this boundary carry their
     // lifetime with them.
@@ -359,16 +363,14 @@ public:
         calc(tg, -1, {});
         return;
       }
-      // task_group runs locally submitted tasks from a stack. Ascending
-      // submission lets later segments, which are typically smaller, begin
-      // on this thread first while earlier segments are available to steal.
-      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
-        DomainHandle domain = domains[(size_t)segnum];
-        assert(domain.isDeliverable());
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          calc(tg, segnum, domain);
-        });
-      }
+      // Ascending submission leaves the last, typically smaller segment on
+      // this thread while earlier segments are available to steal.
+      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+        return [this, tg, segnum, domain = domains[segnum]]() {
+          assert(domain.isDeliverable());
+          calc(tg, (int32_t)segnum, domain);
+        };
+      });
     }
 
     virtual ~Calculator() = default;

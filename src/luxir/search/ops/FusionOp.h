@@ -238,9 +238,7 @@ public:
       // write before doFusion reads it.
       if (segnum <= 0) taskGroup = tg;
       if (needsPrepare) {
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          doPrepareDomain(tg, segnum, domain);
-        });
+        doPrepareDomain(tg, segnum, std::move(domain));
         return;
       }
       doCalc(tg, segnum, domain);
@@ -313,11 +311,11 @@ public:
         segFilters[(size_t)i] = buildSharedFilter(i, baseDomainViews[(size_t)i]);
       }
 
-      for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
-        task_group_run(tg, [this, tg, i]() {
-          dispatchSources(tg, i, segFilters[(size_t)i]);
-        });
-      }
+      task_group_fanout(tg, segFilters.size(), [&](size_t i) {
+        return [this, tg, i, filter = segFilters[i]]() {
+          dispatchSources(tg, (int32_t)i, filter);
+        };
+      });
     }
 
     void doCalc(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -347,9 +345,13 @@ public:
       // filter as its domain.  The source will intersect with its own
       // filterWeights, collect top-K, and ultimately invoke rankingSink
       // which lands in acceptSourceRanking below.
-      for (auto& sc : sourceCalcs) {
-        sc->calc(tg, segnum, sharedFilter);
-      }
+      task_group_fanout(segnum < 0 ? nullptr : tg, sourceCalcs.size(),
+          [&](size_t i) {
+        auto* sourceCalc = sourceCalcs[i].get();
+        return [sourceCalc, tg, segnum, sharedFilter]() {
+          sourceCalc->calc(tg, segnum, sharedFilter);
+        };
+      });
     }
 
     // Called by each source TopDocsReq's rankingSink when its top-K is
@@ -446,12 +448,15 @@ public:
           // An empty segment needs an empty set: a null domain means all docs.
           fusedDomains.emplace_back(builder.build());
         }
-        for (auto& sub : subCalcs) sub->calcAll(taskGroup, fusedDomains);
       }
+
+      task_group_fanout(fusedDomains.empty() ? nullptr : taskGroup, subCalcs.size(), [&](size_t i) {
+        auto* subCalc = subCalcs[i].get();
+        return [this, subCalc]() { subCalc->calcAll(taskGroup, fusedDomains); };
+      });
 
       int64_t numCollected = std::min((int64_t)fusedList.size(), op.topCount);
       int64_t totalHits = (int64_t)fused.size();
-
       auto getDocList = [this](SearchResponse* resp) -> luxir::api::DocList& {
         return *slotArm<luxir::api::DocList>(resp);
       };

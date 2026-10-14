@@ -10,6 +10,7 @@
 #include <limits>
 #include <functional>
 #include "SearchOp.h"
+#include "luxir/util/Signal.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/QueryShape.h"
 #include "luxir/search/SearchOverrides.h"
@@ -732,9 +733,7 @@ public:
         return;
       }
       if (!requiresWholeIndexPrepare) {
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          doCollect(tg, segnum, domain);
-        });
+        doCollect(tg, segnum, std::move(domain));
         return;
       }
 
@@ -744,7 +743,7 @@ public:
       auto count =
           gatheredDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
       if (count != (int32_t)thisOp().req.reader->segments().size()) return;
-      startPrepare(tg);
+      prepareAndDispatch(tg);
     }
 
     void calcAll(oneapi::tbb::task_group* tg,
@@ -763,7 +762,7 @@ public:
         assert(inputDomains[i].isDeliverable());
         inputDomainViews[i] = inputDomains[i].get();
       }
-      startPrepare(tg);
+      prepareAndDispatch(tg);
     }
 
     Query::ScorerSupplier* mainScorerSupplier(MemPool& pool, IndexReader::Segment& seg) {
@@ -1090,12 +1089,6 @@ public:
         subCalc->calcAll(tg, noDomains);
       }
       doneCollecting();
-    }
-
-    void startPrepare(oneapi::tbb::task_group* tg) {
-      task_group_run(tg, [this, tg]() {
-        prepareAndDispatch(tg);
-      });
     }
 
     void prepareMainVariants(oneapi::tbb::task_group* tg) {
@@ -1429,9 +1422,8 @@ public:
       // (fieldSortVisitOrder). Sequentially, one collector then carries its
       // heap from segment to segment, so the segments holding the best keys
       // go first. In parallel the segments are spawned in reverse:
-      // task_group::run pushes onto this thread's deque, which it pops
-      // LIFO, so this thread collects best first and its heap fills with
-      // good keys early. Thieves steal from the other end, the worst
+      // the best segment is the final index and runs inline, so this
+      // thread's heap fills with good keys early. Thieves steal the worst
       // segments, with heaps of their own.
       auto& op = thisOp();
       std::vector<int32_t> order;
@@ -1442,15 +1434,13 @@ public:
             fieldSortSegmentKeys(*op.req.reader, op.sortPlan, op.sortValues),
             op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
       }
-      for (size_t i = 0; i < domains.size(); i++) {
-        size_t at = tg == nullptr ? i : domains.size() - 1 - i;
-        int32_t segnum = order.empty() ? (int32_t)i : order[at];
-        DomainHandle domain = domains[(size_t)segnum];
-        assert(domain.isDeliverable());
-        task_group_run(tg, [this, tg, segnum, domain]() {
+      task_group_fanout(tg, domains.size(), [&](size_t i) {
+        int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
+        return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
+          assert(domain.isDeliverable());
           doCollect(tg, segnum, domain);
-        });
-      }
+        };
+      });
     }
 
     std::vector<DomainHandle> materializeRoutedFilters(
@@ -2491,58 +2481,39 @@ public:
           }
         }
       }
-      // For maximum parallelism, we want to launch sub-tasks that depend on matching documents
-      // as soon as we have that set.  Releasing the collector below could end up
-      // doing a substantial amount of work.
-
-      // since tasks are executed on a stack, push sub-calculators in reverse order.
-      // directly calling a sub-calculator would be beneficial since the domain
-      // we just calculated will still be in cache.
-      // The downside is that it could delay loading stored fields.
-      // We could launch fillQueryTopNResponse as a sub-task and then
-      // launch the sub-calculators in parallel after that.
-      for (int i = subCalcs.size() - 1; i >= 0; i--) {
-        // TODO: launch sub-calculators in parallel (except for the first one).
+      auto childDomain = [&](size_t child) {
         DomainHandle newDomain;
         if (routedProduction.has_value()) {
           assert(subCalcs.size() == subCalcVariants.size());
-          size_t variant = subCalcVariants[(size_t) i];
+          size_t variant = subCalcVariants[child];
           assert(variant < routedProduction->domains.size());
           if (variant == 0 && !routedProduction->inheritReady) {
-            newDomain = matchEverything
-                ? domainHandle : output[(size_t)segnum];
+            newDomain = matchEverything ? domainHandle : output[(size_t)segnum];
           } else {
-            if (op.domainVariants.frame(variant)
-                == DomainVariantPlan::Frame::INHERIT) {
+            if (op.domainVariants.frame(variant) == DomainVariantPlan::Frame::INHERIT) {
               assert(routedProduction->inheritReady);
             }
             newDomain = routedProduction->domains[variant];
           }
         } else {
-          newDomain = matchEverything
-              ? domainHandle : output[(size_t)segnum];
+          newDomain = matchEverything ? domainHandle : output[(size_t)segnum];
         }
         assert(newDomain.isDeliverable());
-        subCalcs[i]->calc(tg, segnum, std::move(newDomain));
-      }
-
-      // Releasing the collector as soon as possible can save merging work.
-      // On the other hand, it could delay the sub-calculators and spoil
-      // the domain (which should be in the CPU cache).
+        return newDomain;
+      };
+      // Consume the domain while it is in cache and make siblings available
+      // before merging the collector. The first child stays on this thread.
+      task_group_fanout(tg, subCalcs.size(), [&](size_t i) {
+        size_t child = subCalcs.size() - 1 - i;
+        auto* subCalc = subCalcs[child].get();
+        auto domain = childDomain(child);
+        return [subCalc, tg, segnum, domain = std::move(domain)]() {
+          Signal::emit("searchTopDocsChildStart", subCalc);
+          subCalc->calc(tg, segnum, domain);
+        };
+      });
       auto count = collectorMerger.release(data.release());
-      if (count == numSegs) {
-        // we are done, so we can call the callback
-        // we could use a nested task_group to wait until we are done here as well.
-
-        // If there are sub-calculators that can run, lanch a separate task
-        // for field loading.
-        auto* tgFieldLoad = subCalcs.size() > 0 ? tg : nullptr;
-        task_group_run(tgFieldLoad, [this]() {doneCollecting();});
-      }
-
-
-
-
+      if (count == numSegs) doneCollecting();
     }
 
     void doneCollecting() {

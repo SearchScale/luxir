@@ -1241,16 +1241,10 @@ public:
 
     void prepareAndDispatch(oneapi::tbb::task_group* tg) {
       prepareGatheredDomains(tg);
-      for (int32_t segnum = 0; segnum < (int32_t)input.size(); segnum++) {
-        task_group_run(tg, [this, segnum]() {
-          collectInputSegment(segnum, input[(size_t)segnum].get());
-        });
-      }
-    }
-
-    void startGatheredDispatch(oneapi::tbb::task_group* tg) {
-      task_group_run(tg, [this, tg]() {
-        prepareAndDispatch(tg);
+      task_group_fanout(tg, input.size(), [&](size_t segnum) {
+        return [this, segnum, domain = input[segnum]]() {
+          collectInputSegment((int32_t)segnum, domain.get());
+        };
       });
     }
 
@@ -1347,7 +1341,7 @@ public:
       int32_t seen = gatheredDomainsSeen.fetch_add(
           1, std::memory_order_acq_rel) + 1;
       assert(seen <= (int32_t)input.size());
-      if (seen == (int32_t)input.size()) startGatheredDispatch(tg);
+      if (seen == (int32_t)input.size()) prepareAndDispatch(tg);
     }
 
     void calcAll(oneapi::tbb::task_group* tg,
@@ -1365,7 +1359,7 @@ public:
       for (const DomainHandle& domain : input) {
         assert(domain.isDeliverable());
       }
-      startGatheredDispatch(tg);
+      prepareAndDispatch(tg);
     }
   };
 };
