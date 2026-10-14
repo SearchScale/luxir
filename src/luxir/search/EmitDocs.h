@@ -43,6 +43,7 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/util/Signal.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
@@ -803,6 +804,12 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
   // An empty page still produces exactly one final DocList. Resumption only
   // happens after a non-final batch, with ranked documents left to emit.
   do {
+    // A request that already failed (a sibling op threw while this stream
+    // was paused) emits nothing more; the error goes out in the final response.
+    {
+      std::lock_guard<std::mutex> lock(req.mutex);
+      if (req.lastResponse->proto.error.has_value()) return true;
+    }
     int64_t batchEnd = batchStart + std::min<int64_t>(maxBatchSize, numCollected - batchStart);
     int64_t batchSizeLocal = batchEnd - batchStart;
 
@@ -841,8 +848,16 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     int columnSize = (int)segDocs.size();
     docListProto.row_count = columnSize;
 
+    // An isolated context: cancellation of the request group, or of whatever
+    // context a resumed emitter runs in, must not skip loaders and leave a
+    // batch's columns unfilled. Only a loader's own exception ends the wait.
+    std::optional<oneapi::tbb::task_group_context> loadColumnsContext;
     std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
-    oneapi::tbb::task_group* tg = parallel ? &loadColumnsTaskGroup.emplace() : nullptr;
+    oneapi::tbb::task_group* tg = nullptr;
+    if (parallel) {
+      auto& context = loadColumnsContext.emplace(oneapi::tbb::task_group_context::isolated);
+      tg = &loadColumnsTaskGroup.emplace(context);
+    }
 
     bool returnScores = getScores;
 
@@ -1012,6 +1027,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 
     loadFields(tg, loaders, runs);
     if (tg != nullptr) {
+      Signal::emit("emitDocsColumnsWait", &req, tg);
       tg->wait();
     }
     tgJoin.tg = nullptr;  // joined normally
@@ -1044,6 +1060,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       loadStoredFields(req, resourceName, std::move(reqs), segDocs, fittedRuns, pendingLoaders, mr);
       loadFields(tg, loaders, fittedRuns);
       if (tg != nullptr) {
+        Signal::emit("emitDocsStoredWait", &req, tg);
         tg->wait();
       }
       tgJoin.tg = nullptr;
