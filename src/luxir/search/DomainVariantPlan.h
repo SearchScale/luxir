@@ -499,18 +499,23 @@ public:
     selection.offers[selection.count++] = {
         Offer::INDEPENDENT, independentCost,
         saturatedMultiply(produced + 2, setBytes)};
-    std::sort(
-        selection.offers.begin(),
-        selection.offers.begin() + (std::ptrdiff_t) selection.count,
-        [](const CostedOffer& left, const CostedOffer& right) {
-          if (left.cpuCost != right.cpuCost) {
-            return left.cpuCost < right.cpuCost;
-          }
-          if (left.peakBytes != right.peakBytes) {
-            return left.peakBytes < right.peakBytes;
-          }
-          return (uint8_t) left.offer < (uint8_t) right.offer;
-        });
+    auto less = [](const CostedOffer& left, const CostedOffer& right) {
+      if (left.cpuCost != right.cpuCost) return left.cpuCost < right.cpuCost;
+      if (left.peakBytes != right.peakBytes) return left.peakBytes < right.peakBytes;
+      return (uint8_t)left.offer < (uint8_t)right.offer;
+    };
+    // There are at most three offers. A bounded insertion sort also avoids
+    // GCC's array-bounds false positives in std::sort's introsort machinery.
+    for (size_t i = 1; i < selection.offers.size(); i++) {
+      if (i >= selection.count) break;
+      auto offer = selection.offers[i];
+      size_t j = i;
+      while (j != 0 && less(offer, selection.offers[j - 1])) {
+        selection.offers[j] = selection.offers[j - 1];
+        j--;
+      }
+      selection.offers[j] = offer;
+    }
     if (forcedOfferForTests.has_value()) {
       auto forced = std::find_if(
           selection.offers.begin(),
