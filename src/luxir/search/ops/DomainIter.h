@@ -251,28 +251,23 @@ void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
     return;
   }
 
-  // Bitset domain (skip to set bits) or null domain (every doc): dense scan with
-  // the block-decoding BulkIterator.
+  // Bitset domain or null domain (every doc): dense scan with the
+  // block-decoding BulkIterator. One loop per domain and value shape, so each
+  // loop carries only its own shape's per-document work. A bitset domain is
+  // drained a word at a time; nextSetBit only finds the next nonempty word.
   const FixedBitSet* bits = nullptr;
   if (domain) {
     bits = &((BitDocSet*) domain)->bits();
   }
-  IntColReader::Iterator intColIter(intColReader);
-  int32_t docid = -1;
-  while (docid + 1 < maxDoc) {
-    if (bits) {
-      docid = bits->nextSetBit(docid + 1);
-      if (docid >= maxDoc) {
-        break;
+  auto scan = [&]<bool Bits, bool Multi>() LUXIR_INLINE {
+    IntColReader::Iterator intColIter(intColReader);
+    auto visit = [&](int32_t docid) LUXIR_INLINE {
+      if (intColIter.docId() < docid) {
+        intColIter.advance(docid);
       }
-    } else {
-      docid++;
-    }
-    if (intColIter.docId() < docid) {
-      intColIter.advance(docid);
-    }
-    if (intColIter.docId() == docid) {
-      if (!intColReader.multiValued()) {
+      if (intColIter.docId() != docid) {
+        missing_num++;
+      } else if constexpr (!Multi) {
         callback(docid, intColIter.value());
       } else {
         auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
@@ -281,9 +276,32 @@ void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
           callback(docid, intColIter.values().valueAt(start + vrank));
         }
       }
+    };
+    if constexpr (Bits) {
+      int32_t docid = bits->nextSetBit(0, maxDoc);
+      while (docid < maxDoc) {
+        int32_t base = docid & ~63;
+        uint64_t word = bits->words[(uint32_t) docid >> 6] & (~0ULL << (docid & 63));
+        if (maxDoc - base < 64) {
+          word &= (1ULL << (maxDoc - base)) - 1;
+        }
+        do {
+          visit(base + std::countr_zero(word));
+          word &= word - 1;
+        } while (word != 0);
+        docid = bits->nextSetBit(base + 64, maxDoc);
+      }
     } else {
-      missing_num++;
+      for (int32_t docid = 0; docid < maxDoc; docid++) {
+        visit(docid);
+      }
     }
+  };
+  bool multi = intColReader.multiValued();
+  if (bits) {
+    multi ? scan.template operator()<true, true>() : scan.template operator()<true, false>();
+  } else {
+    multi ? scan.template operator()<false, true>() : scan.template operator()<false, false>();
   }
 }
 

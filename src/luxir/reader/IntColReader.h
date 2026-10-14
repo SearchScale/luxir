@@ -230,7 +230,9 @@ public:
       return index_;
     }
 
-    int64_t valueAt(int64_t index) {
+    // Always inlined, like the doc iterator's advance: the column walks call
+    // it once per value, and only the frame decode belongs out of line.
+    LUXIR_INLINE int64_t valueAt(int64_t index) {
       assert(index >= 0 && index < column.numValues());
       if (index < decodedStart || index >= decodedEnd) decode(index);
       return decoded[index - decodedStart];
@@ -598,7 +600,7 @@ public:
       return values.advance(target);
     }
 
-    int64_t valueAt(int64_t index) {
+    LUXIR_INLINE int64_t valueAt(int64_t index) {
       return values.valueAt(index);
     }
   };
@@ -642,7 +644,7 @@ public:
 
     /// for single-valued fields only!  For multi-valued
     /// use values() to get the start and end ranks.
-    int64_t value() {
+    LUXIR_INLINE int64_t value() {
       return valueIter.valueAt(docRank);
     }
 
