@@ -648,7 +648,11 @@ public:
 
     // TODO: directly expose docsIter (or the screaming set) here to enable bulk / direct operations on them?
 
-    int32_t advance(int32_t target) {
+    // Always inlined: the facet and stats column walks call this once per
+    // document, and its dense branch is a few instructions. Leaving it to the
+    // inliner made it an out-of-line call whenever another caller appeared
+    // elsewhere in the translation unit (int facets ran 40-67% slower).
+    LUXIR_INLINE int32_t advance(int32_t target) {
       if (dense) {
         if (target >= maxRank) {
           doc = ENDDOC;
@@ -663,7 +667,7 @@ public:
     }
 
     // returns the docid corresponding to the next value
-    int32_t next() {
+    LUXIR_INLINE int32_t next() {
       if (docRank + 1 >= maxRank) {
         doc = ENDDOC;
         return doc;
