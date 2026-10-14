@@ -1909,13 +1909,25 @@ public:
     if (fusionProto.sources.empty()) {
       throw std::runtime_error("Fusion requires at least one source");
     }
-    if (!fusionProto.rrf.has_value()) {
-      throw std::runtime_error("Fusion requires a fusion method (only RRF is supported)");
+    FusionOp::Method method = FusionOp::Method::RRF;
+    int32_t rrfK = 60;
+    if (const auto* rrf = std::get_if<luxir::api::RrfFusion>(&fusionProto.method)) {
+      if (rrf->k.has_value() && *rrf->k < 0) {
+        throw std::runtime_error("RrfFusion.k must be >= 0");
+      }
+      rrfK = rrf->k.value_or(60);
+    } else if (const auto* linear =
+                   std::get_if<luxir::api::LinearFusion>(&fusionProto.method)) {
+      using Normalization = luxir::api::LinearFusion::Normalization;
+      if (linear->normalization != Normalization::MIN_MAX) {
+        throw std::runtime_error("fusion '" + std::string(name)
+            + "': unsupported LinearFusion.normalization "
+            + std::to_string((int)linear->normalization));
+      }
+      method = FusionOp::Method::LINEAR_MIN_MAX;
+    } else {
+      throw std::runtime_error("Fusion requires a fusion method (rrf or linear)");
     }
-    if (fusionProto.rrf->k.has_value() && *fusionProto.rrf->k < 0) {
-      throw std::runtime_error("RrfFusion.k must be >= 0");
-    }
-    int32_t rrfK = fusionProto.rrf->k.value_or(60);
 
     auto sourceEntries = lastWins(fusionProto.sources);  // dedup duplicate source names, last-wins
     std::vector<std::string_view> sourceNames;
@@ -1941,6 +1953,12 @@ public:
       size_t idx = sources.size();
       auto* src = parseTopDocs(
           srcName, *srcProto, TopDocsPlacement::FUSION_SOURCE);
+      // Linear fusion normalizes relevance scores; a field-sorted source
+      // ranks by something else and carries no score to normalize.
+      if (method != FusionOp::Method::RRF && src->sortPlan.useFieldSort) {
+        throw std::runtime_error("fusion '" + std::string(name) + "': linear fusion source '"
+            + std::string(srcName) + "' must rank by score; use rrf for sorted sources");
+      }
       src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
         static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
       };
@@ -1981,7 +1999,8 @@ public:
 
     auto* fusion = luxir::arenaCreate<FusionOp>(
       req.arena, req, name, fusionProto, std::move(sources),
-      std::move(sourceWeights), topCount, sharedFilters, sharedFilterWeights, rrfK);
+      std::move(sourceWeights), topCount, sharedFilters, sharedFilterWeights,
+      method, rrfK);
 
     // Sources are children of this FusionOp in the SearchOp tree but not
     // in `subOps` (different lifecycle - they deliver via rankingSink

@@ -149,9 +149,10 @@ message Fusion {
   // Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 3;
 
-  // Required fusion method.
+  // Required fusion method: exactly one.
   oneof method {
     RrfFusion rrf = 10;
+    LinearFusion linear = 11;
   }
 
   // Response shape (mirrors TopDocs).
@@ -185,6 +186,24 @@ message Fusion {
 // Fusion.weights.
 message RrfFusion {
   optional int32 k = 1;  // rank-smoothing constant, >= 0; unset selects 60
+}
+
+// Weighted linear fusion of normalized scores: fused_score(d) = sum over
+// sources s of weight_s * normalized_s(d), where weight_s comes from
+// Fusion.weights and sources without d contribute nothing. Each source's
+// scores are normalized over its ranked list after merging across segments.
+// Sources must rank by relevance score: a source with a sort other than
+// score descending (optionally followed by _docid_ ascending) is rejected.
+message LinearFusion {
+  enum Normalization {
+    // (score - min) / (max - min) over the source's ranked list, so its best
+    // document gets 1 and its worst gets 0. A list whose scores are all
+    // equal (including a single document) normalizes every document to 1.
+    // NaN scores contribute 0 and are left out of min and max; +inf
+    // normalizes to 1 and -inf to 0.
+    MIN_MAX = 0;
+  }
+  Normalization normalization = 1;  // unset selects MIN_MAX
 }
 
 message SortSpec {

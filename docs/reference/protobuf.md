@@ -119,6 +119,7 @@ defaults and constraints are described in the comments and guides.
 - [`JemallocStats`](#message-luxir.jemallocstats)
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
+- [`LinearFusion`](#message-luxir.linearfusion)
 - [`ListCollectionsResponse`](#message-luxir.listcollectionsresponse)
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
@@ -883,7 +884,7 @@ Hybrid-search fusion: run several source queries (each a full TopDocs spec) and 
 
 **oneof `method`:** at most one member can be set.
 
-Required fusion method.
+Required fusion method: exactly one.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
@@ -891,6 +892,7 @@ Required fusion method.
 | <a id="field-luxir.fusion.filter"></a>[`filter`](#field-luxir.fusion.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated | Filters applied to every source. except\_ops is not supported here or in source filters. |
 | <a id="field-luxir.fusion.limit"></a>[`limit`](#field-luxir.fusion.limit) | 3 | `sint64` | optional | Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.fusion.rrf"></a>[`rrf`](#field-luxir.fusion.rrf) | 10 | [`RrfFusion`](#message-luxir.rrffusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
+| <a id="field-luxir.fusion.linear"></a>[`linear`](#field-luxir.fusion.linear) | 11 | [`LinearFusion`](#message-luxir.linearfusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused document; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
 | <a id="field-luxir.fusion.get_number"></a>[`get_number`](#field-luxir.fusion.get_number) | 5 | `bool` | singular | return the number of distinct documents in the source union |
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
@@ -1033,6 +1035,18 @@ Search effort for IVF indexes.
 |---|---|---|---|---|
 | <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if this field were one IVF index with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap search effort. |
 | <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of live vectors to scan, in \[0,1\]. 0 = no floor. |
+
+<a id="message-luxir.linearfusion"></a>
+
+### luxir.LinearFusion
+
+Weighted linear fusion of normalized scores: fused\_score(d) = sum over sources s of weight\_s \* normalized\_s(d), where weight\_s comes from Fusion.weights and sources without d contribute nothing. Each source's scores are normalized over its ranked list after merging across segments. Sources must rank by relevance score: a source with a sort other than score descending (optionally followed by \_docid\_ ascending) is rejected.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.linearfusion.normalization"></a>[`normalization`](#field-luxir.linearfusion.normalization) | 1 | [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization) | singular | unset selects MIN\_MAX |
 
 <a id="message-luxir.listcollectionsresponse"></a>
 
@@ -1827,6 +1841,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
+- [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
@@ -1928,6 +1943,16 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.fielddef.longterms.truncate"></a>[`TRUNCATE`](#value-luxir.fielddef.longterms.truncate) | 0 | keep a UTF-8-safe prefix of at most 255 bytes; values may merge |
 | <a id="value-luxir.fielddef.longterms.reject"></a>[`REJECT`](#value-luxir.fielddef.longterms.reject) | 1 | reject overlong terms |
 | <a id="value-luxir.fielddef.longterms.hash128"></a>[`HASH128`](#value-luxir.fielddef.longterms.hash128) | 2 | prefix of at most 230 bytes plus 25 base36 hash digits |
+
+<a id="enum-luxir.linearfusion.normalization"></a>
+
+### luxir.LinearFusion.Normalization
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.linearfusion.normalization.min_max"></a>[`MIN_MAX`](#value-luxir.linearfusion.normalization.min_max) | 0 | (score - min) / (max - min) over the source's ranked list, so its best document gets 1 and its worst gets 0. A list whose scores are all equal (including a single document) normalizes every document to 1. NaN scores contribute 0 and are left out of min and max; +inf normalizes to 1 and -inf to 0. |
 
 <a id="enum-luxir.match.operator"></a>
 
