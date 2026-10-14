@@ -30,16 +30,23 @@ static void BM_CollapseTopDocs(benchmark::State& state, int32_t mode) {
         int32_t freq = doc < sizes[0] / 10 ? 8 : doc < sizes[0] / 2 ? 3 : 1;
         for (int32_t word = 0; word < 16; word++) body += word < freq ? "alpha " : "beta ";
         docs.push_back(flatdoc("id", std::to_string(id), "body_w", body,
-            "key_s", "g" + std::to_string(id % nGroups), "sort_i", (int64_t)(id * 37 % nDocs)));
+            "key_s", "g" + std::to_string(id % nGroups), "sort_i", (int64_t)(id * 37 % nDocs), "seq_i", (int64_t)id + 1, "sort_s", "s" + std::to_string(id * 17 % 101)));
       }
       ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     }
   }
 
-  std::string json = R"({"collection":"collapse_bm","query":"body_w:alpha","fields":["_score_"],"limit":)"
-      + std::to_string(mode == 3 ? -1 : 100);
-  if (mode == 1) json += R"(,"sort":"sort_i asc")";
-  if (mode == 2) json += R"(,"collapse":"key_s")";
+  bool churn = mode == 4 || mode == 5;
+  std::string query = churn ? "rescore(*:*, seq_i)" : "body_w:alpha";
+  bool unscored = mode == 6 || mode == 7 || mode >= 9;
+  std::string fields = unscored ? R"([])" : R"(["_score_"])";
+  std::string json = R"({"collection":"collapse_bm","query":")" + query
+      + R"(","fields":)" + fields + R"(,"limit":)" + std::to_string((mode == 3 || mode == 9 || mode == 10) ? -1 : churn ? 10 : 100);
+  if (mode == 1 || mode == 6 || mode == 9 || mode == 11) json += R"(,"sort":"sort_i asc")";
+  if (mode == 7 || mode == 10 || mode == 12) json += R"(,"sort":"sort_s desc")";
+  if (mode == 8) json += R"(,"sort":["sort_i desc","score desc"])";
+  if (mode == 2 || mode == 4 || (mode >= 6 && mode <= 8)) json += R"(,"collapse":"key_s")";
+  if (mode == 5) json += R"(,"collapse":{"field":["key_s","sort_i"]})";
   json += '}';
   // Warm the reader/OrdMap and record decode work outside the timing loop.
   {
@@ -71,3 +78,13 @@ LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, docs_score, 0);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, docs_field, 1);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_score, 2);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, exhaustive_docs, 3);
+
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, churn_score, 4);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, churn_tuple, 5);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_field_numeric, 6);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_field_string, 7);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_field_score_secondary, 8);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, exhaustive_field_numeric, 9);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, exhaustive_field_string, 10);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, docs_field_unscored, 11);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, docs_field_string, 12);

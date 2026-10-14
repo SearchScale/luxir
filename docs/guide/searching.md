@@ -154,56 +154,75 @@ POST /collections/books/_search
 
 ## Collapsing results
 
-`collapse` returns one head document per distinct key. In this initial
-implementation the list is ordered by score: each group's head is its best
-matching member, with document ties broken by the reader's document order.
-Groups with equal scores compare by key (null before a value, tuples
-lexicographically, ordinary keys before singleton groups). For example:
+Use `collapse` to return one document per distinct key, such as one result
+per product when several matching documents describe the same product.
+Each group returns its best matching document according to `sort`, or by
+score when no sort is specified. For example:
 
 ```json
 {
   "query": "title_t:jacket",
   "collapse": "product_id_s",
-  "limit": 10,
+  "sort": "price_i asc",
+  "limit": 2,
   "get_number": true,
-  "fields": ["id", "title_t"]
+  "fields": ["id", "title_t", "price_i"]
 }
 ```
 
-`limit` and `offset` count groups. `get_number` returns exact `found` (groups)
-and `found_docs` (eligible matching documents before paging). `limit: 0`
-returns totals only; `limit: -1` returns all groups and retains O(groups)
-ranking state. Counts require reading every eligible key; without counts,
-competitive-score pruning remains enabled.
+If five matching documents describe three products, a response might be:
 
-A key uses value binding and must be a single-valued STRING or ID with an
-index and column, an INT (signed 64-bit), or a DATE with a column. Tuples
-preserve each component's exact identity:
+```json
+{
+  "found": 3,
+  "found_docs": 5,
+  "docs": [
+    {"id": "a", "title_t": "Rain jacket", "price_i": 49, "_group_": {"val": "P17"}},
+    {"id": "c", "title_t": "Winter jacket", "price_i": 89, "_group_": {"val": "P23"}}
+  ]
+}
+```
+
+`limit` and `offset` count groups. With `get_number: true`, `found` is the
+exact number of groups and `found_docs` is the number of eligible matching
+documents, both before paging. `limit: 0` returns totals without documents;
+`limit: -1` returns every group. Exact totals require examining all matching
+keys. Returning all groups or paging deeply also requires keeping more group
+heads in memory. Without totals, Luxir can skip documents whose ranking
+cannot reach the requested page.
+
+A key field uses value binding and must be single-valued. Supported types
+are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
+a column. Use an object to group by a tuple of fields:
 
 ```json
 "collapse": {"field": ["shop_s", "product_i"], "missing": "group"}
 ```
 
-`missing` defaults to `expand`: any missing component makes the document its
-own singleton group. `group` retains present tuple components and tags missing
-components as null, so `["shop-A", null]` and `["shop-B", null]` differ. `drop`
-excludes documents missing any component, including from `found_docs`.
+`missing` controls documents with any missing key component:
 
-Every JSON head row has `_group_`: `{"val":"P17"}` for one field,
+- `expand` (the default) gives each such document its own group.
+- `group` treats each missing component as null and keeps present components,
+  so `["shop-A", null]` and `["shop-B", null]` are different groups.
+- `drop` excludes such documents, including from `found_docs`.
+
+Each returned document has `_group_`: `{"val":"P17"}` for one field,
 `{"val":["shop-A",null]}` for a tuple, or
-`{"val":null,"singleton":true}` for an expand singleton. Keys use indexed
-string values and integer/date values (dates are epoch milliseconds).
-The protobuf `DocList.groups` table carries typed identities aligned with
-its head rows, independently of rows/columns projection. Streaming batches
-keep that alignment. `format=docs` includes `_group_` on each document and
-`found`/`found_docs` in `_header_` when requested.
+`{"val":null,"singleton":true}` for a document grouped separately by
+`expand`. String keys use indexed values; date keys use epoch milliseconds.
+Groups tied on all sort values compare by key: null precedes a value, tuples
+compare component by component, and ordinary keys precede singleton groups.
+Tied members of one group, and tied singleton groups, use reader document
+order.
 
-`collapse=<field>` is also a URL overlay targeting `q`; `explain=request`
-shows the canonical object form. FLOAT/DOUBLE, TEXT, vector, and multi-valued
-keys are rejected. Field-sort collapse, ops under a collapsed list, collapse
-on fusion sources, and collapse under fusion or facet buckets are currently
-rejected. kNN still selects `k` documents before collapse, so repeated keys
-can produce fewer than `k` groups.
+Streaming batches preserve the association between each document and its
+group. The protobuf `DocList.groups` table contains typed keys aligned with
+the returned rows. With `format=docs`, every document includes `_group_` and
+the `_header_` includes requested totals.
+
+The URL parameter `collapse=<field>` replaces the `q` operation's collapse
+specification with that field. `explain=request` shows the canonical object
+form. See [Limits](#limits) for unsupported combinations.
 
 ## One request, several results
 
@@ -791,9 +810,14 @@ preparation without collecting results. See
 
 ## Limits
 
+- Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
+  Operations under a collapsed list, collapse on fusion sources, and collapse
+  under fusion or facet buckets are unsupported.
+- kNN selects `k` documents before collapse, so repeated keys can produce
+  fewer than `k` groups.
 - Ordered page-after pagination is not implemented. `offset` skips the first
-  matching documents in ranked order, and collection retains up to
-  `offset + limit` documents, so deep pages cost more. An offset past the
+  matching documents (or collapsed groups) in ranked order, and collection
+  retains up to `offset + limit` documents or group heads, so deep pages cost more. An offset past the
   matches returns one empty final batch. Use document-per-line export when the
   goal is to consume every match.
 - The `(segment, docid)` tiebreak is reader-local and can change after segment

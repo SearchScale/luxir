@@ -416,9 +416,9 @@ public:
                                  || placement == OpsPlacement::FUSION)) {
           throw RequestError("collapse is not supported under a facet bucket or Fusion.ops");
         }
-        auto placement = depth == 1 ? TopDocsPlacement::ROOT_OP
-                                    : TopDocsPlacement::NESTED_OP;
-        auto* qr = parseTopDocs(name, topDocs, placement);
+        auto topDocsPlacement = depth == 1 ? TopDocsPlacement::ROOT_OP
+                                           : TopDocsPlacement::NESTED_OP;
+        auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
         addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
         return qr;
       },
@@ -838,7 +838,7 @@ public:
 
   // Build the copyable sort plan. Schema lookups that may throw are resolved
   // here before the plan is passed to TopDocsReq.
-  SortPlan parseSorts(std::span<const luxir::api::SortSpec> sorts) {
+  SortPlan parseSorts(std::span<const luxir::api::SortSpec> sorts, bool collapsed = false) {
     SortPlan out;
     if (sorts.empty()) return out;
     out.useFieldSort = true;
@@ -891,7 +891,9 @@ public:
     bool canonicalScoreDoc = out.clauses.size() == 2 && scoreDesc
       && out.clauses[1].getKind() == SortClause::DOC
       && out.clauses[1].getOrder() == SortField::ASC;
-    if (canonicalScore || canonicalScoreDoc) out.useFieldSort = false;
+    // An explicit document clause participates in group rank. The document
+    // top-K shortcut would replace it with the collapse key tie-break.
+    if (canonicalScore || (!collapsed && canonicalScoreDoc)) out.useFieldSort = false;
     return out;
   }
 
@@ -1502,13 +1504,7 @@ public:
       domainQuery = req.requestPool.make<ForcePrepareQuery>(domainQuery);
     }
 
-    auto parsedSorts = parseSorts(topDocsReq.sort);
-    if (collapse != nullptr && parsedSorts.useFieldSort) {
-      // Field-sort collapse needs group admission and inclusive key bounds.
-      // Until proved, this excludes every document-only field arm, including
-      // exact-domain leaf termination, gathered admission and seeding.
-      throw RequestError("field-sort collapse is not supported yet");
-    }
+    auto parsedSorts = parseSorts(topDocsReq.sort, collapse != nullptr);
     auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
       req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
       &req.warnings,

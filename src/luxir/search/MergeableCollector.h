@@ -24,12 +24,16 @@ public:
   std::unique_ptr<TopDocsCollector> scoreCollector;
   std::unique_ptr<GroupScoreCollector> groupScoreCollector;
   std::unique_ptr<FieldSortCollector> fieldCollector;
+  std::unique_ptr<GroupFieldCollector> groupFieldCollector;
   bool useFieldSort;
 
   MergeableCollector(size_t topCount, const SortPlan& sortPlan,
                      IndexReader* reader, bool needsScores, const CollapsePlan* collapse = nullptr)
     : useFieldSort(sortPlan.useFieldSort) {
-    if (collapse != nullptr) {
+    if (collapse != nullptr && useFieldSort) {
+      groupFieldCollector = std::make_unique<GroupFieldCollector>(
+          topCount, sortPlan.clauses, reader, needsScores, collapse);
+    } else if (collapse != nullptr) {
       groupScoreCollector = std::make_unique<GroupScoreCollector>(topCount, collapse);
     } else if (!useFieldSort) {
       scoreCollector = std::make_unique<TopDocsCollector>(topCount);
@@ -45,8 +49,15 @@ public:
     else return scoreCollector.get();
   }
 
+  template <bool Collapsed>
+  auto* fields() {
+    if constexpr (Collapsed) return groupFieldCollector.get();
+    else return fieldCollector.get();
+  }
+
   /// Number of docs the active arm keeps; 0 for a count-only collection.
   int64_t topCount() const {
+    if (groupFieldCollector) return groupFieldCollector->topCount;
     if (groupScoreCollector) return groupScoreCollector->topCount;
     return useFieldSort ? fieldCollector->topCount : scoreCollector->topCount;
   }
@@ -54,7 +65,9 @@ public:
   /// Add matches the active arm did not see individually, for callers that
   /// derive part of the count instead of collecting it doc by doc.
   void addHits(int64_t hits) {
-    if (groupScoreCollector) {
+    if (groupFieldCollector) {
+      groupFieldCollector->hitCount += hits;
+    } else if (groupScoreCollector) {
       groupScoreCollector->hitCount += hits;
     } else if (useFieldSort) {
       fieldCollector->hitCount += hits;
@@ -66,7 +79,10 @@ public:
   static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
     // merge the smaller collector into the larger collector, or if both the same size, merge
     // the less competitive collector into the more competitive collector.
-    if (a->groupScoreCollector) {
+    if (a->groupFieldCollector) {
+      if (a->groupFieldCollector->size() < b->groupFieldCollector->size()) std::swap(a, b);
+      a->groupFieldCollector->merge(*b->groupFieldCollector);
+    } else if (a->groupScoreCollector) {
       if (a->groupScoreCollector->size() < b->groupScoreCollector->size()) std::swap(a, b);
       a->groupScoreCollector->merge(*b->groupScoreCollector);
     } else if (a->useFieldSort) {

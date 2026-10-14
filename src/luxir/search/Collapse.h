@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include <boost/unordered/unordered_flat_map.hpp>
+#include <algorithm>
+#include <boost/container/small_vector.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <optional>
 #include <vector>
@@ -26,8 +27,15 @@ struct CollapseKey {
   };
   // Ordinary tuples sort before expand singletons; null precedes a value.
   std::optional<uint64_t> singleton;
-  std::vector<Component> components;
-  auto operator<=>(const CollapseKey&) const = default;
+  boost::container::small_vector<Component, 2> components;
+  auto operator<=>(const CollapseKey& other) const {
+    auto cmp = singleton <=> other.singleton;
+    return cmp != 0 ? cmp : std::lexicographical_compare_three_way(
+        components.begin(), components.end(), other.components.begin(), other.components.end());
+  }
+  bool operator==(const CollapseKey& other) const {
+    return singleton == other.singleton && components == other.components;
+  }
 };
 
 struct CollapseKeyHash {
@@ -89,11 +97,13 @@ class CollapseKeyReader {
   const CollapsePlan& plan;
   std::vector<Column> columns;
   CollapseKey scratch;
+  int32_t lastDoc = -1;
 
 public:
   explicit CollapseKeyReader(const CollapsePlan& plan) : plan(plan) {}
 
   void setSegment(int32_t segment) {
+    lastDoc = -1;
     columns.clear();
     columns.resize(plan.fields.size());
     scratch.components.resize(plan.fields.size());
@@ -112,6 +122,15 @@ public:
   }
 
   const CollapseKey* read(int32_t segment, int32_t doc) {
+    // Bound-order and seeded field drivers may rewind within a segment.
+    // Reset presence cursors only on an actual backward read; looking ahead
+    // over a missing value must retain the future position.
+    if (doc < lastDoc) {
+      for (auto& column : columns) {
+        if (column.values) column.values->reset();
+      }
+    }
+    lastDoc = doc;
     scratch.singleton.reset();
     scratch.components.resize(columns.size());
     bool missing = false;
@@ -143,20 +162,40 @@ public:
 // Only retained identities are interned for ranking: state is O(topCount).
 // Exhaustive totals have a separate bitmap (one ordinal key) or exact set.
 class CollapseAdmission {
+  // The lookup table owns only slot indexes. Hash/equality read the one key
+  // owned by each stable slot, including after the vector's storage grows.
+  struct SlotHash {
+    using is_transparent = void;
+    const std::vector<CollapseKey>* keys;
+    size_t operator()(size_t slot) const { return (*this)((*keys)[slot]); }
+    size_t operator()(const CollapseKey& key) const { return CollapseKeyHash{}(key); }
+  };
+  struct SlotEqual {
+    using is_transparent = void;
+    const std::vector<CollapseKey>* keys;
+    bool operator()(size_t a, size_t b) const { return (*keys)[a] == (*keys)[b]; }
+    bool operator()(size_t slot, const CollapseKey& key) const { return (*keys)[slot] == key; }
+    bool operator()(const CollapseKey& key, size_t slot) const { return (*this)(slot, key); }
+  };
 public:
   const CollapsePlan& plan;
   CollapseKeyReader reader;
   std::vector<CollapseKey> keys;
-  boost::unordered_flat_map<CollapseKey, size_t, CollapseKeyHash> retained;
+  boost::unordered_flat_set<size_t, SlotHash, SlotEqual> retained;
   std::vector<uint64_t> seenOrds;
   boost::unordered_flat_set<CollapseKey, CollapseKeyHash> seenKeys;
   int64_t singletons = 0;
 
-  explicit CollapseAdmission(const CollapsePlan& plan) : plan(plan), reader(plan) {
+  explicit CollapseAdmission(const CollapsePlan& plan)
+      : plan(plan), reader(plan), retained(0, SlotHash{&keys}, SlotEqual{&keys}) {
     if (plan.getNumber && plan.fields.size() == 1 && plan.fields[0].ordinal()) {
       seenOrds.resize((size_t)(((plan.fields[0].ords ? plan.fields[0].ords->numOrds() : 0) + 1 + 63) / 64));
     }
   }
+
+  // Hash/equality callbacks point to this keys object, so its address is stable.
+  CollapseAdmission(const CollapseAdmission&) = delete;
+  CollapseAdmission& operator=(const CollapseAdmission&) = delete;
 
   void count(const CollapseKey& key) {
     if (!plan.getNumber) return;
@@ -182,8 +221,8 @@ public:
 
   size_t retain(const CollapseKey& key, size_t slot) {
     if (slot == keys.size()) keys.push_back(key);
-    else { retained.erase(keys[slot]); keys[slot] = key; }
-    retained.emplace(key, slot);
+    else { retained.erase(slot); keys[slot] = key; }
+    retained.insert(slot);
     return slot;
   }
 };

@@ -120,6 +120,9 @@ class ScoreCollector {
 
   void collect(int32_t segment, int32_t docid, float score) {
     if constexpr (Collapsed) {
+      // Without totals, hitCount is not consumed: collapse has no child ops
+      // or fusion sink. Eligibility matters only for admission and counts.
+      if (!groups->plan.getNumber && (topCount == 0 || score < minCompetitiveVal)) return;
       const auto* key = groups->reader.read(segment, docid);
       if (key == nullptr) return;
       hitCount++;
@@ -162,7 +165,7 @@ class ScoreCollector {
     if (topCount == 0 || score < minCompetitiveVal) return;
     auto found = groups->retained.find(key);
     if (found != groups->retained.end()) {
-      size_t slot = found->second;
+      size_t slot = *found;
       auto& member = pq.atSlot((size_t)slot);
       // Group rank ties use the key; member ties still use the document.
       if (score < member.score || (score == member.score && doc >= member.doc)) return;

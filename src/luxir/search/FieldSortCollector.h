@@ -17,14 +17,27 @@
 
 namespace luxir {
 
-class FieldSortCollector {
+struct FieldSortControls {
+  inline static bool disableKeyGatherForTests = false;
+  inline static std::optional<bool> forceLeafDescentForTests;
+};
+
+struct FieldSortKeyBlockPlan {
+  FieldComparator::KeyBatch* batch = nullptr;
+  int32_t blockSize = 0;
+  int64_t blockCount = 0;
+  int32_t leafSize = 0;
+  int64_t leafCount = 0;
+};
+
+template <bool Collapsed = false>
+class FieldCollector : public FieldSortControls {
   static constexpr size_t KEY_BUFFER_SIZE = 1024;
   int64_t keys[KEY_BUFFER_SIZE];
 
 public:
-  inline static bool disableKeyGatherForTests = false;
-  // Overrides the priced leaf-descent decision (descendsToLeaves).
-  inline static std::optional<bool> forceLeafDescentForTests;
+  [[no_unique_address]] std::conditional_t<Collapsed,
+      std::unique_ptr<CollapseAdmission>, NoCollapseAdmission> groups;
 
   struct SortDoc {
     segdoc doc;
@@ -42,12 +55,14 @@ public:
   };
 
   struct FieldSortComparatorFunctor {
-    const FieldSortCollector* collector;
+    const FieldCollector* collector;
 
-    explicit FieldSortComparatorFunctor(const FieldSortCollector* collector)
+    explicit FieldSortComparatorFunctor(const FieldCollector* collector)
       : collector(collector) {}
 
-    bool operator()(const SortDoc& docA, const SortDoc& docB) const;
+    bool operator()(const SortDoc& docA, const SortDoc& docB) const {
+      return collector->compare(docA, docB) < 0;
+    }
   };
 
   struct RuntimeClause {
@@ -168,7 +183,7 @@ public:
   bool needsSort = true;
   // Owns the SortDoc storage and expands it as hits arrive; topCount bounds
   // the heap but is not allocated up front (limit=-1 maps to maxDoc).
-  ExpandingPQ<SortDoc, FieldSortComparatorFunctor> pq;
+  ExpandingPQ<SortDoc, FieldSortComparatorFunctor, Collapsed> pq;
 
   // String-sort candidate pruning state, all segment-local. The union is a
   // conservative candidate superset built from the primary comparator's
@@ -233,9 +248,9 @@ public:
   class ExpressionBindings {
   public:
     MemPool::ScopeGuard scope;
-    FieldSortCollector& collector;
+    FieldCollector& collector;
 
-    ExpressionBindings(FieldSortCollector& collector, MemPool& pool,
+    ExpressionBindings(FieldCollector& collector, MemPool& pool,
                        IndexReader::Segment& segment)
         : scope(pool), collector(collector) {
       try {
@@ -270,10 +285,13 @@ public:
   };
 
 public:
-  FieldSortCollector(int64_t topCount, const std::vector<SortClause>& clauses,
-                     IndexReader* reader, bool needsScores = true)
+  FieldCollector(int64_t topCount, const std::vector<SortClause>& clauses,
+                     IndexReader* reader, bool needsScores = true,
+                     const CollapsePlan* collapse = nullptr)
     : topCount(topCount), needsScores(needsScores),
       pq((size_t)std::max(topCount, (int64_t)0), FieldSortComparatorFunctor(this)) {
+    if constexpr (Collapsed) groups = std::make_unique<CollapseAdmission>(*collapse);
+    else unused(collapse);
     assert(topCount >= 0);
     // Slot indexes are int32 (SortDoc::slot, FieldComparator::growSlots), so
     // the capacity math in growSlotStorage never narrows out of range.
@@ -297,8 +315,8 @@ public:
 
   // The pq's functor holds a back-pointer to this collector; moving would leave
   // it dangling.
-  FieldSortCollector(FieldSortCollector&&) = delete;
-  FieldSortCollector& operator=(FieldSortCollector&&) = delete;
+  FieldCollector(FieldCollector&&) = delete;
+  FieldCollector& operator=(FieldCollector&&) = delete;
 
   // sourceCost: estimated docs the collection source will still produce for
   // this segment (query cost capped by any filter cardinality). It is the
@@ -306,6 +324,7 @@ public:
   // conservatively disables candidate activation.
   void setSegment(const IndexReader::Segment& segment,
                   MemPool* pool = nullptr, int64_t sourceCost = -1) {
+    if constexpr (Collapsed) groups->reader.setSegment(segment.ord);
     segmentPool = pool;
     candidates = nullptr;
     candidateLo = 0;
@@ -422,9 +441,15 @@ public:
     int64_t heapSize = (int64_t)pq.size() * depth / topCount;
     auto bottom = predictBottom(*primaryKeys, card, depth, heapSize,
                                 bottomKey);
-    return bottom.has_value()
-        ? visitFloorAt(*primaryKeys, *bottom, card, depth)
-        : primaryKeys->leafCount();
+    if constexpr (Collapsed) {
+      // Document quantiles are only a cost prior for groups. At a tied
+      // bottom, every tied leaf can contain a winning group key.
+      return bottom.has_value() ? primaryKeys->leavesBoundedAtOrBefore(*bottom)
+                                : primaryKeys->leafCount();
+    } else {
+      return bottom.has_value() ? visitFloorAt(*primaryKeys, *bottom, card, depth)
+                                : primaryKeys->leafCount();
+    }
   }
 
   // Where a doc-order walk of the current segment meets its best keys: the
@@ -501,16 +526,22 @@ public:
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
   // SCORE, DOC, and EXPR apply direction in this clause walk.
-  int compare(const SortDoc& docA, const SortDoc& docB,
+  int compareRank(const SortDoc& docA, const SortDoc& docB,
               CompareSource source = CompareSource::LOCAL,
-              const FieldSortCollector* other = nullptr) const {
+              const FieldCollector* other = nullptr) const {
     for (size_t i = 0; i < clauses.size(); i++) {
       const auto& clause = clauses[i];
       int cmp = 0;
       switch (clause.descriptor.getKind()) {
         case SortClause::COLUMN:
           if (source == CompareSource::CURRENT_DOC) {
-            cmp = clause.comparator->compareBottom(docA.slot, docA.doc, docB.doc);
+            if constexpr (Collapsed) {
+              // Segment ord comparators cache only the heap bottom. A
+              // retained group's member can occupy any other slot.
+              cmp = heapFull() && docA.slot == pq.top().slot
+                  ? clause.comparator->compareBottom(docA.slot, docA.doc, docB.doc)
+                  : clause.comparator->compareCurrent(docA.slot, docA.doc, docB.doc);
+            } else cmp = clause.comparator->compareBottom(docA.slot, docA.doc, docB.doc);
           } else if (source == CompareSource::OTHER) {
             assert(other != nullptr);
             cmp = clause.comparator->compare(
@@ -541,7 +572,22 @@ public:
       }
       if (cmp != 0) return cmp;
     }
-    return (docA.doc > docB.doc) - (docA.doc < docB.doc);
+    return 0;
+  }
+
+  // Rank values order groups; only member selection uses the document tie.
+  int compare(const SortDoc& docA, const SortDoc& docB,
+              CompareSource source = CompareSource::LOCAL,
+              const FieldCollector* other = nullptr) const {
+    int cmp = compareRank(docA, docB, source, other);
+    if (cmp != 0) return cmp;
+    if constexpr (Collapsed) {
+      assert(source != CompareSource::CURRENT_DOC);
+      const auto& a = groups->keys[(size_t)docA.slot];
+      const auto& b = (source == CompareSource::OTHER ? other : this)->groups->keys[(size_t)docB.slot];
+      auto keyCmp = a <=> b;
+      return (keyCmp > 0) - (keyCmp < 0);
+    } else return (docA.doc > docB.doc) - (docA.doc < docB.doc);
   }
 
   // The rejected-doc path must stay small enough to inline into the collectTopK
@@ -560,33 +606,50 @@ public:
     int cmp;
     if (soleColumn != nullptr) [[likely]] {
       cmp = soleColumn->compareBottom(bottom.slot, bottom.doc, doc);
-      if (cmp == 0) {
-        cmp = (bottom.doc > doc) - (bottom.doc < doc);
+      if constexpr (!Collapsed) {
+        if (cmp == 0) cmp = (bottom.doc > doc) - (bottom.doc < doc);
       }
     } else if (soleExpr != nullptr) {
       cmp = soleExpr->compareCurrent(bottom.slot, doc, score);
-      if (cmp == 0) {
-        cmp = (bottom.doc > doc) - (bottom.doc < doc);
+      if constexpr (!Collapsed) {
+        if (cmp == 0) cmp = (bottom.doc > doc) - (bottom.doc < doc);
       }
     } else {
       cmp = compareCurrentDoc(bottom, doc, score);
     }
-    return cmp > 0;
+    // Also used before two-phase exact verification: a tied rank is a
+    // candidate superset until its identity decides group admission.
+    if constexpr (Collapsed) return cmp >= 0;
+    else return cmp > 0;
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
-    hitCount++;
-    if (topCount == 0) return;
+    if constexpr (Collapsed) {
+      if (!groups->plan.getNumber && (topCount == 0
+          || (heapFull() && !competitiveCandidate(segment, docid, score)))) return;
+      const auto* key = groups->reader.read(segment, docid);
+      if (key == nullptr) return;
+      hitCount++;
+      groups->count(*key);
+      if (topCount == 0) return;
+      SortDoc candidate(segdoc(segment, docid), score, -1);
+      admitGroup(*key, candidate,
+          [&](const SortDoc& head) { return compareRank(head, candidate, CompareSource::CURRENT_DOC); },
+          [&](int32_t slot) { copy(slot, candidate.doc, score); });
+    } else {
+      hitCount++;
+      if (topCount == 0) return;
 
-    segdoc doc(segment, docid);
-    if (pq.size() < (size_t)topCount) {
-      warmup(doc, score);
-      return;
-    }
+      segdoc doc(segment, docid);
+      if (pq.size() < (size_t)topCount) {
+        warmup(doc, score);
+        return;
+      }
 
-    SortDoc& bottom = pq.top();
-    if (competitiveCandidate(segment, docid, score)) [[unlikely]] {
-      admit(bottom, doc, score);
+      SortDoc& bottom = pq.top();
+      if (competitiveCandidate(segment, docid, score)) [[unlikely]] {
+        admit(bottom, doc, score);
+      }
     }
   }
 
@@ -604,8 +667,11 @@ public:
   static BlockClass classifyKeyBlock(int32_t segment, int32_t firstUnseenDoc,
                                      int64_t best, int64_t bottomKey,
                                      segdoc bottomDoc, bool soleSort) {
+    // L distinct retained groups certify this primary-key floor. Strictly
+    // worse docs cannot enter or improve a retained member. Equal bounds
+    // remain eligible for group-key ties and out-of-order member ties.
     if (best > bottomKey) return BlockClass::SKIP_STRICT;
-    if (best == bottomKey && soleSort
+    if (best == bottomKey && soleSort && !Collapsed
         && segdoc(segment, firstUnseenDoc) >= bottomDoc) {
       return BlockClass::SKIP_TIE;
     }
@@ -639,13 +705,7 @@ public:
     return below;
   }
 
-  struct KeyBlockPlan {
-    FieldComparator::KeyBatch* batch = nullptr;
-    int32_t blockSize = 0;
-    int64_t blockCount = 0;
-    int32_t leafSize = 0;
-    int64_t leafCount = 0;
-  };
+  using KeyBlockPlan = FieldSortKeyBlockPlan;
 
   // Non-null batch only when ranking is active and the sole primary clause
   // offers order-independent masked leaf gathers (dense single-valued
@@ -817,8 +877,11 @@ public:
       return;
     }
 
-    hitCount += (int64_t)docs.size();
-    if (topCount == 0) return;
+    if constexpr (!Collapsed) hitCount += (int64_t)docs.size();
+    if (topCount == 0) {
+      if constexpr (Collapsed) for (int32_t doc : docs) collect(segment, doc, 0.0f);
+      return;
+    }
 
     size_t i = 0;
     while (i < docs.size()) {
@@ -844,8 +907,11 @@ public:
   void admitGathered(int32_t segment, std::span<const int32_t> docs,
                      std::span<const int64_t> keys,
                      FieldComparator::KeyBatch* batch) {
-    hitCount += (int64_t)docs.size();
-    if (topCount == 0) return;
+    if constexpr (!Collapsed) hitCount += (int64_t)docs.size();
+    if (topCount == 0) {
+      if constexpr (Collapsed) for (int32_t doc : docs) collect(segment, doc, 0.0f);
+      return;
+    }
     if (SkipStats::enabled) {
       SkipStats::fieldSortDocsGathered += (int64_t)docs.size();
     }
@@ -862,31 +928,52 @@ private:
   [[gnu::aligned(64)]] void admitChunk(int32_t segment, std::span<const int32_t> docs,
                   std::span<const int64_t> keys,
                   FieldComparator::KeyBatch* batch) {
-    size_t i = 0;
-    while (i < docs.size() && pq.size() < (size_t)topCount) {
-      int32_t slot = (int32_t)pq.size();
-      ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
-      batch->slotKeys[slot] = keys[i];
-      pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
-      recordAdmission(docs.size(), i);
-      i++;
-    }
-    if (i == docs.size()) return;
+    if constexpr (Collapsed) {
+      // Gathers do not perform a document top-K cut. Each gathered rank
+      // enters the same keyed admission/update policy before heap truncation.
+      for (size_t i = 0; i < docs.size(); i++) {
+        int64_t key = keys[i];
+        if (!groups->plan.getNumber && heapFull()
+            && key > batch->slotKeys[pq.top().slot]) continue;
+        const auto* identity = groups->reader.read(segment, docs[i]);
+        if (identity == nullptr) continue;
+        hitCount++;
+        groups->count(*identity);
+        SortDoc candidate(segdoc(segment, docs[i]), 0.0f, -1);
+        bool admitted = admitGroup(*identity, candidate,
+            [&](const SortDoc& head) {
+              int64_t old = batch->slotKeys[head.slot];
+              return (old > key) - (old < key);
+            }, [&](int32_t slot) { batch->slotKeys[slot] = key; });
+        if (admitted) recordAdmission(docs.size(), i);
+      }
+    } else {
+      size_t i = 0;
+      while (i < docs.size() && pq.size() < (size_t)topCount) {
+        int32_t slot = (int32_t)pq.size();
+        ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
+        batch->slotKeys[slot] = keys[i];
+        pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
+        recordAdmission(docs.size(), i);
+        i++;
+      }
+      if (i == docs.size()) return;
 
-    int64_t bottomKey = batch->slotKeys[pq.top().slot];
-    for (; i < docs.size(); i++) {
-      int64_t key = keys[i];
-      segdoc doc(segment, docs[i]);
-      if (key > bottomKey) continue;
-      if (key == bottomKey && doc >= pq.top().doc) continue;
+      int64_t bottomKey = batch->slotKeys[pq.top().slot];
+      for (; i < docs.size(); i++) {
+        int64_t key = keys[i];
+        segdoc doc(segment, docs[i]);
+        if (key > bottomKey) continue;
+        if (key == bottomKey && doc >= pq.top().doc) continue;
 
-      SortDoc& bottom = pq.top();
-      int32_t slot = bottom.slot;
-      batch->slotKeys[slot] = key;
-      bottom = SortDoc(doc, 0.0f, slot);
-      pq.updateTop();
-      bottomKey = batch->slotKeys[pq.top().slot];
-      recordAdmission(docs.size(), i);
+        SortDoc& bottom = pq.top();
+        int32_t slot = bottom.slot;
+        batch->slotKeys[slot] = key;
+        bottom = SortDoc(doc, 0.0f, slot);
+        pq.updateTop();
+        bottomKey = batch->slotKeys[pq.top().slot];
+        recordAdmission(docs.size(), i);
+      }
     }
   }
 
@@ -950,9 +1037,12 @@ private:
       return {from, nextProbeDoc};
     }
     FieldComparator::CompetitiveOrdState state;
+    // Closing the bottom term by document order is invalid for groups:
+    // any remaining document at that term may carry a smaller group key.
+    // The primary ord interval stays inclusive, also for secondary clauses.
     auto status = clauses[0].comparator->competitiveOrdInterval(
         state, pq.top().slot, pq.top().doc, segment, from,
-        clauses.size() == 1);
+        !Collapsed && clauses.size() == 1);
     if (status == FieldComparator::OrdIntervalStatus::UNSUPPORTED) {
       candidatesDisabled = true;
       return {from, PostingsReader::END};
@@ -1172,7 +1262,7 @@ private:
     }
   }
 
-  void copy(int32_t slot, FieldSortCollector& other,
+  void copy(int32_t slot, FieldCollector& other,
             int32_t otherSlot, segdoc otherDoc) {
     for (size_t i = 0; i < clauses.size(); i++) {
       if (clauses[i].comparator != nullptr) {
@@ -1194,7 +1284,8 @@ private:
 
   LUXIR_NOINLINE int compareCurrentDoc(const SortDoc& bottom, segdoc doc, float score) const {
     SortDoc candidate(doc, score, -1);
-    return compare(bottom, candidate, CompareSource::CURRENT_DOC);
+    if constexpr (Collapsed) return compareRank(bottom, candidate, CompareSource::CURRENT_DOC);
+    else return compare(bottom, candidate, CompareSource::CURRENT_DOC);
   }
 
   LUXIR_NOINLINE void admit(SortDoc& bottom, segdoc doc, float score) {
@@ -1202,6 +1293,43 @@ private:
     bottom = SortDoc(doc, score, bottom.slot);
     pq.updateTop();
     setBottom();
+  }
+
+  template <typename Rank, typename Write>
+  bool admitGroup(const CollapseKey& key, SortDoc candidate, Rank&& rank,
+                  Write&& write) requires Collapsed {
+    auto found = groups->retained.find(key);
+    int32_t slot;
+    bool update = found != groups->retained.end();
+    if (update) {
+      slot = (int32_t)*found;
+      const auto& head = pq.atSlot((size_t)slot);
+      int cmp = rank(head);
+      if (cmp < 0 || (cmp == 0 && head.doc <= candidate.doc)) return false;
+    } else if (!heapFull()) {
+      slot = (int32_t)pq.size();
+      ensureSlotCapacity(slot + 1);
+      groups->retain(key, (size_t)slot);
+    } else {
+      const auto& bottom = pq.top();
+      int cmp = rank(bottom);
+      if (cmp < 0 || (cmp == 0 && key >= groups->keys[(size_t)bottom.slot])) return false;
+      slot = bottom.slot;
+      groups->retain(key, (size_t)slot);
+    }
+    // Improving a non-bottom member cannot change the heap root or its
+    // cached ordinal. Avoid re-seeking a foreign bottom term on that path.
+    bool bottomChanged = !update || (heapFull() && slot == pq.top().slot);
+    write(slot);
+    candidate.slot = slot;
+    if ((size_t)slot == pq.size()) pq.insert(candidate);
+    else {
+      pq.atSlot((size_t)slot) = candidate;
+      pq.updateSlot((size_t)slot);
+    }
+    if (heapFull() && bottomChanged) setBottom();
+    needsSort = true;
+    return true;
   }
 
   void setBottom() {
@@ -1213,24 +1341,36 @@ private:
 
 public:
 
-  void merge(FieldSortCollector& other) {
+  void merge(FieldCollector& other) {
     // Self-merge would iterate a span that insert() can reallocate out from under us.
     assert(this != &other);
     hitCount += other.hitCount;
     needsSort = true;
 
-    for (const SortDoc& otherDoc : other.pq.span()) {
-      if (pq.size() < (size_t)topCount) {
-        int32_t slot = (int32_t)pq.size();
-        ensureSlotCapacity(slot + 1);
-        copy(slot, other, otherDoc.slot, otherDoc.doc);
-        pq.insert(SortDoc(otherDoc.doc, otherDoc.score, slot));
-      } else {
-        SortDoc& bottom = pq.top();
-        if (compare(bottom, otherDoc, CompareSource::OTHER, &other) > 0) {
-          copy(bottom.slot, other, otherDoc.slot, otherDoc.doc);
-          bottom = SortDoc(otherDoc.doc, otherDoc.score, bottom.slot);
-          pq.updateTop();
+    if constexpr (Collapsed) {
+      groups->mergeCounts(*other.groups);
+      // As for score collapse, local top-L groups suffice globally. Merge
+      // compares rank then key; equal-rank member updates compare documents.
+      if (topCount == 0) return;
+      for (const SortDoc& member : other.pq.span()) {
+        admitGroup(other.groups->keys[(size_t)member.slot], member,
+            [&](const SortDoc& head) { return compareRank(head, member, CompareSource::OTHER, &other); },
+            [&](int32_t slot) { copy(slot, other, member.slot, member.doc); });
+      }
+    } else {
+      for (const SortDoc& otherDoc : other.pq.span()) {
+        if (pq.size() < (size_t)topCount) {
+          int32_t slot = (int32_t)pq.size();
+          ensureSlotCapacity(slot + 1);
+          copy(slot, other, otherDoc.slot, otherDoc.doc);
+          pq.insert(SortDoc(otherDoc.doc, otherDoc.score, slot));
+        } else {
+          SortDoc& bottom = pq.top();
+          if (compare(bottom, otherDoc, CompareSource::OTHER, &other) > 0) {
+            copy(bottom.slot, other, otherDoc.slot, otherDoc.doc);
+            bottom = SortDoc(otherDoc.doc, otherDoc.score, bottom.slot);
+            pq.updateTop();
+          }
         }
       }
     }
@@ -1259,9 +1399,7 @@ public:
   }
 };
 
-inline bool FieldSortCollector::FieldSortComparatorFunctor::operator()(
-    const SortDoc& docA, const SortDoc& docB) const {
-  return collector->compare(docA, docB) < 0;
-}
+using FieldSortCollector = FieldCollector<false>;
+using GroupFieldCollector = FieldCollector<true>;
 
 } // namespace luxir

@@ -304,6 +304,12 @@ public:
   // compare new document to bottom slot
   virtual int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) = 0;
 
+  // Compare any retained slot against the current document. Bottom-only
+  // implementations can cache setBottom(), so this is a distinct capability.
+  virtual int compareCurrent(int32_t slot, segdoc oldDoc, segdoc newDoc) {
+    return compareBottom(slot, oldDoc, newDoc);
+  }
+
   // compare two slots
   virtual int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) = 0;
 
@@ -1116,6 +1122,22 @@ public:
       cmp = (bottomOrd > docOrd) - (bottomOrd < docOrd);
     } else {
       cmp = bottomOrd >= docOrd ? 1 : -1;
+    }
+    return sortMultiplier * cmp;
+  }
+
+  int compareCurrent(int32_t slot, segdoc oldDoc, segdoc newDoc) override {
+    unused(oldDoc);
+    const Slot& head = slots[(size_t)slot];
+    int32_t ord = selectedOrd(newDoc.docId());
+    int cmp;
+    if (head.ord == 0 || ord == 0) {
+      cmp = compareMissing(head.ord == 0, ord == 0);
+    } else if (head.ordGen == currentSegment) {
+      cmp = (head.ord > ord) - (head.ord < ord);
+    } else {
+      termsEnum->seekOrd((int64_t)ord - 1);
+      cmp = compareTerms(term(head), (std::string_view)termsEnum->term());
     }
     return sortMultiplier * cmp;
   }
