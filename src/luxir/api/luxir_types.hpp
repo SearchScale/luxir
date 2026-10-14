@@ -114,7 +114,7 @@ namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
 
-struct RrfFusion { int32_t k = 0; };
+struct RrfFusion { std::optional<int32_t> k; };
 struct CalendarGap {
   using Unit = luxir::api::CalendarGap_::Unit;
   int32_t n = 0;
@@ -534,7 +534,8 @@ struct Fusion {                                                  // needs TopDoc
   int64_t offset = 0;
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is one int32)
+  map_view<std::string_view, double> weights;
+  std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is optional<int32>)
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;

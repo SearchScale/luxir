@@ -1040,6 +1040,9 @@ struct from<JSON, luxir::api::Fusion> {
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "weights") {
+            decltype(auto) weights = ::hpp_proto::detail::as_modifiable(ctx, value.weights);
+            glz::util::parse_repeated<O>(true, weights, ctx, vit, vend);
           } else if (key == "rrf") {
             util::from_json<O>(value.rrf, ctx, vit, vend);
           } else {

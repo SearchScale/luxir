@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <limits>
 #include <map>
 #include <memory>
 #include <memory_resource>
@@ -939,4 +940,129 @@ TEST_F(FusionOpTest, offsetNegativeRejected) {
   EXPECT_FALSE(req->ok());
   EXPECT_NE(std::string::npos, req->errorMsg().find("fusion 'f': offset must be >= 0"))
       << req->errorMsg();
+}
+
+// Weighted RRF.  The corpus (three segments) gives deterministic ranks:
+//   apple matchers (BM25, field length): a, b, d, e -> ranks 1..4
+//   banana matchers (prio_i DESC):       d, c, e, b -> ranks 1..4
+class WeightedRrfTest : public FusionOpTest {
+protected:
+  void indexCorpus(CollectionHelper& h) {
+    h.index(flatdoc("id", "a", "foo_w", "apple", "prio_i", 50));
+    h.index(flatdoc("id", "b", "foo_w", "apple banana", "prio_i", 10));
+    h.commit();
+    h.index(flatdoc("id", "d", "foo_w", "apple banana d1", "prio_i", 50));
+    h.index(flatdoc("id", "c", "foo_w", "banana c1 c2 c3 c4", "prio_i", 40));
+    h.commit();
+    h.index(flatdoc("id", "e", "foo_w", "apple banana e1 e2", "prio_i", 20));
+    h.commit();
+  }
+
+  // `extra` is spliced into the fusion object (weights, rrf) and
+  // `moreSources` into its sources.
+  LocalReqHandle run(std::string_view extra, std::string_view moreSources = "") {
+    auto req = localReq(luxirNode->getSearchEngine());
+    parseQueryRequest(R"({"ops":{"f":{"fusion":{"sources":{)" + std::string(moreSources) + R"(
+        "apple":{"query":{"match":{"foo_w":"apple"}}},
+        "banana":{"query":{"match":{"foo_w":"banana"}},
+                  "sort":[{"expr":"prio_i","dir":"desc"}]}},
+        "get_number":true,"get_scores":true,"fields":["id"],
+        "ops":{"ids":{"field_facet":{"field":"id"}}},)"
+        + std::string(extra) + "}}}}", req->rawRequest(), req->mr);
+    req->execute();
+    return req;
+  }
+
+  static std::set<std::string_view> facetIds(LocalReq& req) {
+    const auto* ids = req.docList("f")->ops.at("ids")->facetResult();
+    const auto& v = std::get<api::ColStr>(ids->bucket_ids->kind).v;
+    return {v.begin(), v.end()};
+  }
+
+  void expectError(std::string_view extra, std::string_view msg) {
+    ExpectLog quiet("Search request rejected");
+    auto req = run(extra);
+    EXPECT_NE(std::string::npos, req->errorMsg().find(msg)) << req->errorMsg();
+  }
+};
+
+TEST_F(WeightedRrfTest, weightedScores) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  // Unlisted sources default to weight 1, and duplicate keys are last-wins.
+  for (auto weights : {R"("weights":{"apple":2,"banana":0.5},"rrf":{"k":60})",
+                       R"("weights":{"banana":1,"apple":2,"banana":0.5},"rrf":{})"}) {
+    auto req = run(weights);
+    ASSERT_OK(req);
+    EXPECT_EQ((std::vector<std::string>{"b", "d", "e", "a", "c"}), resultIds(*req));
+    auto s = resultScores(*req);
+    ASSERT_EQ(5u, s.size());
+    EXPECT_FLOAT_EQ(2.0f / 62 + 0.5f / 64, s[0]);
+    EXPECT_FLOAT_EQ(2.0f / 63 + 0.5f / 61, s[1]);
+    EXPECT_FLOAT_EQ(2.0f / 64 + 0.5f / 63, s[2]);
+    EXPECT_FLOAT_EQ(2.0f / 61, s[3]);
+    EXPECT_FLOAT_EQ(0.5f / 62, s[4]);
+  }
+  auto req = run(R"("weights":{"banana":1},"rrf":{})");
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"d", "b", "e", "a", "c"}), resultIds(*req));
+  EXPECT_FLOAT_EQ(1.0f / 63 + 1.0f / 61, resultScores(*req)[0]);
+}
+
+// A zero-weight source is not parsed or executed: its documents are absent
+// from the fused list, found, and the fusion ops domain.  The disabled
+// "bad" source would be rejected if it were parsed.
+TEST_F(WeightedRrfTest, zeroWeightDisablesSource) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  auto req = run(R"("weights":{"banana":0,"bad":0},"rrf":{})",
+                 R"("bad":{"ops":{"x":{"field_facet":{"field":"id"}}}},)");
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "d", "e"}), resultIds(*req));
+  EXPECT_EQ((std::vector<float>{1.0f / 61, 1.0f / 62, 1.0f / 63, 1.0f / 64}),
+            resultScores(*req));
+  EXPECT_EQ(4, req->docList("f")->found.value_or(-1));
+  EXPECT_EQ((std::set<std::string_view>{"a", "b", "d", "e"}), facetIds(*req));
+
+  auto both = run(R"("rrf":{})");
+  ASSERT_OK(both);
+  EXPECT_EQ(5, both->docList("f")->found.value_or(-1));
+  EXPECT_EQ((std::set<std::string_view>{"a", "b", "c", "d", "e"}), facetIds(*both));
+}
+
+TEST_F(WeightedRrfTest, optionalK) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  auto omitted = run(R"("weights":{"banana":0},"rrf":{})");
+  ASSERT_OK(omitted);
+  EXPECT_FLOAT_EQ(1.0f / 61, resultScores(*omitted)[0]);
+  auto zero = run(R"("weights":{"banana":0},"rrf":{"k":0})");
+  ASSERT_OK(zero);
+  EXPECT_EQ((std::vector<float>{1.0f, 1.0f / 2, 1.0f / 3, 1.0f / 4}), resultScores(*zero));
+  expectError(R"("rrf":{"k":-1})", "RrfFusion.k must be >= 0");
+}
+
+TEST_F(WeightedRrfTest, validation) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  expectError(R"("weights":{"pear":1},"rrf":{})",
+              "fusion 'f': weights names unknown source 'pear'");
+  expectError(R"("weights":{"apple":-0.5},"rrf":{})",
+              "fusion 'f': weight for source 'apple' must be finite and >= 0");
+  expectError(R"("weights":{"apple":0,"banana":0},"rrf":{})",
+              "fusion 'f': at least one source weight must be > 0");
+  for (double bad : {std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity(), 1e300}) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& fusion = req->collection("main").topDocs("f").rawOp().kind.emplace<api::Fusion>();
+    fusion.rrf.emplace();
+    setTextSource(addSource(fusion, "apple", req->mr), req->mr, "foo_w", "apple", 5);
+    std::array<std::pair<std::string_view, double>, 1> weights{{{"apple", bad}}};
+    fusion.weights = api::map_view<std::string_view, double>(
+        std::span<const std::pair<std::string_view, double>>(weights));
+    ExpectLog quiet("Search request rejected");
+    req->execute();
+    EXPECT_NE(std::string::npos, req->errorMsg().find(
+        "weight for source 'apple' must be finite and >= 0")) << req->errorMsg();
+  }
 }
