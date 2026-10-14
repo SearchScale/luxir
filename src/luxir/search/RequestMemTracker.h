@@ -14,11 +14,18 @@ namespace luxir {
 // and the request ceiling.
 class RequestMemTracker {
   std::atomic<size_t> chargedBytes{0};
+  std::atomic<size_t> peakBytes{0};
   size_t maxBytes;
 
   [[noreturn]] void throwLimit(std::string_view breaker,
                                std::string_view detail,
                                size_t attemptedTotal) const;
+
+  void recordPeak(size_t total) {
+    size_t peak = peakBytes.load(std::memory_order_relaxed);
+    while (peak < total && !peakBytes.compare_exchange_weak(
+        peak, total, std::memory_order_relaxed)) {}
+  }
 
 public:
   explicit RequestMemTracker(size_t maxBytes) : maxBytes(maxBytes) {}
@@ -37,6 +44,7 @@ public:
   }
 
   size_t ceiling() const { return maxBytes; }
+  size_t peak() const { return peakBytes.load(std::memory_order_relaxed); }
 };
 
 } // namespace luxir

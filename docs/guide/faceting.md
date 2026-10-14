@@ -140,6 +140,86 @@ The same API works for field, range, and query facets directly under the
 query's `ops`. See [Multi-select navigation](#multi-select-navigation) for
 selection values, normalization, and the stricter `selection_mode: "all"`.
 
+## Counting groups and distinct keys
+
+Under a [collapsed list](searching.md#collapsing-results), field, range, and
+query facets count distinct groups by default. A product contributes once to a
+color bucket if a matching variant in that facet's document domain has that color.
+The count uses the collapse key and its missing policy, including tuple keys.
+
+```json
+{
+  "collapse": "product_id_s",
+  "limit": 10,
+  "ops": {
+    "colors": {"field_facet": {"field": "color_s", "limit": 20}},
+    "variant_colors": {
+      "field_facet": {"field": "color_s", "count_unit": "docs"}
+    },
+    "average_price": "avg(price_i)"
+  }
+}
+```
+
+`count_unit: "docs"` counts documents. `count_unit: "groups"` requires an
+enclosing collapsed list and uses the nearest one's key and missing policy.
+Nested facets inherit their parent's measure, including an explicit
+`docs` override. Each nested facet still sees only the documents in its
+parent bucket. An uncollapsed child `top_docs` remains a document list; its
+facets inherit the counting measure. A child list with its own collapse
+establishes a new key and default measure.
+
+The measure governs bucket counts, their default order, `mincount`, and
+`missing`. The missing bucket counts a group when any document in the facet's
+domain lacks the facet value. That group can also occur in named buckets, so
+bucket counts need not sum to `found`. Selected buckets retain their exact
+counts, including zero, even below `mincount` or outside the ordinary page.
+
+Selections and `except_ops` still filter individual documents. With a size=M
+filter, a color bucket counts only variants of size M. A product with red/S
+and blue/M contributes to blue, not red. Metrics such as `avg(price_i)` fold
+the bucket's documents and remain document-weighted.
+
+Use `count_distinct` to count an independent key, including outside collapse:
+
+```json
+{
+  "limit": 0,
+  "ops": {
+    "authors": {
+      "field_facet": {
+        "field": "category_s",
+        "count_distinct": {"field": ["publisher_s", "author_s"], "missing": "drop"}
+      }
+    }
+  }
+}
+```
+
+The key specification accepts the same fields and missing policies as
+`collapse`; a field-name string is shorthand. An explicit `count_unit` and
+`count_distinct` must describe the same measure. `docs` conflicts with any
+distinct key. Counts are exact across segments, including scattered updates
+and deletes. Keys retain their exact values, including numeric extrema and every tuple
+null pattern. Missing keys under `expand` each form their own group. Group
+counting adds no work during indexing or reader reopen.
+
+A group can contribute to many buckets, and the engine must recognize it
+across segments and parallel workers. Memory grows with the number of matching
+groups, facet values, and distinct combinations, rather than only the number of
+returned buckets. Broad multi-valued and high-cardinality facets can cost
+substantially more than document counting. Tuple keys can also add work when
+their component ranges are large.
+
+Distinct counting uses the request memory budget. Exceeding the budget fails
+the request; counts never become estimates or document counts. Use
+`count_unit: "docs"` when document counts are the intended measure.
+
+Distinct counting supports STRING/ID and INT/DATE field facets, numeric/date
+range facets, and query facets, including overlapping query buckets and nested
+operations. TEXT field facets, metric sorts with distinct counts, and fusion
+beneath a collapsed list are rejected.
+
 ## Field facets
 
 A `field_facet` groups by distinct field value. For example, count books in

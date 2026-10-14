@@ -98,6 +98,7 @@ enum class Kind {
 }
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
+namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
@@ -569,6 +570,8 @@ struct ExprOp {
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
 struct FieldFacet {
+  std::optional<FieldFacet_::CountUnit> count_unit;
+  ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
   std::string_view field;
   std::optional<std::int64_t> limit;
   std::optional<std::int64_t> mincount;
@@ -583,6 +586,8 @@ struct QueryBucket {
   ::hpp_proto::optional_indirect_view<Query> query;
 };
 struct QueryFacet {
+  ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
+  std::optional<FieldFacet_::CountUnit> count_unit;
   std::span<const QueryBucket> buckets;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   ::hpp_proto::optional_indirect_view<Val> selected;
@@ -653,6 +658,8 @@ struct Val {                                                   // needs Map,ArrV
   std::string_view asString() const { return std::get<std::string_view>(kind); }
 };
 struct RangeFacet {                                             // needs Val,CalendarGap
+  ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
+  std::optional<FieldFacet_::CountUnit> count_unit;
   std::variant<std::monostate, Val, CalendarGap> gap_kind;
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> start;

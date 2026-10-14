@@ -334,13 +334,6 @@ TEST_F(CollapseTest, validationAndAbsentKeys) {
     req->execute();
     EXPECT_FALSE(req->ok()) << collapse;
   }
-  for (std::string extra : {R"json("ops":{"metric":"sum(key_i)"})json"}) {
-    auto req = localReq(luxirNode->getSearchEngine());
-    ASSERT_TRUE(luxir::api::read_json(req->rawRequest(),
-        R"({"collection":"main","collapse":"key_s",)" + extra + "}", req->mr));
-    req->execute();
-    EXPECT_FALSE(req->ok());
-  }
   for (std::string body : {
       R"({"ops":{"f":{"fusion":{"sources":{"s":{"collapse":"key_s"}},"rrf":{}}}}})",
       R"({"ops":{"f":{"fusion":{"sources":{"s":{}},"rrf":{},"ops":{"q":{"top_docs":{"collapse":"key_s"}}}}}}})",

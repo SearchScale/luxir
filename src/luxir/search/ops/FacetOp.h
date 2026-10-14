@@ -12,6 +12,7 @@
 #include "luxir/search/IndexReader.h"
 #include "FacetEmit.h"
 #include "FacetExecution.h"
+#include "DistinctFacetCounts.h"
 #include "SearchOp.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/DocsReader.h"
@@ -35,6 +36,31 @@ namespace luxir {
 
 class FacetReq : public SearchOp {
 public:
+  const CollapsePlan* countDistinct = nullptr;
+  std::shared_ptr<const FacetGroupPlan> groupPlan;
+  // RUN requires every group's matching docs to form one run in exactly one
+  // segment. Index sorting alone is insufficient: it also needs ownership or
+  // a key-ordered merge across segments.
+  static constexpr bool isContiguous = false;
+  FacetDimension groupDimension() const { return groupPlan->dimension; }
+
+  template <typename Visit>
+  void collectGroups(DistinctFacetCounts& data, int32_t segnum, DocSet* domain, Visit&& visit) {
+    auto pool = MemPool::threadLocalPoolGuard();
+    CollapseKeyReader keys(*countDistinct);
+    keys.withWalk(segnum, domain, [&](auto read) {
+      data.collect([&](auto add, auto missing) {
+        if constexpr (std::is_same_v<std::invoke_result_t<decltype(read), int32_t>, const CollapseKey*>) {
+          int32_t previous = -1;
+          GroupIdentity saved{GroupIdentity::DROP};
+          visit([&](int32_t doc) {
+            if (doc != previous) { saved = data.identity(*groupPlan, read(doc)); previous = doc; }
+            return saved;
+          }, add, missing);
+        } else visit(read, add, missing);
+      });
+    });
+  }
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
@@ -55,6 +81,34 @@ public:
   }
 
   virtual ~FacetReq() = default;
+
+  size_t distinctBindingBytes(FacetDimension values) const {
+    if (DistinctFacetCounts::select(values, groupDimension(), isContiguous) == DistinctFacetMode::PAGED) {
+      uint64_t groups = groupDimension().size;
+      uint64_t words = groups / 64 + (groups % 64 != 0);
+      return saturatingMultiply((size_t)(values.size + 1),
+          (size_t)(words * 8 + (words / 64 + (words % 64 != 0) + 1) * sizeof(uint64_t*)));
+    }
+    // HASH grows with this bucket's touched pairs, just as a document facet's
+    // hash grows with its touched values. Do not price the entire index into
+    // every child binding; actual growth is enforced by the request breaker.
+    return 0;
+  }
+
+  // Distinct missing counts need document identities, not a scalar missing
+  // total. The column presence set is independent of bucket/range predicates.
+  void forEachMissing(DocSet* domain, int32_t segnum, auto&& accept) {
+    auto& postings = reader.segments()[(size_t)segnum].postingsReader();
+    auto* info = fieldInfo(segnum);
+    if (info == nullptr) { forEachDomainDoc(domain, postings.maxDoc(), accept); return; }
+    DocsReader docs(postings, *info);
+    if (!docs.hasBitset()) return;
+    screaming::BitSet::Iterator values(docs.bitset());
+    forEachDomainDoc(domain, postings.maxDoc(), [&](int32_t doc) {
+      if (values.val() < doc) values.advance(doc);
+      if (values.val() != doc) accept(doc);
+    });
+  }
 
   void init() override {
     for (const auto& [childName, child] : subOps) {
@@ -151,6 +205,15 @@ protected:
 public:
   void init() override {
     FacetReq::init();
+    if (countDistinct != nullptr) {
+      // Distinct counting feeds result children with ordinary bucket document
+      // domains. Metrics fold those documents, never one witness per key.
+      if (!fieldFacet.sort.empty()) {
+        throw RequestError("facet '" + std::string(facetName)
+            + "': metric sort with count_distinct is not supported yet");
+      }
+      return;
+    }
     auto sorts = fieldFacet.sort;
     if (!sorts.empty()) {
       if (sorts.size() > 1) {
@@ -280,7 +343,7 @@ public:
     }
 
     template <typename Key, typename Buckets, typename KeyAt, typename IdAt>
-    static std::vector<SelectedFacetBucket<Key>> selectedBuckets(
+    static auto selectedBuckets(
         const Buckets& finalized, KeyAt&& keyAt, IdAt&& idAt) {
       std::vector<SelectedFacetBucket<Key>> buckets;
       buckets.reserve(finalized.size());
@@ -290,6 +353,40 @@ public:
             finalized[i].pinned() ? FacetBucketFlags::PINNED : FacetBucketFlags::NONE});
       }
       return buckets;
+    }
+
+    template <typename Enumerate, typename Lookup>
+    auto finishCountBuckets(Enumerate&& enumerate,
+                            std::span<const std::optional<int64_t>> pins, Lookup&& count) {
+      FieldBucketFinalizer<int64_t, std::monostate, decltype(countFieldBucketOrder)> finalizer(
+          fieldOp().minCount, 0, fieldOp().limit, countFieldBucketOrder);
+      enumerate(finalizer);
+      auto finalized = finalizer.finish();
+      std::vector<PinnedBucketValue<>> pinValues;
+      for (auto key : pins) pinValues.push_back({key ? count(*key) : 0, {}});
+      mergePinnedBuckets<int64_t, std::monostate>(finalized, pins, pinValues);
+      return finalized;
+    }
+
+    // Count-only document and distinct facets share labels, output and child
+    // routing. Their counter enumeration/lookup and domain producers differ.
+    template <typename Label, typename ResolveLabel, typename ExecuteChildren>
+    void emitCountPage(const std::vector<FinalizedFacetBucket<int64_t>>& finalized,
+                       int64_t missing, ResolveLabel&& label, ExecuteChildren&& executeChildren) {
+      std::vector<std::pair<Label, int64_t>> emitted;
+      emitted.reserve(finalized.size());
+      for (const auto& bucket : finalized) emitted.emplace_back(label(bucket), bucket.count);
+      auto& out = *slotArm<luxir::api::FacetResult>(nullptr);
+      emitBuckets(out, emitted, op.req.lastResponse->mr);
+      if (fieldOp().missing) out.missing = missing;
+      using ChildKey = std::conditional_t<std::is_same_v<Label, std::string>, std::string_view, Label>;
+      auto buckets = selectedBuckets<ChildKey>(finalized,
+          [&](size_t i) -> ChildKey { return emitted[i].first; },
+          [&](size_t i) -> std::optional<FacetBucketId> {
+            if constexpr (std::is_same_v<Label, int64_t>) return FacetBucketId{emitted[i].first};
+            else return finalized[i].key ? std::optional(FacetBucketId{*finalized[i].key}) : std::nullopt;
+          });
+      executeChildren(buckets);
     }
 
     template <typename Data = MergeableFieldFacetInline>
@@ -464,6 +561,122 @@ public:
     };
   };
 
+  // A measure-selected count binding, sharing column readers, bucket
+  // finalization and child-domain execution with document facets. The ordinary
+  // calculators retain their existing loops and additive reduction.
+  template <bool Ordinal>
+  class DistinctCalc : public Calc {
+    std::shared_ptr<OrdMap> ordMap;
+    SegmentMergeDriver<DistinctFacetCounts> driver;
+    FacetCountResource domainResource;
+    std::pmr::vector<DomainHandle> input;
+
+    FacetDimension valueDimension;
+    DistinctFacetMode mode = DistinctFacetMode::AUTO;
+    void collect(DistinctFacetCounts& data, int32_t segnum, DocSet* domain) {
+      auto& facet = this->fieldOp();
+      auto pool = MemPool::threadLocalPoolGuard();
+      auto& postings = facet.reader.segments()[(size_t)segnum].postingsReader();
+      auto* info = facet.fieldInfo(segnum);
+      int64_t missing = 0;
+      facet.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+        if (!info) { missing = domain ? domain->card() : postings.maxDoc(); return; }
+        if constexpr (Ordinal) {
+          OrdColReader column(postings, *info);
+          forEachOrdValue(domain, column, ordMap->getSegToGlobal(segnum), postings.maxDoc(), missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE { add(value, group(doc)); });
+        } else {
+          IntColReader column(postings, *info);
+          forEachIntColValue(domain, column, postings.maxDoc(), missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE { add(value, group(doc)); });
+        }
+      });
+      if (facet.missing && missing != 0) {
+        facet.collectGroups(data, segnum, domain, [&](auto group, auto, auto missingBucket) {
+          facet.forEachMissing(domain, segnum,
+              [&](int32_t doc) { missingBucket(group(doc)); });
+        });
+      }
+    }
+
+    void result(std::unique_ptr<DistinctFacetCounts> data) {
+      auto& facet = this->fieldOp();
+      data->finish();
+      auto pool = MemPool::threadLocalPoolGuard();
+      std::optional<OrdMapStr> labels;
+      if constexpr (Ordinal) labels.emplace(pool.pool(), ordMap.get(), facet.reader, facet.segInfos);
+      std::vector<std::optional<int64_t>> pins;
+      if constexpr (Ordinal) {
+        for (std::string_view selected : facet.selectedStrings) {
+          pins.push_back(labels->termStats(selected).globalOrd);
+        }
+      } else for (int64_t selected : facet.selectedInts) pins.push_back(selected);
+      auto finalized = this->finishCountBuckets([&](auto& finalizer) {
+        for (auto [value, count] : data->counts) if (count > 0) finalizer.add({value, count, {}});
+        if constexpr (Ordinal) if (facet.minCount == 0) {
+          for (uint64_t value = 0; value < valueDimension.size; value++) {
+            if (data->count((int64_t)value) == 0) finalizer.add({(int64_t)value, 0, {}});
+          }
+        }
+      }, pins, [&](int64_t key) { return data->count(key); });
+      int64_t missingCount = data->missing();
+      data.reset();
+      auto children = [&](auto& buckets) {
+        using Key = std::conditional_t<Ordinal, std::string_view, int64_t>;
+        this->template executeBucketChildren<Key>(buckets, FacetBucketProducer::JOINT,
+          [&](size_t segnum, auto block, FacetBucketFeed feed) {
+            feedFacetBucketDomainChunks(facet.reader.segments()[segnum].maxDoc(), block,
+                FACET_BUCKET_DOMAIN_BYTES, feed, [&](auto chunk) {
+                  boost::unordered_flat_map<int64_t, int32_t> bucketOf;
+                  for (size_t i = 0; i < chunk.size(); i++) {
+                    if (chunk[i].id) bucketOf.emplace(chunk[i].id->value, (int32_t)i);
+                  }
+                  return buildFacetBucketDomains(facet.reader.segments()[segnum].maxDoc(), chunk.size(),
+                      [&](auto&& accept) {
+                        int64_t missing = 0;
+                        if constexpr (Ordinal) facet.facetSegOrdCol(input[segnum].get(), (int32_t)segnum,
+                            missing, ordMap->getSegToGlobal((int32_t)segnum), accept);
+                        else facet.facetSegIntCol(input[segnum].get(), (int32_t)segnum, missing, accept);
+                      }, [&](int64_t value) {
+                        auto it = bucketOf.find(value);
+                        return it == bucketOf.end() ? -1 : it->second;
+                      });
+                });
+          });
+      };
+      if constexpr (Ordinal) this->template emitCountPage<std::string>(finalized, missingCount,
+          [&](const auto& bucket) { return std::string(bucket.pinned() ? facet.selectedStrings[bucket.pinIndex]
+              : labels->ordToStr(*bucket.key)); }, children);
+      else this->template emitCountPage<int64_t>(finalized, missingCount,
+          [](const auto& bucket) { return *bucket.key; }, children);
+    }
+
+  public:
+    DistinctCalc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+                 std::shared_ptr<OrdMap> ordMap = {}, FacetDimension values = {})
+        : Calc(op, parent, slot, numSlots), ordMap(std::move(ordMap)),
+          driver(op.req.reader->segments().size(),
+              [this](std::unique_ptr<DistinctFacetCounts> data) { result(std::move(data)); }),
+          domainResource(op.req.memoryTracker, std::format("facet '{}' domains", op.name)), input(&domainResource) {
+      driver.setCreator([this]() { return new DistinctFacetCounts(this->op.req.memoryTracker,
+          std::format("facet '{}'", this->op.name), mode, valueDimension, this->fieldOp().groupDimension(), FacetReq::isContiguous); });
+      if constexpr (Ordinal) valueDimension = {true, 0, (uint64_t)(this->ordMap ? this->ordMap->numOrds() : 0)};
+      else valueDimension = values;
+      mode = DistinctFacetCounts::select(valueDimension, this->fieldOp().groupDimension(), FacetReq::isContiguous);
+      if (!this->fieldOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+    }
+
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
+      unused(tg);
+      if (segnum == -1) { driver.completeEmpty(); return; }
+      DocSet* docs = domain.get();
+      if (!input.empty()) input[(size_t)segnum] = std::move(domain);
+      driver.contribute([&](DistinctFacetCounts& data) { collect(data, segnum, docs); });
+    }
+
+
+  };
+
 public:
   FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
@@ -557,6 +770,10 @@ public:
     globalMin = range.min;
     globalMax = range.max;
     useVector = range.useVector;
+  }
+
+  FacetDimension valueDimension() const {
+    return {useVector, globalMin, useVector ? (uint64_t)globalMax - (uint64_t)globalMin + 1 : 0};
   }
 
   bool canEmitAsBucketChild() const override {
@@ -701,69 +918,31 @@ public:
     };
 
     void facetResult(MergeableIntFacet& merged) {
-      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result
-      auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
-      auto minCount = thisOp().minCount;
-      auto limit = thisOp().limit;
-      auto missing = thisOp().missing;
-
-      // TODO: stream into FieldBucketFinalizer instead of collecting every
-      // counted value (see finalizeFieldBuckets in FacetEmit.h).
-      std::vector<FacetCandidate<int64_t>> candidates;
-      // Both storage types (monostate -> neither -> empty result, e.g. empty index).
-      if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
-        for (auto [val, count] : *countMap) {
-          candidates.push_back({val, count, {}});
+      auto lookup = [&](int64_t selected) -> int64_t {
+        if (auto* counts = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
+          auto it = counts->find(selected);
+          return it == counts->end() ? 0 : it->second;
         }
-      } else if (auto* countVector = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
-        for (size_t i = 0; i < countVector->size(); i++) {
-          if ((*countVector)[i] > 0) {
-            candidates.push_back({merged.minValue + (int64_t)i,
-                                  (*countVector)[i], {}});
-          }
-        }
-      }
-      // Selected values are reconciled against the finished page, and the
-      // count for one the page does not hold is read straight out of the
-      // counter rather than carried through selection.
-      std::vector<std::optional<int64_t>> pins;
-      std::vector<PinnedBucketValue<>> pinValues;
-      pins.reserve(thisOp().selectedInts.size());
-      pinValues.reserve(thisOp().selectedInts.size());
-      for (int64_t selected : thisOp().selectedInts) {
-        pins.emplace_back(selected);
-        int64_t count = 0;
-        if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
-          auto it = countMap->find(selected);
-          if (it != countMap->end()) count = it->second;
-        } else if (auto* countVector =
-                       std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
+        if (auto* counts = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
           uint64_t index = (uint64_t)selected - (uint64_t)merged.minValue;
-          if (index < countVector->size()) {
-            count = (*countVector)[index];
+          return index < counts->size() ? (*counts)[index] : 0;
+        }
+        return 0;
+      };
+      std::vector<std::optional<int64_t>> pins;
+      for (int64_t selected : thisOp().selectedInts) pins.push_back(selected);
+      auto finalized = finishCountBuckets([&](auto& finalizer) {
+        if (auto* counts = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
+          for (auto [value, count] : *counts) finalizer.add({value, count, {}});
+        } else if (auto* counts = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
+          for (size_t i = 0; i < counts->size(); i++) if ((*counts)[i] > 0) {
+            finalizer.add({(int64_t)((uint64_t)merged.minValue + i), (*counts)[i], {}});
           }
         }
-        pinValues.push_back({count, {}});
-      }
-      auto finalized = finalizeCountFieldBuckets(
-          std::move(candidates), minCount, 0, limit);
-      mergePinnedBuckets<int64_t, std::monostate>(finalized, pins, pinValues);
-      std::vector<std::pair<int64_t, int64_t>> countVec;
-      countVec.reserve(finalized.size());
-      for (const auto& bucket : finalized) {
-        assert(bucket.key.has_value());
-        countVec.emplace_back(*bucket.key, bucket.count);
-      }
-      emitBuckets(facetResultProto, countVec, mr);
-      if (missing) {
-        facetResultProto.missing = merged.missing_num;
-      }
-      if (!thisOp().subOps.empty()) {
-        auto buckets = selectedBuckets<int64_t>(finalized,
-            [&](size_t i) { return *finalized[i].key; },
-            [&](size_t i) { return FacetBucketId{*finalized[i].key}; });
-        executeResultChildren(buckets);
-      }
+      }, pins, lookup);
+      emitCountPage<int64_t>(finalized, merged.missing_num,
+          [](const auto& bucket) { return *bucket.key; },
+          [this](auto& buckets) { executeResultChildren(buckets); });
     }
 
     void facetInlineResult(std::unique_ptr<MergeableFieldFacetInline> data) {
@@ -817,6 +996,9 @@ public:
   };
 
   size_t facetBucketResidentBytes() const override {
+    if (countDistinct != nullptr) {
+      return saturatingAdd(sizeof(DistinctCalc<false>), distinctBindingBytes(valueDimension()));
+    }
     int64_t width = useVector ? globalMax - globalMin + 1 : 0;
     size_t bytes = sizeof(Calc);
     if (inlineSubOps.empty()) {
@@ -839,6 +1021,7 @@ public:
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
+    if (countDistinct != nullptr) return new DistinctCalc<false>(*this, parent, slot, numSlots, {}, valueDimension());
     return new Calc(*this, parent, slot, numSlots);
   };
 
@@ -1135,6 +1318,7 @@ class FixedBucketFacetReq : public FacetReq {
   std::span<const size_t> selectedBuckets;
 
 public:
+  struct CountView { std::span<const int64_t> counts; int64_t missing_num; };
   class MergeableFixedBuckets : public MergeableData {
   public:
     std::vector<int64_t> counts;
@@ -1164,6 +1348,10 @@ public:
       numBuckets(numBuckets), selectedBuckets(selectedBuckets) {}
 
   size_t bucketCount() const { return numBuckets; }
+  size_t facetBucketResidentBytes() const override {
+    if (countDistinct == nullptr) return SearchOp::facetBucketResidentBytes();
+    return distinctBindingBytes({true, 0, (uint64_t)numBuckets});
+  }
   std::span<const size_t> selectedBucketIndexes() const {
     return selectedBuckets;
   }
@@ -1178,7 +1366,7 @@ public:
   virtual bool requiresWholeReaderDomain() const { return false; }
 
   virtual std::vector<size_t> emittedBuckets(
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const uint8_t> pinned) const {
     unused(merged);
     unused(pinned);
@@ -1190,12 +1378,17 @@ public:
 
   virtual void emitBucketResult(
       luxir::api::FacetResult& result,
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const = 0;
 
+  template <bool Distinct = false>
   class Calc : public Calculator {
-    SegmentMergeDriver<MergeableFixedBuckets> driver;
+  public:
+    using Data = std::conditional_t<Distinct, DistinctFacetCounts, MergeableFixedBuckets>;
+  private:
+    SegmentMergeDriver<Data> driver;
+    DistinctFacetMode mode = DistinctFacetMode::AUTO;
     std::atomic<int32_t> gatheredDomainsSeen{0};
 
   protected:
@@ -1209,7 +1402,7 @@ public:
     }
 
     virtual void collectSegment(
-        MergeableFixedBuckets& data, int32_t segnum, DocSet* domain) = 0;
+        Data& data, int32_t segnum, DocSet* domain) = 0;
     // The FacetBucketBlockExecutor domain source for result children.
     virtual void feedBucketDomains(
         size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
@@ -1219,9 +1412,9 @@ public:
     }
 
     void collectInputSegment(int32_t segnum, DocSet* domain) {
-      driver.contribute([&](MergeableFixedBuckets& data) {
-        if (data.counts.empty()) {
-          data.counts.assign(fixedOp().bucketCount(), 0);
+      driver.contribute([&](Data& data) {
+        if constexpr (!Distinct) {
+          if (data.counts.empty()) data.counts.assign(fixedOp().bucketCount(), 0);
         }
         collectSegment(data, segnum, domain);
       });
@@ -1236,7 +1429,7 @@ public:
       });
     }
 
-    void facetResult(MergeableFixedBuckets& merged) {
+    void facetResult(CountView merged) {
       auto& mr = op.req.lastResponse->mr;
       auto* result = slotArm<luxir::api::FacetResult>(nullptr);
 
@@ -1254,7 +1447,7 @@ public:
     // after its last segment. The subclass producer decides how many of a
     // segment's bucket domains are alive at once.
     void executeResultChildren(
-        const MergeableFixedBuckets& merged,
+        CountView merged,
         std::span<const size_t> emitted,
         std::span<const uint8_t> pinned) {
       if (fixedOp().subOps.empty() || emitted.empty()) return;
@@ -1293,9 +1486,21 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots),
         driver(op.req.reader->segments().size(),
-               [this](std::unique_ptr<MergeableFixedBuckets> merged) {
-                 facetResult(*merged);
-               }) {
+               [this](std::unique_ptr<Data> merged) {
+                 if constexpr (Distinct) {
+                   merged->finish();
+                   std::vector<int64_t> counts(fixedOp().bucketCount());
+                   for (size_t i = 0; i < counts.size(); i++) counts[i] = merged->count((int64_t)i);
+                   facetResult({counts, merged->missing()});
+                 } else facetResult({merged->counts, merged->missing_num});
+               }),
+        input() {
+      if constexpr (Distinct) {
+        driver.setCreator([this]() { return new Data(this->op.req.memoryTracker,
+            std::format("facet '{}'", this->op.name), mode,
+            FacetDimension{true, 0, (uint64_t)fixedOp().bucketCount()}, fixedOp().groupDimension(), FacetReq::isContiguous); });
+        mode = DistinctFacetCounts::select({true, 0, (uint64_t)fixedOp().bucketCount()}, fixedOp().groupDimension(), FacetReq::isContiguous);
+      }
       if (!fixedOp().subOps.empty() || fixedOp().requiresWholeReaderDomain()) {
         input.resize(op.req.reader->segments().size());
       }
@@ -1401,7 +1606,7 @@ public:
   }
 
   std::vector<size_t> emittedBuckets(
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const uint8_t> pinned) const override {
     std::vector<size_t> emitted;
     emitted.reserve(bucketCount());
@@ -1414,7 +1619,7 @@ public:
 
   void emitBucketResult(
       luxir::api::FacetResult& result,
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const override {
     size_t n = emitted.size();
@@ -1449,14 +1654,31 @@ public:
     if (missing) result.missing = merged.missing_num;
   }
 
-  class Calc : public FixedBucketFacetReq::Calc {
+  template <bool Distinct = false>
+  class Calc : public FixedBucketFacetReq::Calc<Distinct> {
+    using Base = FixedBucketFacetReq::Calc<Distinct>;
     IntFacetRangeReq& rangeOp() {
-      return (IntFacetRangeReq&)getOp();
+      return (IntFacetRangeReq&)this->getOp();
     }
 
     void collectSegment(
-        MergeableFixedBuckets& data, int32_t segnum,
+        typename Base::Data& data, int32_t segnum,
         DocSet* domain) override {
+      if constexpr (Distinct) {
+        auto& range = rangeOp();
+        int64_t missing = 0;
+        range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+          range.facetSegIntCol(domain, segnum, missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value), group(doc));
+              });
+        });
+        if (range.missing && missing != 0) range.collectGroups(data, segnum, domain,
+            [&](auto group, auto, auto missingBucket) {
+              range.forEachMissing(domain, segnum,
+                  [&](int32_t doc) { missingBucket(group(doc)); });
+            });
+      } else {
       int64_t start = rangeOp().fences.front();
       int64_t end = rangeOp().fences.back();
       auto& segment = rangeOp().reader.segments()[segnum];
@@ -1508,6 +1730,7 @@ public:
             if (val < start || val >= end) return;
             counts[range.bucketOf(val)]++;
           });
+      }
     }
 
     // Build one chunk of one segment's bucket domains in a value-column pass.
@@ -1527,7 +1750,7 @@ public:
           rangeOp().reader.segments()[segnum].maxDoc(), buckets.size(),
           [&](auto&& accept) {
             int64_t missing = 0;
-            rangeOp().facetSegIntCol(input[segnum].get(), (int32_t)segnum,
+            rangeOp().facetSegIntCol(this->input[segnum].get(), (int32_t)segnum,
                                      missing, accept);
           }, [&](int64_t value) {
             return value < start || value >= end
@@ -1546,12 +1769,13 @@ public:
 
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FixedBucketFacetReq::Calc(op, parent, slot, numSlots) {}
+      : Base(op, parent, slot, numSlots) {}
   };
 
   Calculator* createCalculator(
       Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+    if (countDistinct != nullptr) return new Calc<true>(*this, parent, slot, numSlots);
+    return new Calc<false>(*this, parent, slot, numSlots);
   }
 };
 
@@ -1598,7 +1822,7 @@ public:
 
   void emitBucketResult(
       luxir::api::FacetResult& result,
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const override {
     auto& ids = result.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
@@ -1611,11 +1835,13 @@ public:
     }
   }
 
-  class Calc : public FixedBucketFacetReq::Calc {
+  template <bool Distinct = false>
+  class Calc : public FixedBucketFacetReq::Calc<Distinct> {
+    using Base = FixedBucketFacetReq::Calc<Distinct>;
     std::vector<QueryPrep::PreparedSource> preparedSources;
 
     QueryFacetReq& queryOp() {
-      return (QueryFacetReq&)getOp();
+      return (QueryFacetReq&)this->getOp();
     }
 
     Query::SegmentSource& bucketSource(size_t bucket) {
@@ -1641,8 +1867,8 @@ public:
 
     void prepareGatheredDomains(oneapi::tbb::task_group* tg) override {
       std::vector<DocSet*> domains;
-      domains.reserve(input.size());
-      for (const DomainHandle& domain : input) {
+      domains.reserve(this->input.size());
+      for (const DomainHandle& domain : this->input) {
         domains.push_back(domain.get());
       }
       Query::Weight::PrepareContext context{
@@ -1656,8 +1882,18 @@ public:
     }
 
     void collectSegment(
-        MergeableFixedBuckets& data, int32_t segnum,
+        typename Base::Data& data, int32_t segnum,
         DocSet* domain) override {
+      if constexpr (Distinct) {
+        auto& segment = queryOp().reader.segments()[(size_t)segnum];
+        for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
+          auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+          DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
+          queryOp().collectGroups(data, segnum, matches.get(), [&](auto group, auto add, auto) {
+            forEachDomainDoc(matches.get(), segment.maxDoc(), [&](int32_t doc) { add((int64_t)bucket, group(doc)); });
+          });
+        }
+      } else {
       auto& segment = queryOp().reader.segments()[(size_t)segnum];
       // The count pass never retains matches (result children re-materialize
       // their selected buckets), so the direct count is eligible whenever the
@@ -1693,6 +1929,7 @@ public:
         DomainHandle matches(QueryPrep::materialize(supplier, guard.pool(), segment, domain));
         data.counts[bucket] += matches.get()->card();
       }
+      }
     }
 
     // Bucket queries are independent: one domain is alive at a time, and the
@@ -1708,7 +1945,7 @@ public:
             releaseBucketState(segment, block[i].key);
           });
           domain = materializeBucket(
-              segnum, block[i].key, input[segnum].get());
+              segnum, block[i].key, this->input[segnum].get());
         }
         feed(i, std::move(domain));
       }
@@ -1716,7 +1953,7 @@ public:
 
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FixedBucketFacetReq::Calc(op, parent, slot, numSlots) {}
+      : Base(op, parent, slot, numSlots) {}
 
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
       if (queryOp().segmentStateRetained(segment)) return;
@@ -1727,7 +1964,8 @@ public:
 
   Calculator* createCalculator(
       Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+    if (countDistinct != nullptr) return new Calc<true>(*this, parent, slot, numSlots);
+    return new Calc<false>(*this, parent, slot, numSlots);
   }
 };
 

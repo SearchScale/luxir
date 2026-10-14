@@ -224,6 +224,12 @@ The URL parameter `collapse=<field>` replaces the `q` operation's collapse
 specification with that field. `explain=request` shows the canonical object
 form. See [Limits](#limits) for unsupported combinations.
 
+Facets under the list count distinct groups in their own routed
+document domains by default. `count_unit: "docs"` restores document counts;
+expression metrics remain document-weighted. See
+[Counting groups and distinct keys](faceting.md#counting-groups-and-distinct-keys)
+for nested facets, selections, independent distinct keys, and memory costs.
+
 ## One request, several results
 
 Add `ops` beside the query when the response should include analytics as well
@@ -811,8 +817,10 @@ preparation without collecting results. See
 ## Limits
 
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
-  Operations under a collapsed list, collapse on fusion sources, and collapse
-  under fusion or facet buckets are unsupported.
+  Collapse on fusion sources and under fusion or facet buckets is unsupported.
+  Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
+  ranges, and query facets. TEXT distinct facets, metric facet sorts with
+  distinct counts, and fusion beneath collapse are unsupported.
 - kNN selects `k` documents before collapse, so repeated keys can produce
   fewer than `k` groups.
 - Ordered page-after pagination is not implemented. `offset` skips the first

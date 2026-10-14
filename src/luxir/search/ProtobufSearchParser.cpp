@@ -97,6 +97,9 @@ struct SearchParserImpl {
   TopDocsReq* firstQuery = nullptr;
   size_t nonDefaultDomainVariants = 0;
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
+  const CollapsePlan* enclosingCollapse = nullptr;
+  const CollapsePlan* inheritedFacetMeasure = nullptr;
+  std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
@@ -412,6 +415,12 @@ public:
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
+        auto* oldCollapse = enclosingCollapse;
+        auto* oldMeasure = inheritedFacetMeasure;
+        auto restore = scope_guard([&]() noexcept {
+          enclosingCollapse = oldCollapse;
+          inheritedFacetMeasure = oldMeasure;
+        });
         if (topDocs.collapse && (placement == OpsPlacement::FACET_BUCKET
                                  || placement == OpsPlacement::FUSION)) {
           throw RequestError("collapse is not supported under a facet bucket or Fusion.ops");
@@ -422,7 +431,12 @@ public:
         addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
         return qr;
       },
-      [&](const luxir::api::Fusion& fusion) -> SearchOp* { return parseFusion(name, fusion, depth); },
+      [&](const luxir::api::Fusion& fusion) -> SearchOp* {
+        if (enclosingCollapse != nullptr) {
+          throw RequestError("fusion under a collapsed list is not supported yet");
+        }
+        return parseFusion(name, fusion, depth);
+      },
       [&](const luxir::api::FieldFacet& facetReq) -> SearchOp* {
         FacetReq* facet;
         auto prepared = preparedFacets.find(&searchOp);
@@ -433,6 +447,9 @@ public:
         } else {
           facet = createFieldFacetReq(name, facetReq, placement);
         }
+        auto* oldMeasure = inheritedFacetMeasure;
+        inheritedFacetMeasure = ((FieldFacetReq*)facet)->countDistinct;
+        auto restore = scope_guard([&]() noexcept { inheritedFacetMeasure = oldMeasure; });
         addSubs(*facet, facetReq.ops, depth, OpsPlacement::FACET_BUCKET);
         return facet;
       },
@@ -446,6 +463,9 @@ public:
         } else {
           facet = createRangeFacetReq(name, facetReq, placement);
         }
+        auto* oldMeasure = inheritedFacetMeasure;
+        inheritedFacetMeasure = facet->countDistinct;
+        auto restore = scope_guard([&]() noexcept { inheritedFacetMeasure = oldMeasure; });
         addSubs(*facet, facetReq.ops, depth, OpsPlacement::FACET_BUCKET);
         return facet;
       },
@@ -468,6 +488,9 @@ public:
           validateQueryFacetQueries(plan);
         }
         FacetReq* facet = createQueryFacetReq(name, facetReq, plan);
+        auto* oldMeasure = inheritedFacetMeasure;
+        inheritedFacetMeasure = facet->countDistinct;
+        auto restore = scope_guard([&]() noexcept { inheritedFacetMeasure = oldMeasure; });
         addSubs(*facet, facetReq.ops, depth, OpsPlacement::FACET_BUCKET);
         return facet;
       },
@@ -527,11 +550,93 @@ public:
     }, value.kind);
   }
 
+  CollapsePlan* resolveCollapse(const api::Collapse& spec, bool getNumber) {
+    using Missing = luxir::api::Collapse_::MissingPolicy;
+    if (spec.missing != Missing::EXPAND && spec.missing != Missing::GROUP
+        && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
+    if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
+    auto* collapse = luxir::arenaCreate<CollapsePlan>(
+        req.arena, *req.reader, spec.missing, getNumber);
+    std::unordered_set<std::string> resolved;
+    for (std::string_view name : spec.field) {
+      auto field = req.schema->resolveFor(name, OpClass::VALUE);
+      auto& type = *field.fieldType;
+      if (type.multiValued() || !type.hasColumn()) {
+        throw RequestError("collapse key must be single-valued with a column: " + std::string(name));
+      }
+      if (!resolved.insert(field.physicalName).second) {
+        throw RequestError("duplicate resolved collapse field: " + std::string(name));
+      }
+      using Type = luxir::api::GroupComponent_::Type;
+      Type wireType;
+      switch (type.type()) {
+        case FieldType::STRING: wireType = Type::STRING; break;
+        case FieldType::ID: wireType = Type::ID; break;
+        case FieldType::INT: wireType = Type::INT; break; // Luxir integers are signed int64.
+        case FieldType::DATE: wireType = Type::DATE; break;
+        default: throw RequestError("unsupported collapse key type: " + std::string(name));
+      }
+      bool ordinal = type.type() == FieldType::STRING || type.type() == FieldType::ID;
+      if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
+        throw RequestError("string collapse key must be indexed: " + std::string(name));
+      }
+      collapse->fields.push_back({field.physicalName, wireType,
+          ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
+          req.reader->field(field.physicalName)});
+    }
+    return collapse;
+  }
+
+  template <typename Facet>
+  const CollapsePlan* resolveMeasure(const Facet& facetReq) {
+    const CollapsePlan* measure = inheritedFacetMeasure;
+    using Unit = api::FieldFacet_::CountUnit;
+    if (facetReq.count_unit) {
+      switch (*facetReq.count_unit) {
+        case Unit::DOCS: measure = nullptr; break;
+        case Unit::GROUPS:
+          if (enclosingCollapse == nullptr) {
+            throw RequestError("count_unit groups requires an enclosing collapse");
+          }
+          measure = enclosingCollapse;
+          break;
+        default: throw RequestError("invalid facet count_unit");
+      }
+    }
+    if (facetReq.count_distinct) {
+      auto* distinct = resolveCollapse(*facetReq.count_distinct, false);
+      if (facetReq.count_unit) {
+        bool same = measure != nullptr && measure->missing == distinct->missing
+            && measure->fields.size() == distinct->fields.size();
+        if (same) for (size_t i = 0; i < measure->fields.size(); i++) {
+          same &= measure->fields[i].name == distinct->fields[i].name;
+        }
+        if (!same) throw RequestError("conflicting count_unit and count_distinct measures");
+      }
+      measure = distinct;
+    }
+    return measure;
+  }
+
+  void configureMeasure(FacetReq& facet, const CollapsePlan* measure) {
+    facet.countDistinct = measure;
+    if (measure == nullptr) return;
+    for (auto& plan : facetGroupPlans) {
+      const auto* spec = &plan->key;
+      bool same = spec->fields.size() == measure->fields.size();
+      if (same) for (size_t i = 0; i < spec->fields.size(); i++) same &= spec->fields[i].name == measure->fields[i].name;
+      if (same) { facet.groupPlan = plan; return; }
+    }
+    facet.groupPlan = std::make_shared<FacetGroupPlan>(*measure);
+    facetGroupPlans.push_back(facet.groupPlan);
+  }
+
   FacetReq* createFieldFacetReq(
       std::string_view facetName, const luxir::api::FieldFacet& facetReq,
       OpsPlacement placement,
       const CanonicalValueSet* preparedSelected = nullptr) {
     validateSelectionEnvelope(facetName, facetReq, placement);
+    const CollapsePlan* measure = resolveMeasure(facetReq);
     const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
@@ -577,7 +682,7 @@ public:
       }
     }
 
-    FacetReq* facet = nullptr;
+    FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
       // DATE is epoch millis in the int column; it terms-facets exactly like
       // INT (distinct millis values).  Date-histogram bucketing is a range
@@ -612,6 +717,7 @@ public:
         break;
       }
       case FieldType::Type::TEXT:
+        if (measure != nullptr) throw RequestError("TEXT field_facet distinct counts are not supported yet");
         facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing, selectedStrings);
         break;
@@ -620,6 +726,7 @@ public:
     if (facet == nullptr) {
       throw std::runtime_error("Unknown facet field type: " + std::string(facetField));
     }
+    configureMeasure(*facet, measure);
     return facet;
   }
 
@@ -627,6 +734,7 @@ public:
       std::string_view facetName, const luxir::api::RangeFacet& facetReq,
       OpsPlacement placement) {
     validateSelectionEnvelope(facetName, facetReq, placement);
+    const CollapsePlan* measure = resolveMeasure(facetReq);
     const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     if (!facetReq.start.has_value() || !facetReq.end.has_value()) {
@@ -783,10 +891,12 @@ public:
             ? (int64_t)floatToSortableInt32((float)canonical)
             : doubleToSortableInt64(canonical);
       });
-      return luxir::arenaCreate<IntFacetRangeReq>(
+      auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, fieldType->type(), minCount,
           facetReq.missing, selected);
+      configureMeasure(*facet, measure);
+      return facet;
     }
 
     int64_t start = fieldType->type() == FieldType::Type::DATE
@@ -830,10 +940,12 @@ public:
           : fieldType->coerceColInt64(value, facetField, context);
     });
 
-    return luxir::arenaCreate<IntFacetRangeReq>(
+    auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetField, facetName, parsed.values,
         parsed.affine, parsed.affineGap, fieldType->type(), minCount,
         facetReq.missing, selected);
+    configureMeasure(*facet, measure);
+    return facet;
   }
 
   // Build the copyable sort plan. Schema lookups that may throw are resolved
@@ -1160,8 +1272,10 @@ public:
     for (size_t i = 0; i < weights.size(); i++) {
       weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
     }
-    return luxir::arenaCreate<QueryFacetReq>(
+    auto* facet = luxir::arenaCreate<QueryFacetReq>(
         req.arena, req, facetReq, facetName, plan.bucketQueries, weights);
+    configureMeasure(*facet, resolveMeasure(facetReq));
+    return facet;
   }
 
   std::vector<ParsedFilter> prepareFacetSelections(
@@ -1380,43 +1494,10 @@ public:
       if (placement == TopDocsPlacement::FUSION_SOURCE) {
         throw RequestError("collapse is not supported on a fusion source");
       }
-      if (!topDocsReq.ops.empty()) {
-        throw RequestError("ops under collapse require group counting support");
-      }
-      const auto& spec = *topDocsReq.collapse;
-      using Missing = luxir::api::Collapse_::MissingPolicy;
-      if (spec.missing != Missing::EXPAND && spec.missing != Missing::GROUP
-          && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
-      if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
-      collapse = luxir::arenaCreate<CollapsePlan>(
-          req.arena, *req.reader, spec.missing, topDocsReq.get_number);
-      std::unordered_set<std::string> resolved;
-      for (std::string_view name : spec.field) {
-        auto field = req.schema->resolveFor(name, OpClass::VALUE);
-        auto& type = *field.fieldType;
-        if (type.multiValued() || !type.hasColumn()) {
-          throw RequestError("collapse key must be single-valued with a column: " + std::string(name));
-        }
-        if (!resolved.insert(field.physicalName).second) {
-          throw RequestError("duplicate resolved collapse field: " + std::string(name));
-        }
-        using Type = luxir::api::GroupComponent_::Type;
-        Type wireType;
-        switch (type.type()) {
-          case FieldType::STRING: wireType = Type::STRING; break;
-          case FieldType::ID: wireType = Type::ID; break;
-          case FieldType::INT: wireType = Type::INT; break; // Luxir integers are signed int64.
-          case FieldType::DATE: wireType = Type::DATE; break;
-          default: throw RequestError("unsupported collapse key type: " + std::string(name));
-        }
-        bool ordinal = type.type() == FieldType::STRING || type.type() == FieldType::ID;
-        if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
-          throw RequestError("string collapse key must be indexed: " + std::string(name));
-        }
-        collapse->fields.push_back({field.physicalName, wireType,
-            ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
-            req.reader->field(field.physicalName)});
-      }
+      collapse = resolveCollapse(*topDocsReq.collapse, topDocsReq.get_number);
+      enclosingCollapse = collapse;
+      // Facets under a collapsed list count groups unless they say otherwise.
+      inheritedFacetMeasure = collapse;
     }
     Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
@@ -1617,7 +1698,7 @@ public:
     bool cacheFirstExactDomain = false;
     bool constantExactDomainRanking = requirements.needRankedDocs
         && scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE;
-    bool canOmitForExactDomain = !routedFilters
+    bool canOmitForExactDomain = collapse == nullptr && !routedFilters
         && placement == TopDocsPlacement::ROOT_OP
         && requirements.needExactDomain && !parsedSorts.useFieldSort
         && (!requirements.needRankedDocs || constantExactDomainRanking)
@@ -1656,7 +1737,7 @@ public:
     bool cacheFirstFieldSort = false;
     bool fieldSortBuildVetoed = false;
     bool cacheFirstFieldSortShape =
-        placement == TopDocsPlacement::ROOT_OP
+        collapse == nullptr && placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
         && limit > 0 && parsedSorts.useFieldSort
         && (requestFlags & Query::NEED_SCORES) == 0

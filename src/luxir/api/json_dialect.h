@@ -331,6 +331,8 @@ struct from<JSON, luxir::api::QueryFacet> {
     bool sawOps = false;
     bool sawSelected = false;
     bool sawSelectionMode = false;
+    bool sawCountUnit = false;
+    bool sawCountDistinct = false;
     util::scan_object_fields<Opts, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
@@ -349,6 +351,12 @@ struct from<JSON, luxir::api::QueryFacet> {
           } else if (key == "selection_mode" && !sawSelectionMode) {
             sawSelectionMode = true;
             util::from_json<O>(value.selection_mode, ctx, vit, vend);
+          } else if (key == "count_unit" && !sawCountUnit) {
+            sawCountUnit = true;
+            util::from_json<O>(value.count_unit, ctx, vit, vend);
+          } else if (key == "count_distinct" && !sawCountDistinct) {
+            sawCountDistinct = true;
+            util::from_json<O>(value.count_distinct, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -392,6 +400,14 @@ struct to<JSON, luxir::api::QueryFacet> {
     if (value.selection_mode != luxir::api::SelectionMode::ANY) {
       dump<",\"selection_mode\":" >(b, ix);
       serialize<JSON>::template op<Opts>(value.selection_mode, ctx, b, ix);
+    }
+    if (value.count_unit) {
+      dump<",\"count_unit\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.count_unit, ctx, b, ix);
+    }
+    if (value.count_distinct) {
+      dump<",\"count_distinct\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.count_distinct, ctx, b, ix);
     }
     dump<'}'>(b, ix);
   }

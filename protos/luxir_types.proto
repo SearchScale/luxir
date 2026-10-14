@@ -571,6 +571,10 @@ enum SelectionMode {
 // STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
 // counts, limits, mincount, missing, and selections.
 message FieldFacet {
+  enum CountUnit {
+    DOCS = 0; // Count documents.
+    GROUPS = 1; // Distinct keys of the nearest enclosing collapsed list.
+  }
   string field = 1;
 
   // Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all.
@@ -581,7 +585,7 @@ message FieldFacet {
   // STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain.
   // INT/DATE require a positive value when set.
   optional int64 mincount = 3;
-  bool missing = 4; // return the count of documents without a value
+  bool missing = 4; // Return the count without a value, in the chosen count unit.
 
   // One metric sub-operation name. Unset sorts by count
   // descending, then bucket value ascending.
@@ -593,6 +597,14 @@ message FieldFacet {
   // counts, even below mincount or absent from the index. Null is an error.
   Val selected = 7;
   SelectionMode selection_mode = 8; // ALL requires a nonempty selection
+
+  // Unset inherits a parent facet's measure, or counts groups beneath a
+  // collapsed list. GROUPS requires an enclosing collapse. Controls count,
+  // count order, mincount, and missing; metrics still fold documents.
+  optional CountUnit count_unit = 9;
+  // Exact distinct keys per bucket, also usable without collapse. Same key
+  // types and missing policies as Collapse. Conflicting measures are errors.
+  Collapse count_distinct = 10;
 }
 
 message CalendarGap {
@@ -621,7 +633,7 @@ message RangeFacet {
     CalendarGap calendar_gap = 10; // civil gap for DATE fields only
   }
   optional int64 mincount = 5; // minimum bucket count; unset = 0; must be >= 0
-  bool missing = 6; // return the count of documents without a value
+  bool missing = 6; // Return the count without a value, in the chosen count unit.
   map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
   string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only
 
@@ -630,6 +642,8 @@ message RangeFacet {
   // bounds after coercion are errors.
   Val selected = 11;
   SelectionMode selection_mode = 12; // same filtering rules as FieldFacet; see SelectionMode
+  optional FieldFacet.CountUnit count_unit = 13; // Inherits the parent measure; GROUPS uses the nearest collapse.
+  Collapse count_distinct = 14; // Exact distinct keys; same specification as Collapse.
 }
 
 message QueryBucket {
@@ -643,6 +657,8 @@ message QueryFacet {
   map<string, SearchOp> ops = 6; // sub-ops per bucket
   Val selected = 7; // bucket name or array of distinct existing names; null is an error
   SelectionMode selection_mode = 8; // same filtering rules as FieldFacet; see SelectionMode
+  optional FieldFacet.CountUnit count_unit = 9; // Inherits the parent measure; GROUPS uses the nearest collapse.
+  Collapse count_distinct = 10; // Exact distinct keys; same specification as Collapse.
 }
 
 // Overrides the incoming document set for an operation directly in

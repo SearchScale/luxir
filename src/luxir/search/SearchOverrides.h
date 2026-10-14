@@ -54,6 +54,15 @@ inline std::size_t forcedFacetBucketBlockBuckets = [] {
 // Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.
 inline std::size_t forcedRequestMemoryMaxBytes = 0;
+enum class DistinctFacetMode;
+extern DistinctFacetMode forcedDistinctFacetMode;
+// Test-only assertion: each group's matching docs form one run in exactly
+// one segment. Index sorting alone does not establish cross-segment ownership.
+inline bool distinctFacetRunContractForTests = false;
+struct DistinctFacetStats {
+  std::atomic<size_t> interned{0}, paged{0}, hash{0}, run{0}, refused{0};
+};
+inline DistinctFacetStats* distinctFacetStatsForTests = nullptr;
 inline std::atomic<size_t>* facetAggregateStateReservationCounterForTests =
     nullptr;
 

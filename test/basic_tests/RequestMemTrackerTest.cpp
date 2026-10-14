@@ -31,6 +31,7 @@ TEST(RequestMemTrackerTest, chargesReleasesAndNamesRejectedCharge) {
   EXPECT_EQ(6u, tracker.bytes());
   tracker.release(6);
   EXPECT_EQ(0u, tracker.bytes());
+  EXPECT_EQ(6u, tracker.peak());
 }
 
 TEST(RequestMemTrackerTest, partialChargePreservesReservationSemantics) {
@@ -39,6 +40,7 @@ TEST(RequestMemTrackerTest, partialChargePreservesReservationSemantics) {
   EXPECT_EQ(3u, tracker.chargeUpTo(5, 2, "test", "tail"));
   EXPECT_EQ(10u, tracker.bytes());
   tracker.release(10);
+  EXPECT_EQ(10u, tracker.peak());
 }
 
 TEST(RequestMemTrackerTest, nonThrowingChargeLeavesDeniedReservationAlone) {
@@ -49,6 +51,7 @@ TEST(RequestMemTrackerTest, nonThrowingChargeLeavesDeniedReservationAlone) {
   EXPECT_TRUE(tracker.tryCharge(4));
   EXPECT_EQ(10u, tracker.bytes());
   tracker.release(10);
+  EXPECT_EQ(10u, tracker.peak());
 }
 
 TEST(RequestMemTrackerTest, unlimitedTrackerStillRejectsCounterOverflow) {

@@ -376,6 +376,7 @@ public:
 
   void init() override {
     FieldFacetReq::init();
+    if (countDistinct != nullptr) return;
     // Whether the REMAINING sub-ops join the count pass or stay behind for the
     // post-selection bucket-domain feed. limit==-1 still inlines all because
     // every bucket is returned. A finite limit that covers the index-wide
@@ -1392,50 +1393,12 @@ public:
     void emitPage(std::vector<FinalizedFacetBucket<int64_t>> finalized,
                   int64_t missingCount) {
 
-      std::vector<std::pair<std::string, int64_t>> countVec;
-      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
-                         *thisOp().req.reader, thisOp().segInfos);
-      countVec.reserve(finalized.size());
-      selectedBuckets.reserve(finalized.size());
-      for (const auto& bucket : finalized) {
-        std::string_view key;
-        std::optional<FacetBucketId> id;
-        FacetBucketFlags flags = FacetBucketFlags::NONE;
-        if (bucket.pinned()) {
-          const auto& pin = thisOp().pinnedBuckets[bucket.pinIndex];
-          key = pin.key;
-          if (pin.ord.has_value()) id = FacetBucketId{*pin.ord};
-          flags = FacetBucketFlags::PINNED;
-        } else {
-          assert(bucket.key.has_value());
-          key = ordMapStr.ordToStr(*bucket.key);
-          id = FacetBucketId{*bucket.key};
-        }
-        countVec.emplace_back(key, bucket.count);
-        int32_t output = (int32_t)selectedBuckets.size();
-        selectedBuckets.push_back({
-            .key = countVec.back().first,
-            .id = id,
-            .count = bucket.count,
-            .owner = FacetOwnerSlot{output},
-            .output = FacetOutputSlot{output},
-            .flags = flags,
-        });
-      }
-
-      auto& mr = op.req.lastResponse->mr;
-      luxir::api::FacetResult* result = nullptr;
-      getTarget(nullptr, [&](luxir::api::Val& val) {
-        routeTarget<luxir::api::ArrVal>(val, mr, [&](luxir::api::Val& target) {
-          result = &oneofMut<luxir::api::FacetResult>(target);
-        });
-      });
-      auto& facetResultProto = *result;
-      emitBuckets(facetResultProto, countVec, mr);
-      if (thisOp().missing) facetResultProto.missing = missingCount;
-      executeResultChildren(selectedBuckets);
+      auto pool = MemPool::threadLocalPoolGuard();
+      OrdMapStr labels(pool.pool(), thisOp().ordMap.get(), thisOp().reader, thisOp().segInfos);
+      emitCountPage<std::string>(finalized, missingCount,
+          [&](const auto& bucket) { return std::string(bucket.pinned()
+              ? thisOp().pinnedBuckets[bucket.pinIndex].key : labels.ordToStr(*bucket.key)); },
+          [this](auto& buckets) { executeResultChildren(buckets); });
     }
 
 
@@ -1922,7 +1885,7 @@ public:
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
-    if (context.stringColumn == nullptr || ordMap == nullptr
+    if (countDistinct != nullptr || context.stringColumn == nullptr || ordMap == nullptr
         || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
       return nullptr;
     }
@@ -1934,6 +1897,7 @@ public:
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
+    if (countDistinct != nullptr) return new DistinctCalc<true>(*this, parent, slot, numSlots, ordMap);
     return new Calc(*this, parent, slot, numSlots);
   }
 
@@ -1947,6 +1911,9 @@ public:
   // hash, are not charged.
   size_t facetBucketResidentBytes() const override {
     int64_t numOrds = ordMap ? ordMap->numOrds() : 0;
+    if (countDistinct != nullptr) {
+      return saturatingAdd(sizeof(DistinctCalc<true>), distinctBindingBytes({true, 0, (uint64_t)numOrds}));
+    }
     size_t bytes = sizeof(Calc);
     if (inlineSubOps.empty()) {
       int64_t maxDoc = 0;

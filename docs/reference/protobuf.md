@@ -846,11 +846,13 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.field"></a>[`field`](#field-luxir.fieldfacet.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.fieldfacet.limit"></a>[`limit`](#field-luxir.fieldfacet.limit) | 2 | `sint64` | optional | Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all. Selected buckets outside the ordinary page are appended after it. |
 | <a id="field-luxir.fieldfacet.mincount"></a>[`mincount`](#field-luxir.fieldfacet.mincount) | 3 | `int64` | optional | Minimum bucket count. Unset includes only buckets with matches. STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain. INT/DATE require a positive value when set. |
-| <a id="field-luxir.fieldfacet.missing"></a>[`missing`](#field-luxir.fieldfacet.missing) | 4 | `bool` | singular | return the count of documents without a value |
+| <a id="field-luxir.fieldfacet.missing"></a>[`missing`](#field-luxir.fieldfacet.missing) | 4 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.fieldfacet.sort"></a>[`sort`](#field-luxir.fieldfacet.sort) | 5 | [`SortSpec`](#message-luxir.sortspec) | repeated | One metric sub-operation name. Unset sorts by count descending, then bucket value ascending. |
 | <a id="field-luxir.fieldfacet.ops"></a>[`ops`](#field-luxir.fieldfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.fieldfacet.selected"></a>[`selected`](#field-luxir.fieldfacet.selected) | 7 | [`Val`](#message-luxir.val) | singular | Scalar or array of selected values, coerced as AnyOfQuery values. Selected buckets missing from the ordinary page append in input order with exact counts, even below mincount or absent from the index. Null is an error. |
 | <a id="field-luxir.fieldfacet.selection_mode"></a>[`selection_mode`](#field-luxir.fieldfacet.selection_mode) | 8 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | ALL requires a nonempty selection |
+| <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list. GROUPS requires an enclosing collapse. Controls count, count order, mincount, and missing; metrics still fold documents. |
+| <a id="field-luxir.fieldfacet.count_distinct"></a>[`count_distinct`](#field-luxir.fieldfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys per bucket, also usable without collapse. Same key types and missing policies as Collapse. Conflicting measures are errors. |
 
 <a id="message-luxir.fieldvariants"></a>
 
@@ -1296,6 +1298,8 @@ Named query buckets. A document may contribute to more than one bucket.
 | <a id="field-luxir.queryfacet.ops"></a>[`ops`](#field-luxir.queryfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-ops per bucket |
 | <a id="field-luxir.queryfacet.selected"></a>[`selected`](#field-luxir.queryfacet.selected) | 7 | [`Val`](#message-luxir.val) | singular | bucket name or array of distinct existing names; null is an error |
 | <a id="field-luxir.queryfacet.selection_mode"></a>[`selection_mode`](#field-luxir.queryfacet.selection_mode) | 8 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
+| <a id="field-luxir.queryfacet.count_unit"></a>[`count_unit`](#field-luxir.queryfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
+| <a id="field-luxir.queryfacet.count_distinct"></a>[`count_distinct`](#field-luxir.queryfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys; same specification as Collapse. |
 
 <a id="message-luxir.rangefacet"></a>
 
@@ -1317,11 +1321,13 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | <a id="field-luxir.rangefacet.gap"></a>[`gap`](#field-luxir.rangefacet.gap) | 4 | [`Val`](#message-luxir.val) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | positive fixed width in field units; integer milliseconds for DATE |
 | <a id="field-luxir.rangefacet.calendar_gap"></a>[`calendar_gap`](#field-luxir.rangefacet.calendar_gap) | 10 | [`CalendarGap`](#message-luxir.calendargap) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | civil gap for DATE fields only |
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
-| <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | return the count of documents without a value |
+| <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.rangefacet.ops"></a>[`ops`](#field-luxir.rangefacet.ops) | 8 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only |
 | <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. |
 | <a id="field-luxir.rangefacet.selection_mode"></a>[`selection_mode`](#field-luxir.rangefacet.selection_mode) | 12 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
+| <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
+| <a id="field-luxir.rangefacet.count_distinct"></a>[`count_distinct`](#field-luxir.rangefacet.count_distinct) | 14 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys; same specification as Collapse. |
 
 <a id="message-luxir.rangequery"></a>
 
@@ -1870,6 +1876,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
+- [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
@@ -1985,6 +1992,17 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.fielddef.longterms.truncate"></a>[`TRUNCATE`](#value-luxir.fielddef.longterms.truncate) | 0 | keep a UTF-8-safe prefix of at most 255 bytes; values may merge |
 | <a id="value-luxir.fielddef.longterms.reject"></a>[`REJECT`](#value-luxir.fielddef.longterms.reject) | 1 | reject overlong terms |
 | <a id="value-luxir.fielddef.longterms.hash128"></a>[`HASH128`](#value-luxir.fielddef.longterms.hash128) | 2 | prefix of at most 230 bytes plus 25 base36 hash digits |
+
+<a id="enum-luxir.fieldfacet.countunit"></a>
+
+### luxir.FieldFacet.CountUnit
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fieldfacet.countunit.docs"></a>[`DOCS`](#value-luxir.fieldfacet.countunit.docs) | 0 | Count documents. |
+| <a id="value-luxir.fieldfacet.countunit.groups"></a>[`GROUPS`](#value-luxir.fieldfacet.countunit.groups) | 1 | Distinct keys of the nearest enclosing collapsed list. |
 
 <a id="enum-luxir.groupcomponent.type"></a>
 

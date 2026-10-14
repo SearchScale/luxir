@@ -14,6 +14,7 @@
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/OrdMapStr.h"
+#include "luxir/search/ops/DomainIter.h"
 
 namespace luxir {
 
@@ -51,6 +52,12 @@ struct CollapseKeyHash {
   }
 };
 
+// Tagged channels leave every int64 pattern available to ordinary keys.
+struct GroupIdentity {
+  enum Kind { VALUE, NULL_KEY, SINGLETON, DROP } kind;
+  int64_t value = 0;
+};
+
 struct CollapsePlan {
   struct Field {
     std::string name;
@@ -67,6 +74,28 @@ struct CollapsePlan {
 
   CollapsePlan(IndexReader& reader, luxir::api::Collapse_::MissingPolicy missing,
                bool getNumber) : missing(missing), reader(reader), getNumber(getNumber) {}
+
+  GroupIdentity missingIdentity(int32_t segment, int32_t doc) const {
+    using Missing = luxir::api::Collapse_::MissingPolicy;
+    if (missing == Missing::GROUP) return {GroupIdentity::NULL_KEY};
+    if (missing == Missing::DROP) return {GroupIdentity::DROP};
+    return {GroupIdentity::SINGLETON,
+        (int64_t)(((uint64_t)(uint32_t)segment << 32) | (uint32_t)doc)};
+  }
+
+  const CollapseKey* finishKey(CollapseKey& key, bool absent,
+                                int32_t segment, int32_t doc) const {
+    key.singleton.reset();
+    if (absent) {
+      auto identity = missingIdentity(segment, doc);
+      if (identity.kind == GroupIdentity::DROP) return nullptr;
+      if (identity.kind == GroupIdentity::SINGLETON) {
+        key.components.clear();
+        key.singleton = (uint64_t)identity.value;
+      }
+    }
+    return &key;
+  }
 
   void emit(luxir::api::GroupKey& out, const CollapseKey& key,
             std::pmr::memory_resource& mr, MemPool& pool) const {
@@ -93,6 +122,7 @@ class CollapseKeyReader {
     OrdMap::SegToGlobal mapping;
     std::optional<IntColReader> numbers;
     std::optional<IntColReader::Iterator> values;
+    bool dense = false;
   };
   const CollapsePlan& plan;
   std::vector<Column> columns;
@@ -111,6 +141,7 @@ public:
     for (size_t i = 0; i < columns.size(); i++) {
       auto* info = plan.fields[i].segments.at((size_t)segment);
       if (!info) continue;
+      columns[i].dense = info->docsWithField == postings.maxDoc();
       if (plan.fields[i].ordinal()) {
         columns[i].ords.emplace(postings, *info);
         columns[i].mapping = plan.fields[i].ords->getSegToGlobal(segment);
@@ -149,14 +180,121 @@ public:
       }
       missing |= !component.present;
     }
-    using Missing = luxir::api::Collapse_::MissingPolicy;
-    if (missing && plan.missing == Missing::DROP) return nullptr;
-    if (missing && plan.missing == Missing::EXPAND) {
-      scratch.components.clear();
-      scratch.singleton = ((uint64_t)(uint32_t)segment << 32) | (uint32_t)doc;
-    }
-    return &scratch;
+    return plan.finishKey(scratch, missing, segment, doc);
   }
+
+private:
+  // Bounded, forward-only cursors. The ordinary ordinal match is just a
+  // two-pointer join; refill/seeks stay outside that per-document fast path.
+  class OrdWalk {
+    OrdValueBatches values;
+    OrdValueBatches::Batch batch;
+    int32_t position = 0;
+    int32_t previous = -1;
+    int64_t saved = -1;
+    bool ended = false;
+
+    int64_t seek(int32_t doc) {
+      if (ended) return -1;
+      while (position == batch.size || batch.docs[batch.size - 1] < doc) {
+        if (!values.next(batch)) { ended = true; return -1; }
+        position = 0;
+      }
+      position = (int32_t)(screaming::gallopLowerBound(
+          batch.docs + position, batch.docs + batch.size, doc) - batch.docs);
+      return batch.docs[position] == doc ? batch.ords[position++] : -1;
+    }
+  public:
+    OrdWalk(Column& column, DocSet* domain, int32_t maxDoc)
+        : values(domain, *column.ords, column.mapping, maxDoc, false, nullptr) {}
+    int64_t read(int32_t doc) LUXIR_INLINE {
+      assert(doc >= previous);
+      if (doc == previous) return saved;
+      previous = doc;
+      if (position < batch.size && batch.docs[position] == doc) return saved = batch.ords[position++];
+      return saved = seek(doc);
+    }
+  };
+
+  class NumberWalk {
+    IntColReader::Iterator values;
+    int32_t previous = -1;
+    CollapseKey::Component saved;
+  public:
+    explicit NumberWalk(Column& column) : values(*column.numbers) {}
+    CollapseKey::Component read(int32_t doc) LUXIR_INLINE {
+      assert(doc >= previous);
+      if (doc == previous) return saved;
+      previous = doc;
+      saved = {};
+      if (values.docId() < doc) values.advance(doc);
+      if (values.docId() == doc) saved = {true, values.value()};
+      return saved;
+    }
+  };
+
+  class WalkColumn {
+    std::optional<OrdWalk> ords;
+    std::optional<NumberWalk> numbers;
+  public:
+    WalkColumn(Column& column, DocSet* domain, int32_t maxDoc) {
+      if (column.ords) ords.emplace(column, domain, maxDoc);
+      else if (column.numbers) numbers.emplace(column);
+    }
+    CollapseKey::Component read(int32_t doc) {
+      if (ords) {
+        int64_t value = ords->read(doc);
+        return value >= 0 ? CollapseKey::Component{true, value} : CollapseKey::Component{};
+      }
+      return numbers ? numbers->read(doc) : CollapseKey::Component{};
+    }
+  };
+
+public:
+  // Facet value streams are in document order. One key cursor serves all of
+  // a document's values. A second pass (missing or another query bucket) opens
+  // a new walk, so numeric iterators never rewind within a walk.
+  template <typename Visit>
+  void withWalk(int32_t segment, DocSet* domain, Visit&& visit) {
+    setSegment(segment);
+    int32_t maxDoc = plan.reader.segments()[(size_t)segment].maxDoc();
+    if (columns.size() == 1) {
+      auto& info = columns[0];
+      if (info.ords) {
+        OrdWalk column(info, domain, maxDoc);
+        if (info.dense) visit([&](int32_t doc) LUXIR_INLINE { return column.read(doc); });
+        else visit([&](int32_t doc) LUXIR_INLINE -> GroupIdentity {
+          int64_t value = column.read(doc);
+          return value >= 0 ? GroupIdentity{GroupIdentity::VALUE, value} : plan.missingIdentity(segment, doc);
+        });
+      } else if (info.numbers) {
+        NumberWalk column(info);
+        if (info.dense) visit([&](int32_t doc) LUXIR_INLINE { return column.read(doc).value; });
+        else visit([&](int32_t doc) LUXIR_INLINE -> GroupIdentity {
+          auto value = column.read(doc);
+          return value.present ? GroupIdentity{GroupIdentity::VALUE, value.value} : plan.missingIdentity(segment, doc);
+        });
+      } else visit([&](int32_t doc) { return plan.missingIdentity(segment, doc); });
+      return;
+    }
+    std::vector<WalkColumn> cursors;
+    cursors.reserve(columns.size());
+    for (auto& column : columns) cursors.emplace_back(column, domain, maxDoc);
+    int32_t previous = -1;
+    const CollapseKey* saved = nullptr;
+    visit([&](int32_t doc) -> const CollapseKey* {
+      if (doc == previous) return saved;
+      previous = doc;
+      scratch.components.resize(columns.size());
+      bool absent = false;
+      for (size_t i = 0; i < cursors.size(); i++) {
+        scratch.components[i] = cursors[i].read(doc);
+        absent |= !scratch.components[i].present;
+      }
+      return saved = plan.finishKey(scratch, absent, segment, doc);
+    });
+  }
+
 };
 
 // Only retained identities are interned for ranking: state is O(topCount).
