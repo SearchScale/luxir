@@ -8,6 +8,7 @@
 
 #include <fmt/format.h>
 
+#include <bit>
 #include <cassert>
 #include <charconv>
 #include <cmath>
@@ -259,10 +260,13 @@ inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
   size_t start = floats.size();
   // Error-message prefix, formatted lazily so the success path does no formatting.
   auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
+  auto throwNonFinite = [&](size_t index) {
+    throw RequestError(fmt::format(
+        "field '{}': {}element {} is outside finite float32 range", fieldName, prefix(), index), "invalid_value");
+  };
   auto appendDouble = [&](double d, size_t index) {
     float f = (float)d;
-    if (!std::isfinite(f)) throw RequestError(fmt::format(
-        "field '{}': {}element {} is outside finite float32 range", fieldName, prefix(), index), "invalid_value");
+    if (!std::isfinite(f)) throwNonFinite(index);
     floats.push_back(f);
   };
   if (const auto* vec = std::get_if<api::Vector>(&one.kind)) {
@@ -272,9 +276,26 @@ inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
   } else if (const auto* arr = std::get_if<api::ArrFloat>(&one.kind)) {
     floats.insert(floats.end(), arr->v.begin(), arr->v.end());
   } else if (const auto* arr = std::get_if<api::ArrDouble>(&one.kind)) {
-    for (size_t i = 0; i < arr->v.size(); i++) appendDouble(arr->v[i], i);
+    // Narrow in one branch-free (vectorizable) pass, flagging non-finite results
+    // by exponent bits; only a failure goes back for the first bad index.
+    size_t n = arr->v.size();
+    floats.resize(start + n);
+    float* out = floats.data() + start;
+    const double* in = arr->v.data();
+    uint32_t nonFinite = 0;
+    for (size_t i = 0; i < n; i++) {
+      out[i] = (float)in[i];
+      nonFinite |= (uint32_t)((std::bit_cast<uint32_t>(out[i]) & 0x7f800000u) == 0x7f800000u);
+    }
+    if (nonFinite) [[unlikely]] {
+      for (size_t i = 0; i < n; i++) {
+        if (!std::isfinite(out[i])) throwNonFinite(i);
+      }
+    }
   } else if (const auto* arr = std::get_if<api::ArrInt>(&one.kind)) {
-    for (int64_t value : arr->v) floats.push_back((float)value);
+    size_t n = arr->v.size();
+    floats.resize(start + n);
+    for (size_t i = 0; i < n; i++) floats[start + i] = (float)arr->v[i];
   } else if (const auto* arr = std::get_if<api::ArrVal>(&one.kind)) {
     for (size_t i = 0; i < arr->v.size(); i++) {
       const auto& kind = arr->v[i].kind;
