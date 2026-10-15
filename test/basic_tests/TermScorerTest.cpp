@@ -7151,7 +7151,7 @@ TEST_F(TermScorerTest, queryPrepDomainDrivenBitsetReachesSegmentEnd) {
 
 // "+a b" without scores: the optional clause is a pure score add under a
 // mandatory clause, so a non-scoring weight drops it - membership is
-// unchanged and the single-clause count() shortcut engages (Lucene's
+// unchanged and the single-clause count shortcut engages (Lucene's
 // BooleanWeight simplification).
 TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
   const int32_t N = 1500;
@@ -7181,7 +7181,7 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
 
   // Non-scoring: optional dropped -> O(1) exact count, and iteration = df(a).
   auto* countWeight = q.createWeight(qContext, 0);
-  EXPECT_EQ(countWeight->count(segment), dfA);
+  EXPECT_EQ(countForTests(countWeight, segment), dfA);
   auto* countScorer = countWeight->createScorer(testIndex.pool, segment);
   ASSERT_NE(countScorer, nullptr);
   int32_t iterated = 0;
@@ -7195,7 +7195,7 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
   Query::Context qContext2(testIndex.pool, *testIndex.reader);
   BooleanQuery q2(mand, opt, {}, {});
   auto* scoredWeight = q2.createWeight(qContext2, Query::NEED_SCORES);
-  EXPECT_EQ(scoredWeight->count(segment), -1);
+  EXPECT_EQ(countForTests(scoredWeight, segment), -1);
   auto* scoredScorer = scoredWeight->createScorer(testIndex.pool, segment);
   ASSERT_NE(scoredScorer, nullptr);
   int32_t scoredCount = 0;

@@ -2311,7 +2311,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
-  auto built = plan.resolve(*reader, reader->segments()[0], nullptr);
+  auto built = resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr);
   ASSERT_TRUE(built.available);
   EXPECT_EQ(8, built.count);
   cache->sweep();
@@ -2645,6 +2645,9 @@ TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
   EXPECT_EQ(2, bypass.bypasses);
   EXPECT_EQ(2, build.builds);
   EXPECT_EQ(2, hit.hits);
+  EXPECT_EQ(1, bypass.constants);
+  EXPECT_EQ(0, build.constants);
+  EXPECT_EQ(0, hit.constants);
 }
 
 TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
@@ -2679,7 +2682,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
-  ASSERT_TRUE(plan.resolve(*reader, reader->segments()[0], nullptr).available);
+  ASSERT_TRUE(resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr).available);
   cache->sweep();
   ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
 
@@ -3395,7 +3398,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
-  ASSERT_TRUE(plan.resolve(
+  ASSERT_TRUE(resolveWholeMembershipForTests(plan,
       *reader, reader->segments()[0], nullptr).available);
   cache->sweep();
   ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);

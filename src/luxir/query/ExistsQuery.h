@@ -112,19 +112,11 @@ public:
       traits |= IS_CONSTANT_SCORING;
     }
 
-    // docsWithField is the exact match count - free from the field stats -
-    // unless deletions could have removed some of its docs. A field with no
-    // values in the segment counts zero under any domain.
-    std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) override {
-      const SegFieldInfo* info = segmentInfo(segment);
-      if (info == nullptr || info->docsWithField == 0) {
-        return 0;
-      }
-      if (domain != nullptr || segment.liveDocs() != nullptr) {
-        return std::nullopt;
-      }
-      return (int64_t) info->docsWithField;
+    // Header totals include deleted docs, so a restricted segment needs iteration.
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      const auto* info = segmentInfo(segment);
+      return countBound(segment, domain, info ? info->docsWithField : 0,
+                        CountHow::METADATA);
     }
 
     class Supplier final : public Query::ScorerSupplier {

@@ -728,6 +728,27 @@ public:
     return (flags & NEED_SCORES) != 0 ? multiplier * local : 0.0f;
   }
 
+  enum class CountHow : uint8_t { METADATA, SUPPLIER, INDEX_WALK, ITERATE };
+  static constexpr CountHow COUNT_PROBE_LIMIT = CountHow::SUPPLIER;
+  static constexpr CountHow COUNT_EXECUTION_LIMIT = CountHow::INDEX_WALK;
+  struct CountShortcut {
+    int64_t maxMatches;
+    CountHow how;
+    Weight* resolver = nullptr;
+  };
+
+  // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
+  static CountShortcut countBound(IndexReader::Segment& segment, DocSet* domain,
+                                  int64_t docs, CountHow how = CountHow::ITERATE) {
+    int64_t bound = std::min<int64_t>(docs, segment.numLive());
+    if (domain && domain->cachedCard() >= 0) {
+      bound = std::min<int64_t>(bound, domain->cachedCard());
+    }
+    if (bound == 0) return {0, CountHow::METADATA};
+    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+    return {bound, how};
+  }
+
   /// Per-segment planning state. Suppliers are allocated from the segment-local
   /// targetPool and only need to live until their resolved plans are built.
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
@@ -1010,6 +1031,7 @@ public:
 
     /// Return temporary per-segment planning state allocated from targetPool.
     /// A null supplier means this source cannot match the segment.
+    /// The source and segment must outlive the supplier and its plans.
     Query::ScorerSupplier* scorerSupplier(
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode =
@@ -1582,12 +1604,14 @@ public:
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
-    /// Exact O(1) per-segment membership count without constructing a
-    /// supplier. A null result means the caller must execute the query.
-    virtual std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) {
-      unused(segment, domain);
-      return std::nullopt;
+    /// Metadata-only: no supplier, index walks, locks or cardinality counts.
+    /// METADATA is exact; SUPPLIER resolves at supplier construction;
+    /// INDEX_WALK may decode crossing index leaves; ITERATE is a bound.
+    /// Resolvable non-metadata shortcuts name the leaf that resolves them.
+    /// Execution may resolve more than this metadata proves.
+    virtual CountShortcut countShortcut(IndexReader::Segment& segment,
+                                         DocSet* domain) {
+      return countBound(segment, domain, segment.maxDoc());
     }
 
     /// Policy family for choosing the sparse-filtered top-k density knee.
@@ -1632,22 +1656,6 @@ public:
     /// allocate scorer state from target, and do not allocate from context.pool
     /// or populate/mutate Query::Context caches.
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
-
-    /// Return a constant-count plan result, or -1 when this segment requires
-    /// execution to count.
-    virtual int64_t count(IndexReader::Segment& segment) {
-      auto guard = MemPool::threadLocalPoolGuard();
-      ScorerSupplier* supplier = scorerSupplier(guard.pool(), segment);
-      if (supplier == nullptr) return 0;
-      ScorerSupplier::BulkScorerContext constantContext;
-      constantContext.requireConstantCount = true;
-      auto constantPlan = supplier->planBulk(
-          ExecutionUse::COUNT_WINDOWS, constantContext);
-      if (constantPlan.hasConstantCount()) {
-        return constantPlan.constantCount;
-      }
-      return -1;
-    }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };

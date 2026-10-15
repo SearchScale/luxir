@@ -318,8 +318,8 @@ TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
   Query::Weight* filterWeight = unbound.createWeight(filterContext, 0);
   Query::Context childFilterContext(pool, *reader);
   Query::Weight* childFilterWeight = term.createWeight(childFilterContext, 0);
-  EXPECT_EQ(childFilterWeight->count(reader->segments()[0]),
-            filterWeight->count(reader->segments()[0]));
+  EXPECT_EQ(countForTests(childFilterWeight, reader->segments()[0]),
+            countForTests(filterWeight, reader->segments()[0]));
   Query::Scorer* filterScorer =
       filterWeight->createScorer(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, filterScorer);

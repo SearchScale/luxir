@@ -970,14 +970,8 @@ public:
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
         TopDocsCollector& collector, int32_t maxDoc) {
-      Query::ScorerSupplier::BulkScorerContext constantContext;
-      constantContext.requireConstantCount = true;
-      auto constantPlan = countSupplier.planBulk(
-          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-          constantContext);
-      int64_t count = collectorFilter == nullptr
-              && constantPlan.hasConstantCount()
-          ? constantPlan.constantCount : -1;
+      auto constant = QueryPrep::supplierCount(&countSupplier);
+      int64_t count = collectorFilter == nullptr ? constant.value_or(-1) : -1;
 
       Query::ScorerSupplier::BulkScorerContext bulkContext;
       if (count < 0) {
@@ -1813,19 +1807,7 @@ public:
             skipCount(SkipStats::exactDomainStreamFallbacks);
           }
         }
-        QueryPrep::WholeMembershipResult wholeMembershipResult;
-        if (!exactDomain && !matchEverything
-            && !op.wholeMembershipPlan.empty()) {
-          wholeMembershipResult = op.wholeMembershipPlan.resolve(
-              *op.req.reader, seg, domain, preparedWeight.get());
-        }
-        bool wholeMembershipAvailable = wholeMembershipResult.available;
-        bool wholeTopKCountAvailable = wholeMembershipAvailable
-            && op.wholeMembershipPlan.isTopKCount();
-        bool wholeFieldSortAvailable = wholeMembershipAvailable
-            && op.wholeMembershipPlan.isFieldSort();
-        bool wholeFallbackSupplierPending =
-            !wholeMembershipAvailable && op.wholeMembershipPlan.hasCacheUse();
+        bool wholeFallbackSupplierPending = false;
         auto obtainMainSupplier = [&]() {
           if (wholeFallbackSupplierPending) {
             op.wholeMembershipPlan.recordFallbackSupplier();
@@ -1836,6 +1818,23 @@ public:
           }
           return supplier;
         };
+        QueryPrep::WholeMembershipResult wholeMembershipResult;
+        if (!exactDomain && !matchEverything
+            && !op.wholeMembershipPlan.empty()) {
+          wholeMembershipResult = op.wholeMembershipPlan.resolve(
+              *op.req.reader, seg, domain, preparedWeight.get(),
+              [&](Query::Weight& resolver) {
+                return &resolver == op.weight ? obtainMainSupplier()
+                    : resolver.scorerSupplier(poolGuard.pool(), seg);
+              });
+        }
+        bool wholeMembershipAvailable = wholeMembershipResult.available;
+        bool wholeTopKCountAvailable = wholeMembershipAvailable
+            && op.wholeMembershipPlan.isTopKCount();
+        bool wholeFieldSortAvailable = wholeMembershipAvailable
+            && op.wholeMembershipPlan.isFieldSort();
+        wholeFallbackSupplierPending =
+            !wholeMembershipAvailable && op.wholeMembershipPlan.hasCacheUse();
         // A root, non-prepared filter-only Boolean can expose its one cached
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
@@ -2002,13 +2001,8 @@ public:
           bool counted = false;
           if (!requiresWholeIndexPrepare && builderPtr == nullptr && filter == nullptr
               && !data->useFieldSort && data->scoreCollector->topCount == 0) {
-            Query::ScorerSupplier::BulkScorerContext countContext;
-            countContext.requireConstantCount = true;
-            auto countPlan = supplier->planBulk(
-                Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-                countContext);
-            if (countPlan.hasConstantCount()) {
-              data->scoreCollector->hitCount += countPlan.constantCount;
+            if (auto count = QueryPrep::supplierCount(supplier)) {
+              data->scoreCollector->hitCount += *count;
               counted = true;
             }
           }

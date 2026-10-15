@@ -75,7 +75,9 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
   for (int32_t doc = 0; doc < segment.maxDoc(); doc++) {
     if (materialized->get(doc)) run.bulk.push_back(doc);
   }
-  run.count = weight->count(segment);
+  auto count = QueryPrep::supplierCount(sparseSupplier);
+  EXPECT_TRUE(count.has_value());
+  run.count = count.value_or(-1);
   return run;
 }
 
@@ -335,7 +337,7 @@ TEST_F(NumericRangeZoneMapTest, countDeclinesDeletedSegment) {
   NumericPredicateQuery query("deleted_i", 0, 100);
   auto* weight = query.createWeight(context, 0);
   ASSERT_NE(index.reader->segments()[0].liveDocs(), nullptr);
-  EXPECT_EQ(weight->count(index.reader->segments()[0]), -1);
+  EXPECT_EQ(countForTests(weight, index.reader->segments()[0]), -1);
 }
 
 TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {

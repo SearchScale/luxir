@@ -114,6 +114,20 @@ public:
     segInfos = context.topReader.field(query.getField());
   }
 
+  // A BKD count can decode crossing leaves, so probes only report that level;
+  // the walk belongs to execution after the supplier has been selected.
+  Query::CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    const SegFieldInfo* info = nullptr;
+    if (query.isEmpty() || !segmentInfo(segment, info) || info->numValues == 0) {
+      return {0, Query::CountHow::METADATA};
+    }
+    auto how = info->pointsMetaOff != 0 && info->monoLoc.offset() == 0
+        ? Query::CountHow::INDEX_WALK : Query::CountHow::ITERATE;
+    auto shortcut = Query::countBound(segment, domain, info->docsWithField, how);
+    if (shortcut.how == Query::CountHow::INDEX_WALK) shortcut.resolver = this;
+    return shortcut;
+  }
+
   class Supplier final : public Query::ScorerSupplier {
     enum class ScorerArm : uint8_t {
       SPARSE_VERIFY,
@@ -283,13 +297,18 @@ public:
         BulkUse use, const BulkScorerContext& bulkContext) override {
       unused(use);
       if (bulkContext.requireConstantCount) {
-        if (segment.liveDocs() != nullptr || bkd == nullptr
-            || reader.multiValued()) {
+        auto shortcut = weight.countShortcut(segment, nullptr);
+        if (shortcut.how == Query::CountHow::METADATA) {
+          return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                  BulkAnswer::NO, nullptr, shortcut.maxMatches};
+        }
+        if (shortcut.how != Query::CountHow::INDEX_WALK) {
           return {
             BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO,
           };
         }
+        assert(bkd != nullptr && !reader.multiValued() && segment.liveDocs() == nullptr);
         size_t size = bkd->maxPointsPerLeaf();
         BKDReader::Scratch countScratch{
           {}, planPool.make_span<uint32_t>(size),

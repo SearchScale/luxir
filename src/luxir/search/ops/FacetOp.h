@@ -1665,14 +1665,32 @@ public:
       bool countOnly = domain == nullptr;
       for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
         auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+        auto guard = MemPool::threadLocalPoolGuard();
+        Query::ScorerSupplier* supplier = nullptr;
+        bool supplierBuilt = false;
+        auto obtainSupplier = [&]() {
+          if (!supplierBuilt) {
+            supplier = bucketSource(bucket).scorerSupplier(guard.pool(), segment);
+            supplierBuilt = true;
+          }
+          return supplier;
+        };
         if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
-          int64_t count = queryOp().bucketWeights[bucket]->count(segment);
-          if (count >= 0) {
-            data.counts[bucket] += count;
+          auto* weight = queryOp().bucketWeights[bucket];
+          auto count = QueryPrep::resolveCount(weight->countShortcut(segment, domain),
+              [&](Query::Weight& resolver) {
+                return &resolver == weight ? obtainSupplier()
+                    : resolver.scorerSupplier(guard.pool(), segment);
+              }, Query::COUNT_EXECUTION_LIMIT);
+          if (!count) count = QueryPrep::supplierCount(obtainSupplier());
+          if (count) {
+            data.counts[bucket] += *count;
             continue;
           }
         }
-        DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
+        supplier = obtainSupplier();
+        if (supplier == nullptr) continue;
+        DomainHandle matches(QueryPrep::materialize(supplier, guard.pool(), segment, domain));
         data.counts[bucket] += matches.get()->card();
       }
     }

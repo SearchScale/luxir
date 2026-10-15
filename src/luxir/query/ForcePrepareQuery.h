@@ -126,9 +126,9 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
-      return childWeight->constantCount(segment, domain);
+      return childWeight->countShortcut(segment, domain);
     }
   };
 };

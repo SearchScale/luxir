@@ -294,7 +294,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   auto* sparseSupplier = sparseWeight->scorerSupplier(pool, segment);
   ASSERT_NE(nullptr, sparseSupplier);
   EXPECT_EQ(2, sparseSupplier->cost());
-  EXPECT_EQ(2, sparseWeight->count(segment));
+  EXPECT_EQ(2, countForTests(sparseWeight, segment));
   auto* sparseScorer = buildScorerForTests(
       pool, *sparseSupplier, segment.maxDoc());
   ASSERT_NE(nullptr, sparseScorer);
@@ -347,7 +347,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   Query::Context deletedContext(deletedPool, *deletedReader);
   ExistsQuery deletedQuery("body_w");
   auto* deletedWeight = deletedQuery.createWeight(deletedContext, 0);
-  EXPECT_EQ(-1, deletedWeight->count(deletedReader->segments()[0]));
+  EXPECT_EQ(-1, countForTests(deletedWeight, deletedReader->segments()[0]));
 
   auto deletedReq = localReq(helper.getSearchEngine());
   deletedReq->collection("main").topDocs("q").existsQuery("body_w")

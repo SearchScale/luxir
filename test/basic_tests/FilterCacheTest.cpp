@@ -2343,7 +2343,7 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
 }
 
-TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
+TEST(FilterCacheTest, weightCountShortcutsAreNarrowAndTransparent) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(dir);
   IndexWriter writer(writerSnapshots);
@@ -2355,6 +2355,12 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   auto& segment = reader->segments()[0];
   MemPool pool;
   Query::Context context(pool, *reader);
+
+  auto metadataCount = [&](Query::Weight* weight, DocSet* domain = nullptr) -> std::optional<int64_t> {
+    auto shortcut = weight->countShortcut(segment, domain);
+    if (shortcut.how != Query::CountHow::METADATA) return std::nullopt;
+    return shortcut.maxMatches;
+  };
 
   AllQuery all;
   MatchNoDocsQuery none;
@@ -2369,19 +2375,17 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   auto* boostWeight = boost.createWeight(context, 0);
   auto* preparedWeight = prepared.createWeight(context, 0);
 
-  EXPECT_EQ(3, *allWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *noneWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *alphaWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *constantWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *boostWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *preparedWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(3, *metadataCount(allWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(noneWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(alphaWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(constantWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(boostWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(preparedWeight, nullptr));
 
   auto restricted = docs(3, {0, 2});
-  EXPECT_FALSE(allWeight->constantCount(
-      segment, restricted.get()).has_value());
-  EXPECT_EQ(0, *noneWeight->constantCount(segment, restricted.get()));
-  EXPECT_FALSE(alphaWeight->constantCount(
-      segment, restricted.get()).has_value());
+  EXPECT_EQ(2, metadataCount(allWeight, restricted.get()));
+  EXPECT_EQ(0, *metadataCount(noneWeight, restricted.get()));
+  EXPECT_FALSE(metadataCount(alphaWeight, restricted.get()).has_value());
 
   TermQuery beta("text_w", "beta");
   TermQuery ghost("text_w", "ghost");
@@ -2408,25 +2412,23 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   // two live clauses have unknown overlap. Dropped (non-gating) optionals
   // leave the lone required clause's count; a gating optional group or a
   // prohibited clause needs execution.
-  EXPECT_EQ(2, *deadClauseUnionWeight->constantCount(segment, nullptr));
-  EXPECT_FALSE(liveUnionWeight->constantCount(segment, nullptr).has_value());
-  EXPECT_EQ(0, *deadUnionWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *deadUnionWeight->constantCount(segment, restricted.get()));
-  EXPECT_EQ(2, *mandOptWeight->constantCount(segment, nullptr));
-  EXPECT_FALSE(gatedOptWeight->constantCount(segment, nullptr).has_value());
-  EXPECT_FALSE(excludedWeight->constantCount(segment, nullptr).has_value());
-  EXPECT_FALSE(deadClauseUnionWeight->constantCount(
-      segment, restricted.get()).has_value());
+  EXPECT_EQ(2, *metadataCount(deadClauseUnionWeight, nullptr));
+  EXPECT_FALSE(metadataCount(liveUnionWeight, nullptr).has_value());
+  EXPECT_EQ(0, *metadataCount(deadUnionWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(deadUnionWeight, restricted.get()));
+  EXPECT_EQ(2, *metadataCount(mandOptWeight, nullptr));
+  EXPECT_FALSE(metadataCount(gatedOptWeight, nullptr).has_value());
+  EXPECT_FALSE(metadataCount(excludedWeight, nullptr).has_value());
+  EXPECT_FALSE(metadataCount(deadClauseUnionWeight, restricted.get()).has_value());
 
   ExistsQuery exists("text_w");
   ExistsQuery absentField("other_w");
   auto* existsWeight = exists.createWeight(context, 0);
   auto* absentFieldWeight = absentField.createWeight(context, 0);
-  EXPECT_EQ(3, *existsWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *absentFieldWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *absentFieldWeight->constantCount(segment, restricted.get()));
-  EXPECT_FALSE(existsWeight->constantCount(
-      segment, restricted.get()).has_value());
+  EXPECT_EQ(3, *metadataCount(existsWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(absentFieldWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(absentFieldWeight, restricted.get()));
+  EXPECT_FALSE(metadataCount(existsWeight, restricted.get()).has_value());
 }
 
 TEST(FilterCacheTest,
@@ -2458,7 +2460,7 @@ TEST(FilterCacheTest,
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan firstPlan(
       *firstWeight, firstUse, firstContext.filterUses);
-  auto built = firstPlan.resolve(*reader, segment, incoming.get());
+  auto built = test::resolveWholeMembershipForTests(firstPlan, *reader, segment, incoming.get());
   ASSERT_TRUE(built.available);
   EXPECT_EQ(1, built.count);
   ASSERT_NE(nullptr, built.docs.get());
@@ -2475,7 +2477,7 @@ TEST(FilterCacheTest,
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan hitPlan(
       *hitWeight, hitUse, hitContext.filterUses);
-  auto hit = hitPlan.resolve(*reader, segment, incoming.get());
+  auto hit = test::resolveWholeMembershipForTests(hitPlan, *reader, segment, incoming.get());
   ASSERT_TRUE(hit.available);
   EXPECT_EQ(1, hit.count);
   EXPECT_EQ(1, SkipStats::wholeCountHits);
@@ -2488,7 +2490,7 @@ TEST(FilterCacheTest,
   EXPECT_EQ(hit.docs.get()->card(), composed.get()->card());
 
   auto emptyDomain = docs(5, {});
-  auto allDeleted = hitPlan.resolve(
+  auto allDeleted = test::resolveWholeMembershipForTests(hitPlan,
       *reader, segment, emptyDomain.get());
   ASSERT_TRUE(allDeleted.available);
   EXPECT_EQ(0, allDeleted.count);
@@ -2505,7 +2507,7 @@ TEST(FilterCacheTest,
       *dependentWeight, dependentUse, dependentContext.filterUses,
       PreparedDomainDependence::PREPARE_DOMAIN);
   EXPECT_THROW(
-      dependentPlan.resolve(*reader, segment, nullptr), std::logic_error);
+      test::resolveWholeMembershipForTests(dependentPlan, *reader, segment, nullptr), std::logic_error);
 
   MemPool retryPool;
   Query::Context retryContext(retryPool, *reader);
@@ -2514,7 +2516,7 @@ TEST(FilterCacheTest,
       dependentQuery, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan retryPlan(
       *retryWeight, retryUse, retryContext.filterUses);
-  auto retry = retryPlan.resolve(*reader, segment, nullptr);
+  auto retry = test::resolveWholeMembershipForTests(retryPlan, *reader, segment, nullptr);
   ASSERT_TRUE(retry.available);
   EXPECT_EQ(1, retry.count);
 }
@@ -4118,7 +4120,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
         *reader, nestedDomains, /*parallel=*/false};
     auto prepared = plan.prepareMainWeight(prepareContext);
     ASSERT_NE(nullptr, prepared);
-    auto result = plan.resolve(
+    auto result = test::resolveWholeMembershipForTests(plan,
         *reader, reader->segments()[0], nestedDomains[0], prepared.get());
     EXPECT_FALSE(result.available);
   }
@@ -4903,7 +4905,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
     for (auto& segment : reader->segments()) {
       DocSet* domain = segment.liveDocs() == nullptr
           ? nullptr : &segment.liveDocs()->docset();
-      auto resolved = plan.resolve(*reader, segment, domain);
+      auto resolved = test::resolveWholeMembershipForTests(plan, *reader, segment, domain);
       EXPECT_TRUE(resolved.available);
       result += resolved.count;
     }
@@ -5088,7 +5090,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
     auto buildPrepared = buildPlan.prepareMainWeight(buildPrepareContext);
     int64_t built = 0;
     for (auto& segment : reader->segments()) {
-      auto result = buildPlan.resolve(
+      auto result = test::resolveWholeMembershipForTests(buildPlan,
           *reader, segment, domains[(size_t)segment.ord],
           buildPrepared.get());
       ASSERT_TRUE(result.available);
@@ -5120,7 +5122,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   cachedMembership.reserve(reader->segments().size());
   int64_t cachedCount = 0;
   for (auto& segment : reader->segments()) {
-    auto result = plan.resolve(
+    auto result = test::resolveWholeMembershipForTests(plan,
         *reader, segment, domains[(size_t)segment.ord], prepared.get());
     ASSERT_TRUE(result.available);
     cachedCount += result.count;

@@ -434,7 +434,7 @@ TEST_F(GeoDistanceQueryTest, bkdScanAndColumnOraclesAcrossCorpora) {
         EXPECT_EQ(expected, collect(state.weight->createScanScorerForTests(
                                 pool, segment)));
         EXPECT_EQ(field == "geo_single" ? (int64_t)expected.size() : -1,
-                  state.weight->count(segment));
+                  countForTests(state.weight, segment));
 
         SegFieldInfo info = fieldInfo(segment, field);
         BKDReader bkd(segment.postingsReader(), info);
@@ -473,7 +473,7 @@ TEST_F(GeoDistanceQueryTest, scanFallbackAndCountGating) {
   DistanceState state(pool, *reader, "geo_single", 0.0, 0.0, 1000000.0);
   auto expected = bruteColumn(segment, "geo_single", state.query);
   EXPECT_EQ(expected, collect(state.weight->createScorer(pool, segment)));
-  EXPECT_EQ(-1, state.weight->count(segment));
+  EXPECT_EQ(-1, countForTests(state.weight, segment));
 }
 
 TEST_F(GeoDistanceQueryTest, countRejectsDeletedSegment) {
@@ -495,7 +495,7 @@ TEST_F(GeoDistanceQueryTest, countRejectsDeletedSegment) {
   ASSERT_NE(nullptr, segment.liveDocs());
   MemPool pool;
   DistanceState state(pool, *reader, "geo_single", 0.0, 0.0, 1000.0);
-  EXPECT_EQ(-1, state.weight->count(segment));
+  EXPECT_EQ(-1, countForTests(state.weight, segment));
 }
 
 TEST_F(GeoDistanceQueryTest, rejectsInvalidArguments) {

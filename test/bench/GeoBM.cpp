@@ -26,6 +26,7 @@
 #include "luxir/util/random.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -538,7 +539,7 @@ void BM_GeoCount(benchmark::State& state, CorpusShape shape) {
     GeoBoxQuery query(FIELD, box.minLat, box.maxLat, box.minLon, box.maxLon);
     auto* weight = static_cast<GeoBoxQuery::Weight*>(
         query.createWeight(context, 0));
-    int64_t count = weight->count(segment);
+    int64_t count = countForTests(weight, segment);
     benchmark::DoNotOptimize(count);
     if (count != expected) {
       state.SkipWithError("geo count differs from quantized oracle");
@@ -651,7 +652,7 @@ void BM_GeoDistanceCount(benchmark::State& state, CorpusShape shape) {
                            circle.radiusMeters);
     auto* weight = static_cast<GeoDistanceQuery::Weight*>(
         query.createWeight(context, 0));
-    int64_t count = weight->count(segment);
+    int64_t count = countForTests(weight, segment);
     benchmark::DoNotOptimize(count);
     if (count != expected) {
       state.SkipWithError("geo distance count differs from quantized oracle");

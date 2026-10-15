@@ -1764,14 +1764,20 @@ public:
         bool everySegmentConstant = wholeMembershipWeight->matchesAllDocs();
         if (!everySegmentConstant) {
           everySegmentConstant = true;
+          bool everySegmentEmpty = !req.reader->segments().empty();
           for (auto& segment : req.reader->segments()) {
             DocSet* rootDomain = segment.liveDocs() == nullptr
                 ? nullptr : &segment.liveDocs()->docset();
-            if (!wholeMembershipWeight->constantCount(
-                    segment, rootDomain).has_value()) {
+            auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
+            everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA
+                && shortcut.maxMatches == 0;
+            if (shortcut.how > Query::COUNT_PROBE_LIMIT) {
               everySegmentConstant = false;
               break;
             }
+          }
+          if (everySegmentEmpty && hasRequiredConjunction(*query)) {
+            everySegmentConstant = false;
           }
         }
         bool fieldSortFullyRouted = false;

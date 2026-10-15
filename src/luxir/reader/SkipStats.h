@@ -23,6 +23,9 @@ struct SkipStats {
 
   static inline bool enabled = false;
 
+  // Calls to TermsEnum::seek(), including unsuccessful seeks.
+  static inline int64_t termDictionarySeeks = 0;
+
   // Docs-block body decodes (full 128-doc blocks + the StreamVByte tail). This is
   // the real decode work; blocks_decoded(pruned) / blocks_decoded(exhaustive) is
   // the "% of blocks decoded vs total" headline.
@@ -322,6 +325,7 @@ struct SkipStats {
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
+  static inline int64_t numericPredicateScanArms = 0;
   static inline int64_t rangeFacetPointsArms = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
@@ -373,6 +377,7 @@ struct SkipStats {
 
   static void reset() {
     docBlocksDecoded = 0;
+    termDictionarySeeks = 0;
     tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;
     l0CheckpointJumps = 0;
@@ -610,6 +615,7 @@ struct SkipStats {
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
     numericPredicateZoneArms = 0;
+    numericPredicateScanArms = 0;
     rangeFacetPointsArms = 0;
     geoBKDArms = 0;
     geoScanArms = 0;

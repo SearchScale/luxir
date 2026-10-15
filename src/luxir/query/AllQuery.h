@@ -233,11 +233,13 @@ public:
       return targetPool.make<AllQuery::Scorer>(segment, score);
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
-      return domain == nullptr
-          ? std::optional<int64_t>((int64_t) segment.maxDoc())
-          : std::nullopt;
+      if (domain && domain->cachedCard() >= 0
+          && (!segment.liveDocs() || domain == &segment.liveDocs()->docset())) {
+        return {domain->cachedCard(), CountHow::METADATA};
+      }
+      return countBound(segment, domain, segment.maxDoc(), CountHow::METADATA);
     }
 
   };
