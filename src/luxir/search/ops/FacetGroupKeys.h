@@ -19,6 +19,25 @@ struct FacetDimension {
 class FacetGroupPlan {
   struct Component { int64_t base; uint64_t radix; };
   std::vector<Component> components;
+  static FacetDimension componentDimension(const CollapsePlan& key, const CollapsePlan::Field& field) {
+    if (field.ordinal()) return {true, 0,
+        (uint64_t)(field.ords ? field.ords->numOrds() : 0)};
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (size_t segnum = 0; segnum < key.reader.segments().size(); segnum++) {
+      auto* info = field.segments.at(segnum);
+      if (!info || info->numValues == 0) continue;
+      assert(info->columnBounds);
+      lo = std::min(lo, info->columnBounds->min);
+      hi = std::max(hi, info->columnBounds->max);
+    }
+    if (lo > hi) return {true, 0, 0};
+    // Unsigned subtraction also covers ranges crossing zero without signed
+    // overflow. Share the tuple bound; the reducer's byte cap decides whether
+    // a representable dense range is small enough for paged rows.
+    uint64_t width = (uint64_t)hi - (uint64_t)lo;
+    if (width >= (uint64_t)INT64_MAX) return {};
+    return {true, lo, width + 1};
+  }
 public:
   const CollapsePlan& key;
   FacetDimension dimension;
@@ -26,36 +45,19 @@ public:
 
   explicit FacetGroupPlan(const CollapsePlan& key) : key(key) {
     if (key.fields.size() == 1) {
-      if (key.fields[0].ordinal()) dimension = {true, 0,
-          (uint64_t)(key.fields[0].ords ? key.fields[0].ords->numOrds() : 0)};
+      dimension = componentDimension(key, key.fields[0]);
       return;
     }
     uint64_t product = 1;
     for (const auto& field : key.fields) {
-      int64_t base = 0;
-      uint64_t cardinality = 0;
-      if (field.ordinal()) cardinality = (uint64_t)(field.ords ? field.ords->numOrds() : 0);
-      else {
-        int64_t lo = INT64_MAX, hi = INT64_MIN;
-        for (size_t segnum = 0; segnum < key.reader.segments().size(); segnum++) {
-          auto* info = field.segments.at(segnum);
-          if (!info || info->numValues == 0) continue;
-          assert(info->columnBounds);
-          lo = std::min(lo, info->columnBounds->min);
-          hi = std::max(hi, info->columnBounds->max);
-        }
-        if (lo <= hi) {
-          base = lo;
-          uint64_t width = (uint64_t)hi - (uint64_t)lo;
-          if (width >= (uint64_t)INT64_MAX) { internTuples = true; break; }
-          cardinality = width + 1;
-        }
-      }
-      if (cardinality >= (uint64_t)INT64_MAX || product > (uint64_t)INT64_MAX / (cardinality + 1)) {
+      auto dimension = componentDimension(key, field);
+      uint64_t cardinality = dimension.size;
+      if (!dimension.dense || cardinality >= (uint64_t)INT64_MAX
+          || product > (uint64_t)INT64_MAX / (cardinality + 1)) {
         internTuples = true;
         break;
       }
-      components.push_back({base, cardinality + 1});
+      components.push_back({dimension.base, cardinality + 1});
       product *= cardinality + 1;
     }
     if (!internTuples) dimension = {true, 0, product};

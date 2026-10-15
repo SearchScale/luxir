@@ -728,3 +728,67 @@ TEST_F(DistinctFacetTest, wideTupleWorkerIdsAreRemappedBeforeUnion) {
   EXPECT_EQ(2, merged->count(20));
   EXPECT_EQ(2, merged->missing());
 }
+
+TEST_F(DistinctFacetTest, scalarNumericDimensionsPreserveExtremaAndMissingChannels) {
+  CollectionHelper helper;
+  for (int32_t segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int64_t i = 0; i < 32; i++) {
+      auto doc = flatdoc("id", std::to_string(segment * 32 + i), "color_s", i % 2 ? "red" : "blue");
+      if (i % 7 != 0) {
+        doc.emplace_back("near_min_i", INT64_MIN + i % 5);
+        doc.emplace_back("near_max_i", INT64_MAX - i % 5);
+        doc.emplace_back("cross_i", i % 5 - 2);
+        doc.emplace_back("when_dt", (i % 5) * 1000);
+        doc.emplace_back("wide_i", i % 2 ? INT64_MIN : INT64_MAX);
+      }
+      docs.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto full = run("main", R"("limit":-1)");
+  SearchOverridesGuard modeGuard(forcedDistinctFacetMode);
+  SearchOverridesGuard statsGuard(distinctFacetStatsForTests);
+  forcedDistinctFacetMode = DistinctFacetMode::AUTO;
+  for (auto field : {"near_min_i", "near_max_i", "cross_i", "when_dt", "wide_i"}) {
+    for (auto policy : {"expand", "group", "drop"}) {
+      DistinctFacetStats stats;
+      distinctFacetStatsForTests = &stats;
+      auto request = run("main", R"("limit":0,"ops":{"c":{"field_facet":{"field":"color_s","limit":-1,
+          "missing":true,"count_distinct":)" + spec(std::vector<std::string>{field}, policy) + "}}}");
+      check(*request->docList()->ops.at("c")->facetResult(),
+          oracle(*full->docList(), {field}, policy, "color_s", [](const api::Map&) { return true; }));
+      if (field == std::string_view("wide_i")) { EXPECT_GT(stats.hash.load(), 0); }
+      else { EXPECT_GT(stats.paged.load(), 0); }
+    }
+  }
+}
+
+TEST_F(DistinctFacetTest, sparseNumericWalksWithTuplesAndDeletes) {
+  CollectionHelper helper;
+  for (int32_t segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int64_t i = segment * 4096; i < (segment + 1) * 4096; i++) {
+      auto doc = flatdoc("id", std::to_string(i), "marker_s", i % 257 == 0 ? "hit" : "other");
+      if (i % 5 != 0) doc.emplace_back("key_i", INT64_MIN + i % 19);
+      if (i % 7 != 0) doc.emplace_back("when_dt", (i % 3) * 1000);
+      if (i % 3 != 0) doc.emplace_back("color_s", i % 2 ? "red" : "blue");
+      if (i % 11 != 0) doc.emplace_back("size_i", i % 4);
+      docs.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds({"257", "5397"}, UpdateMessage::COMMIT).success);
+  auto full = run("main", R"("query":"marker_s:hit","limit":-1)");
+  for (const auto& fields : std::vector<std::vector<std::string>>{{"key_i"}, {"when_dt"}, {"key_i", "when_dt"}}) {
+    for (auto policy : {"expand", "group", "drop"}) for (int32_t parallel : {1, -1}) {
+      auto request = run("main", R"("query":"marker_s:hit","limit":0,"collapse":)" + spec(fields, policy)
+          + R"(,"ops":{"c":{"field_facet":{"field":"color_s","limit":-1,"missing":true}},
+              "s":{"field_facet":{"field":"size_i","limit":-1,"missing":true}}})", parallel);
+      for (auto [name, field] : {std::pair{"c", "color_s"}, std::pair{"s", "size_i"}}) {
+        check(*request->docList()->ops.at(name)->facetResult(),
+            oracle(*full->docList(), fields, policy, field, [](const api::Map&) { return true; }));
+      }
+    }
+  }
+}

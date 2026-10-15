@@ -201,6 +201,20 @@ inline int32_t countMissingInDomain(const DomainView& view,
   return view.card - haveField;
 }
 
+// A sparse (array) domain decodes values by point, big-skipping the column
+// with SparseIterator; bitset and all-docs domains use the block-decoding
+// BulkIterator. Every walk over an int column follows this one rule.
+inline bool sparseIntColWalk(const DocSet* domain) {
+  return domain != nullptr && domain->type == DocSet::Type::ARRAY;
+}
+
+// Call visit.template operator()<Iterator>() with the walk's iterator type.
+template <typename Visit>
+void withIntColIteratorType(const DocSet* domain, Visit&& visit) {
+  if (sparseIntColWalk(domain)) visit.template operator()<IntColReader::SparseIterator>();
+  else visit.template operator()<IntColReader::Iterator>();
+}
+
 // The single place that knows how to walk a facet/stats domain over an int
 // column: domain type (array / bitset / null=all-docs) x single-vs-multi-valued
 // x dense-vs-sparse column iterator.
@@ -217,7 +231,7 @@ inline int32_t countMissingInDomain(const DomainView& view,
 template <class F>
 void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
                         int32_t maxDoc, int64_t& missing_num, F&& callback) {
-  if (domain && domain->type == DocSet::Type::ARRAY) {
+  if (sparseIntColWalk(domain)) {
     // Sparse domain: iterate the (sorted) doc list and big-skip the column with
     // the value-decoding SparseIterator.
     ArrDocSet* arrDocs = (ArrDocSet*) domain;

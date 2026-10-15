@@ -185,7 +185,8 @@ static void BM_GroupFacetReducerComparison(benchmark::State& state, bool scatter
 // Intra-request parallelism, plus tuple/numeric keys, on the same catalog.
 [[maybe_unused]] static const bool groupFacetExtraCases = [] {
   for (bool scattered : {false, true}) for (auto [label, shape] : {
-      std::pair{"one", 0}, std::pair{"all", 1}, std::pair{"brand", 3}}) {
+      std::pair{"one", 0}, std::pair{"all", 1}, std::pair{"brand", 3},
+      std::pair{"narrow_one", 4}, std::pair{"narrow_all", 5}}) {
     for (bool groups : {false, true}) {
       std::string name = "BM_GroupFacetCatalog/" + std::string(scattered ? "scattered_" : "contiguous_")
           + label + (groups ? "_groups" : "_docs");

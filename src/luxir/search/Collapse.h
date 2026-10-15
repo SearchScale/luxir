@@ -285,8 +285,9 @@ private:
     }
   };
 
+  template <typename Iterator>
   class NumberWalk {
-    IntColReader::Iterator values;
+    Iterator values;
     int32_t previous = -1;
     CollapseKey::Component saved;
   public:
@@ -302,9 +303,10 @@ private:
     }
   };
 
+  template <typename Iterator>
   class WalkColumn {
     std::optional<OrdWalk> ords;
-    std::optional<NumberWalk> numbers;
+    std::optional<NumberWalk<Iterator>> numbers;
   public:
     WalkColumn(Column& column, DocSet* domain, int32_t maxDoc) {
       if (column.ords) ords.emplace(column, domain, maxDoc);
@@ -337,30 +339,34 @@ public:
           return value >= 0 ? GroupIdentity{GroupIdentity::VALUE, value} : plan.missingIdentity(segment, doc);
         });
       } else if (info.numbers) {
-        NumberWalk column(info);
-        if (info.dense) visit([&](int32_t doc) LUXIR_INLINE { return column.read(doc).value; });
-        else visit([&](int32_t doc) LUXIR_INLINE -> GroupIdentity {
-          auto value = column.read(doc);
-          return value.present ? GroupIdentity{GroupIdentity::VALUE, value.value} : plan.missingIdentity(segment, doc);
+        withIntColIteratorType(domain, [&]<typename Iterator>() {
+          NumberWalk<Iterator> column(info);
+          if (info.dense) visit([&](int32_t doc) LUXIR_INLINE { return column.read(doc).value; });
+          else visit([&](int32_t doc) LUXIR_INLINE -> GroupIdentity {
+            auto value = column.read(doc);
+            return value.present ? GroupIdentity{GroupIdentity::VALUE, value.value} : plan.missingIdentity(segment, doc);
+          });
         });
       } else visit([&](int32_t doc) { return plan.missingIdentity(segment, doc); });
       return;
     }
-    std::vector<WalkColumn> cursors;
-    cursors.reserve(columns.size());
-    for (auto& column : columns) cursors.emplace_back(column, domain, maxDoc);
-    int32_t previous = -1;
-    const CollapseKey* saved = nullptr;
-    visit([&](int32_t doc) -> const CollapseKey* {
-      if (doc == previous) return saved;
-      previous = doc;
-      scratch.components.resize(columns.size());
-      bool absent = false;
-      for (size_t i = 0; i < cursors.size(); i++) {
-        scratch.components[i] = cursors[i].read(doc);
-        absent |= !scratch.components[i].present;
-      }
-      return saved = plan.finishKey(scratch, absent, segment, doc);
+    withIntColIteratorType(domain, [&]<typename Iterator>() {
+      std::vector<WalkColumn<Iterator>> cursors;
+      cursors.reserve(columns.size());
+      for (auto& column : columns) cursors.emplace_back(column, domain, maxDoc);
+      int32_t previous = -1;
+      const CollapseKey* saved = nullptr;
+      visit([&](int32_t doc) -> const CollapseKey* {
+        if (doc == previous) return saved;
+        previous = doc;
+        scratch.components.resize(columns.size());
+        bool absent = false;
+        for (size_t i = 0; i < cursors.size(); i++) {
+          scratch.components[i] = cursors[i].read(doc);
+          absent |= !scratch.components[i].present;
+        }
+        return saved = plan.finishKey(scratch, absent, segment, doc);
+      });
     });
   }
 
