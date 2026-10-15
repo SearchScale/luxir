@@ -400,8 +400,8 @@ TEST_F(UtilTest, lazyMapDoesNotInheritCancellation) {
 #ifndef NDEBUG
 TEST_F(UtilTest, lazyMapRejectsRecursiveBuild) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
+  SharedLazyMap<int, int> map;
   EXPECT_DEATH({
-    SharedLazyMap<int, int> map;
     map.getOrCreate(7, [&] { return map.getOrCreate(7, [] { return std::make_shared<int>(42); }); });
   }, "recursive shared build");
 }
