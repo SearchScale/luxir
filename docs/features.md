@@ -265,8 +265,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Stream every match: `limit: -1` with `?format=docs` returns one document
   per line over one connection, with no cursor, scroll state, or page size.
   The output pipes straight back into NDJSON ingest.
-- Hybrid fusion: reciprocal rank fusion over named sources with shared and
-  per-source filters, `limit` and `offset` over the fused list, and facets and
+- Hybrid fusion: weighted reciprocal rank fusion over named sources with
+  shared and per-source filters, `limit` and `offset` over the fused list, and facets and
   metrics over the fused candidate set.
 - A warnings channel: declared degradations (a clamped fuzzy distance, a
   skipped calendar bucket) carry a code and a message in the response instead

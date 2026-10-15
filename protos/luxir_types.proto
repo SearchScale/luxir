@@ -170,13 +170,21 @@ message Fusion {
   // Runs over the union of filtered source ranked lists, as counted by found.
   // Fusion limit and offset do not affect this candidate domain.
   map<string, SearchOp> ops = 15;
+
+  // Per-source weights keyed by source name, used by the fusion method.
+  // A source without an entry has weight 1. Weights must be finite and
+  // >= 0, every key must name a source, and at least one source must have a
+  // weight > 0. A zero weight disables its source: it is not executed and
+  // its documents do not enter the fused list, found, or the ops domain.
+  map<string, double> weights = 16;
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
-// 1 / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source s
-// (or omitted if d does not appear in s).  k=60 is the standard default.
+// weight_s / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source
+// s (sources without d contribute nothing) and weight_s comes from
+// Fusion.weights.
 message RrfFusion {
-  int32 k = 1;  // 0 means use default (60)
+  optional int32 k = 1;  // rank-smoothing constant, >= 0; unset selects 60
 }
 
 message SortSpec {

@@ -196,8 +196,8 @@ one required clause beside text and range clauses, or the query behind a
 ## Hybrid search with RRF
 
 A `fusion` operation ranks several sources independently and merges them with
-reciprocal rank fusion: each document scores `sum(1 / (k + rank))` over the
-sources that returned it, ranks starting at one. Rank fusion combines BM25 and
+reciprocal rank fusion: each document scores `sum(weight / (k + rank))` over
+the sources that returned it, ranks starting at one. Rank fusion combines BM25 and
 vector similarity without converting them to a common score scale,
 and facets can be computed over the fused list:
 
@@ -288,7 +288,8 @@ has no root shorthand, so both request and response use named `ops`.
 |---|---|
 | `sources` | Named ranked inputs. Each takes its own `query`, `filter`, `sort`, and `limit`. |
 | `filter` | Shared by every source, computed once per segment; ANDed with each source's own filter. |
-| `rrf.k` | The rank-smoothing constant; `60` is the conventional choice. |
+| `weights` | Per-source weights keyed by source name; a source without an entry has weight `1`. |
+| `rrf.k` | The rank-smoothing constant, `>= 0`. Omitted selects `60`, the conventional choice. |
 | `limit`, `offset`, `fields`, `get_scores`, `get_number`, `document_format` | Response shape, on the fusion, not on a source. |
 | `ops` | Facets and metrics over the fused candidate set. |
 
@@ -301,6 +302,32 @@ within the union of the source windows and does not enlarge them, so deep
 fusion paging needs larger source limits; per-source `offset` is ignored.
 Place `ops` on the fusion itself. For facets over a full text match set, put a
 sibling `top_docs` operation at the request root.
+
+### Source weights
+
+`weights` scales each source's contribution to `weight / (k + rank)`, so a
+source can count for more or less than the others without changing the
+candidate pools:
+
+```json
+{
+  "fusion": {
+    "sources": {
+      "lexical": {"query": {"match": {"title_t": "dune"}}, "limit": 100},
+      "semantic": {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 100}}, "limit": 100}
+    },
+    "weights": {"lexical": 1, "semantic": 2},
+    "rrf": {}
+  }
+}
+```
+
+A document ranked first by both sources here scores `1/61 + 2/61`. Weights
+must be finite and `>= 0`, every key must name a source, and at least one
+source needs a weight above zero; anything else rejects the request. A weight
+of `0` disables its source: the source is not run, and its documents do not
+reach the fused list, `found`, or the fusion's `ops`. That lets a client turn
+a source off by configuration without rewriting the request.
 
 ## Approximate search
 

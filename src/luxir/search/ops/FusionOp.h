@@ -25,10 +25,12 @@ namespace luxir {
 
 // Hybrid-search fusion: runs N named source queries (each a full TopDocs)
 // across all segments and merges their per-source ranked lists into one
-// fused list.  V1 implements Reciprocal Rank Fusion: fused_score(d) =
-// sum over sources s of 1 / (k + rank_s(d)), where rank_s(d) is d's
-// 1-based rank in source s's ranked output (0 if d does not appear).
-// Standard k = 60.
+// fused list.  V1 implements weighted Reciprocal Rank Fusion:
+// fused_score(d) = sum over sources s of weight_s / (k + rank_s(d)), where
+// rank_s(d) is d's 1-based rank in source s's ranked output (sources without
+// d contribute nothing).  k defaults to 60 and weights to 1.  The parser
+// resolves Fusion.weights by name and drops zero-weight sources, so every
+// source here has a weight > 0.
 //
 // Each source is a child TopDocsReq with its rankingSink wired to deliver
 // the merged top-K back here.  This means TopDocsReq's per-segment
@@ -53,6 +55,8 @@ public:
   // Each source is a full TopDocsReq parented to this FusionOp.  Their
   // rankingSinks are set by the parser to deliver to FusionOp::Calc.
   std::vector<TopDocsReq*> sources;
+  // Fusion weight per source, parallel to `sources`; every entry is > 0.
+  std::vector<double> sourceWeights;
   int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
   std::span<ParsedFilter> filters;  // shared fusion-level filters
   std::span<Query::Weight*> filterWeights;
@@ -62,12 +66,15 @@ public:
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
   FusionOp(SearchRequest& req, std::string_view name, const ReqFusion& fusionProto,
-           std::vector<TopDocsReq*>&& sources, int64_t topCount,
+           std::vector<TopDocsReq*>&& sources,
+           std::vector<double>&& sourceWeights, int64_t topCount,
            std::span<ParsedFilter> filters,
            std::span<Query::Weight*> filterWeights, int32_t rrfK)
     : SearchOp(req, name), fusionProto(fusionProto),
-      sources(std::move(sources)), topCount(topCount), filters(filters),
+      sources(std::move(sources)), sourceWeights(std::move(sourceWeights)),
+      topCount(topCount), filters(filters),
       filterWeights(filterWeights), rrfK(rrfK) {
+    assert(this->sourceWeights.size() == this->sources.size());
     if (!filterWeights.empty()) {
       assert(!this->sources.empty());
       assert(filterWeights.size() == filters.size());
@@ -352,10 +359,12 @@ public:
 
       // Accumulate fused scores by segdoc.
       boost::unordered_flat_map<segdoc, float, SegdocHash> fused;
-      for (auto& ranked : rankedPerSource) {
+      for (size_t s = 0; s < rankedPerSource.size(); s++) {
+        auto& ranked = rankedPerSource[s];
+        float weight = (float)op.sourceWeights[s];
         for (int32_t rank = 0; rank < (int32_t)ranked.size(); rank++) {
-          // 1-based rank; RRF: 1 / (k + rank).
-          float contrib = 1.0f / (float)((int64_t)k + rank + 1);
+          // 1-based rank; weighted RRF: weight / (k + rank).
+          float contrib = weight / (float)((int64_t)k + rank + 1);
           fused[ranked[rank]] += contrib;
         }
       }
