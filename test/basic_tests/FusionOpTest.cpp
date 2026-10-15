@@ -731,7 +731,8 @@ TEST_F(FusionOpTest, validation) {
     ExpectLog quiet("Search request rejected");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
-    EXPECT_NE(lreq->errorMsg().find("source"), std::string::npos);
+    EXPECT_NE(lreq->errorMsg().find("fusion 'f': requires at least one source"),
+              std::string::npos) << lreq->errorMsg();
     lreq->done();
   }
 
@@ -1041,7 +1042,7 @@ TEST_F(WeightedRrfTest, optionalK) {
   auto zero = run(R"("weights":{"banana":0},"rrf":{"k":0})");
   ASSERT_OK(zero);
   EXPECT_EQ((std::vector<float>{1.0f, 1.0f / 2, 1.0f / 3, 1.0f / 4}), resultScores(*zero));
-  expectError(R"("rrf":{"k":-1})", "RrfFusion.k must be >= 0");
+  expectError(R"("rrf":{"k":-1})", "fusion 'f': RrfFusion.k must be >= 0");
 }
 
 TEST_F(WeightedRrfTest, validation) {
@@ -1050,7 +1051,8 @@ TEST_F(WeightedRrfTest, validation) {
   expectError(R"("weights":{"pear":1},"rrf":{})",
               "fusion 'f': weights names unknown source 'pear'");
   expectError(R"("weights":{"apple":-0.5},"rrf":{})",
-              "fusion 'f': weight for source 'apple' must be finite and >= 0");
+              "fusion 'f': weight for source 'apple' must be finite, >= 0, "
+              "and within float range");
   expectError(R"("weights":{"apple":0,"banana":0},"rrf":{})",
               "fusion 'f': at least one source weight must be > 0");
   for (double bad : {std::numeric_limits<double>::quiet_NaN(),
@@ -1065,7 +1067,8 @@ TEST_F(WeightedRrfTest, validation) {
     ExpectLog quiet("Search request rejected");
     req->execute();
     EXPECT_NE(std::string::npos, req->errorMsg().find(
-        "weight for source 'apple' must be finite and >= 0")) << req->errorMsg();
+        "weight for source 'apple' must be finite, >= 0, and within float range"))
+        << req->errorMsg();
   }
 }
 
@@ -1226,9 +1229,16 @@ TEST_F(LinearFusionTest, validation) {
     ExpectLog quiet("Search request rejected");
     auto req = run(LEX, R"("limit":10)");
     EXPECT_NE(std::string::npos, req->errorMsg().find(
-        "Fusion requires a fusion method (rrf or linear)")) << req->errorMsg();
+        "fusion 'f': requires a fusion method (rrf or linear)")) << req->errorMsg();
   }
-  EXPECT_ANY_THROW(run(LEX, R"("rrf":{},"linear":{})"));
+  try {
+    run(LEX, R"("rrf":{},"linear":{})");
+    ADD_FAILURE() << "a request naming both methods was accepted";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string::npos,
+              std::string(e.what()).find("fusion takes exactly one method: rrf or linear"))
+        << e.what();
+  }
   EXPECT_ANY_THROW(run(LEX, R"("linear":{"normalization":"l2"})"));
   {
     auto req = localReq(luxirNode->getSearchEngine());

@@ -326,11 +326,12 @@ candidate pools:
 ```
 
 A document ranked first by both sources here scores `1/61 + 2/61`. Weights
-must be finite and `>= 0`, every key must name a source, and at least one
-source needs a weight above zero; anything else rejects the request. A weight
-of `0` disables its source: the source is not run, and its documents do not
-reach the fused list, `found`, or the fusion's `ops`. That lets a client turn
-a source off by configuration without rewriting the request.
+must be finite, `>= 0`, and within float range, every key must name a source,
+and at least one source needs a weight above zero; anything else rejects the
+request. A weight of `0` disables its source: the source is not run, and its
+documents do not reach the fused list, `found`, or the fusion's `ops`. That
+lets a client turn a source off by configuration without rewriting the
+request.
 
 ### Linear fusion
 

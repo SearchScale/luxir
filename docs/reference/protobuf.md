@@ -900,7 +900,7 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
 | <a id="field-luxir.fusion.document_format"></a>[`document_format`](#field-luxir.fusion.document_format) | 9 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, as counted by found. Fusion limit and offset do not affect this candidate domain. |
-| <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite and &gt;= 0, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
+| <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite, &gt;= 0, and within float range, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
 
 <a id="message-luxir.fuzzyquery"></a>
 

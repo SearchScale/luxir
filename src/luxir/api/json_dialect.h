@@ -1047,7 +1047,8 @@ struct from<JSON, luxir::api::Fusion> {
             // one method arm: a second one is an error (proto3 canonical
             // JSON), not a silent last-wins
             if (value.method.index() != 0) {
-              ctx.error = error_code::unknown_key;
+              ctx.error = error_code::syntax_error;
+              ctx.custom_error_message = "fusion takes exactly one method: rrf or linear";
               return true;
             }
             if (key == "rrf") {

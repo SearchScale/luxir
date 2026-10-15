@@ -53,34 +53,40 @@ struct FacetParsePlan {
   bool refinerPlanned = true;
 };
 
+// Prefix for every error about the fusion named `fusionName`.
+std::string fusionPrefix(std::string_view fusionName) {
+  return "fusion '" + std::string(fusionName) + "': ";
+}
+
 // Resolve Fusion.weights (named at the API boundary) into one weight per
 // source, aligned with `sourceNames` (the source execution order), so no
 // fusion method depends on map ordering. Shared by every fusion method.
 // Unlisted sources get weight 1. Rejects names that are not sources,
-// negative or non-finite weights, and a configuration with no weight > 0.
+// negative, non-finite, or out-of-float-range weights, and a configuration
+// with no weight > 0.
 // A zero entry means the caller should disable that source.
 std::vector<double> resolveSourceWeights(
     std::string_view fusionName,
     const luxir::api::map_view<std::string_view, double>& weights,
     std::span<const std::string_view> sourceNames) {
-  auto prefix = [&]() { return "fusion '" + std::string(fusionName) + "': "; };
   std::vector<double> resolved(sourceNames.size(), 1.0);
   for (const auto& [key, weight] : lastWins(weights)) {
     auto it = std::ranges::find(sourceNames, key);
     if (it == sourceNames.end()) {
-      throw std::runtime_error(prefix() + "weights names unknown source '"
-          + std::string(key) + "'");
+      throw std::runtime_error(fusionPrefix(fusionName)
+          + "weights names unknown source '" + std::string(key) + "'");
     }
     // Scores are float, so a weight must also be finite as a float.
     if (!std::isfinite(*weight) || *weight < 0
         || *weight > (double)std::numeric_limits<float>::max()) {
-      throw std::runtime_error(prefix() + "weight for source '"
-          + std::string(key) + "' must be finite and >= 0");
+      throw std::runtime_error(fusionPrefix(fusionName) + "weight for source '"
+          + std::string(key) + "' must be finite, >= 0, and within float range");
     }
     resolved[(size_t)(it - sourceNames.begin())] = *weight;
   }
   if (std::ranges::none_of(resolved, [](double w) { return w > 0; })) {
-    throw std::runtime_error(prefix() + "at least one source weight must be > 0");
+    throw std::runtime_error(fusionPrefix(fusionName)
+        + "at least one source weight must be > 0");
   }
   return resolved;
 }
@@ -1903,30 +1909,30 @@ public:
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
     int64_t offset = fusionProto.offset;
     if (offset < 0) {
-      throw std::runtime_error(
-          "fusion '" + std::string(name) + "': offset must be >= 0");
+      throw std::runtime_error(fusionPrefix(name) + "offset must be >= 0");
     }
     if (fusionProto.sources.empty()) {
-      throw std::runtime_error("Fusion requires at least one source");
+      throw std::runtime_error(fusionPrefix(name) + "requires at least one source");
     }
     FusionOp::Method method = FusionOp::Method::RRF;
     int32_t rrfK = 60;
     if (const auto* rrf = std::get_if<luxir::api::RrfFusion>(&fusionProto.method)) {
       if (rrf->k.has_value() && *rrf->k < 0) {
-        throw std::runtime_error("RrfFusion.k must be >= 0");
+        throw std::runtime_error(fusionPrefix(name) + "RrfFusion.k must be >= 0");
       }
       rrfK = rrf->k.value_or(60);
     } else if (const auto* linear =
                    std::get_if<luxir::api::LinearFusion>(&fusionProto.method)) {
       using Normalization = luxir::api::LinearFusion::Normalization;
       if (linear->normalization != Normalization::MIN_MAX) {
-        throw std::runtime_error("fusion '" + std::string(name)
-            + "': unsupported LinearFusion.normalization "
+        throw std::runtime_error(fusionPrefix(name)
+            + "unsupported LinearFusion.normalization "
             + std::to_string((int)linear->normalization));
       }
       method = FusionOp::Method::LINEAR_MIN_MAX;
     } else {
-      throw std::runtime_error("Fusion requires a fusion method (rrf or linear)");
+      throw std::runtime_error(fusionPrefix(name)
+          + "requires a fusion method (rrf or linear)");
     }
 
     auto sourceEntries = lastWins(fusionProto.sources);  // dedup duplicate source names, last-wins
@@ -1956,7 +1962,7 @@ public:
       // Linear fusion normalizes relevance scores; a field-sorted source
       // ranks by something else and carries no score to normalize.
       if (method != FusionOp::Method::RRF && src->sortPlan.useFieldSort) {
-        throw std::runtime_error("fusion '" + std::string(name) + "': linear fusion source '"
+        throw std::runtime_error(fusionPrefix(name) + "linear fusion source '"
             + std::string(srcName) + "' must rank by score; use rrf for sorted sources");
       }
       src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {

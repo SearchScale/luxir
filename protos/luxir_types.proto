@@ -173,10 +173,11 @@ message Fusion {
   map<string, SearchOp> ops = 15;
 
   // Per-source weights keyed by source name, used by the fusion method.
-  // A source without an entry has weight 1. Weights must be finite and
-  // >= 0, every key must name a source, and at least one source must have a
-  // weight > 0. A zero weight disables its source: it is not executed and
-  // its documents do not enter the fused list, found, or the ops domain.
+  // A source without an entry has weight 1. Weights must be finite, >= 0,
+  // and within float range, every key must name a source, and at least one
+  // source must have a weight > 0. A zero weight disables its source: it is
+  // not executed and its documents do not enter the fused list, found, or the
+  // ops domain.
   map<string, double> weights = 16;
 }
 
