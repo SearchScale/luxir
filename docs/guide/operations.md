@@ -364,11 +364,13 @@ across machines if requests must produce identical civil-time boundaries.
 
 ## Shutdown and recovery
 
-Engine/server components have drainable shutdown paths, but the current
-`luxir` executable does not install an application signal handler to invoke
-them. A normal `SIGTERM`/`SIGINT` therefore terminates the process rather than
-waiting for in-flight requests. Before a planned stop, quiesce producers and
-publish an immediate commit. After an unplanned stop, the filesystem backend
+On `SIGTERM` or `SIGINT` the server stops accepting connections, waits for
+in-flight gRPC and HTTP requests to finish, stops background work (scrubbing,
+replication), releases the data directory and exits with status `0`. Updates
+that were not yet committed are not committed by shutdown: only acknowledged
+commits are durable, so before a planned stop quiesce producers and publish an
+immediate commit. A second signal during the drain exits immediately with
+status `128 + signal`. After an unplanned stop, the filesystem backend
 reopens the last durable commit. If recovery selects an older valid root, a writer
 publishes it under a new incarnation so followers cannot confuse it with an
 older generation of their current source. File retirement does not fsync removals:
@@ -389,7 +391,6 @@ features it does not yet supply:
 - no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
 - no scheduled backups or automatic restore (use `luxir pull` and `luxir promote`);
-- no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 
 None of these can be enabled by configuration. The pieces those layers will
