@@ -32,7 +32,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -167,6 +167,7 @@ typename Emit::value_type pickMissingVal(std::span<const typename Emit::value_ty
 struct StoredReq {
   std::string_view fieldName;
   FieldType* fieldType;
+  IndexReader::FieldSegments infos;
   // Exactly one of starget / mtarget is populated (selected by multi flag).
   bool multi;
   // Mutable views over the arena-allocated column slots (single: one
@@ -228,7 +229,7 @@ inline uint8_t* allocStringColumn(luxir::api::Column& fieldCol, size_t columnSiz
 // segment and writes values into starget (single) or mtarget (multi).
 // No-op if the field isn't in the segment.  Extracted so the stored-fields
 // path can fall back here when a segment predates the STORED flag.
-inline void loadStrColForSegment(SearchRequest& req, std::string_view field, FieldType& fieldType,
+inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, FieldType& fieldType,
                                  std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
                                  std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
                                  uint8_t* present, std::pmr::memory_resource& mr)
@@ -239,13 +240,8 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
 
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  FieldReader fieldReader(postingsReader);
-  bool found = fieldReader.seek(field);
-  if (!found) {
-    return;
-  }
-  SegFieldInfo segFieldInfo;
-  fieldReader.readFieldInfo(segFieldInfo);
+  if (!info) return;
+  const auto& segFieldInfo = *info;
 
   bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
 
@@ -292,18 +288,18 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
 
 // loadStrCol when the output spans are already allocated (by the caller's
 // earlier allocStringColumn).  Dispatches one per-segment task per run.
-inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, FieldType& fieldType,
+inline void loadStrColWithTargets(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
                                   std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
                                   uint8_t* present,
                                   std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
                                   std::pmr::memory_resource& mr)
 {
-  addFieldLoader(loaders, runs, [&req, field, &fieldType, segDocs, starget, mtarget, present, &mr](std::span<RowIndex> idxSpan) {
-    loadStrColForSegment(req, field, fieldType, idxSpan, segDocs, starget, mtarget, present, mr);
+  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, starget, mtarget, present, &mr](std::span<RowIndex> idxSpan) {
+    loadStrColForSegment(req, infos.at(segDocs[idxSpan[0]].segment()), fieldType, idxSpan, segDocs, starget, mtarget, present, mr);
   });
 }
 
-inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
+inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
                        FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr)
@@ -314,7 +310,7 @@ inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fi
   std::span<luxir::api::ArrStr> mtarget;
   uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                        starget, mtarget, pendingCols, mr);
-  loadStrColWithTargets(req, field, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr);
+  loadStrColWithTargets(req, infos, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr);
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
@@ -364,7 +360,7 @@ struct DoubleColEmit {
 
 // The caller finishes the batch and waits before releasing loader resources.
 template <typename Emit>
-inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
+inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
                        FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr)
@@ -398,20 +394,16 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
     auto& numCol = Emit::multiCol(fieldCol);
     mtarget = std::span<typename Emit::arr_type>(build::allocArray(numCol.v, columnSize, mr), columnSize);
   }
-  addFieldLoader(loaders, runs, [&req, field, &fieldType, segDocs, starget, mtarget, present, &mr](std::span<RowIndex> idxSpan) {
+  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, starget, mtarget, present, &mr](std::span<RowIndex> idxSpan) {
     auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
     auto& postingsReader = req.reader->segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(field);
-    if (!found) {
-      return;
-    }
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    auto* info = infos.at(segNum);
+    if (!info) return;
+    const auto& segFieldInfo = *info;
 
     if (!fieldType.multiValued()) {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
@@ -445,7 +437,7 @@ inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, std::
   std::memcpy(fs, bytes.data(), bytes.size());
 }
 
-inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view field,
+inline void loadVectorColForSegmentSingle(SearchRequest& req, const SegFieldInfo* info,
                                           std::span<RowIndex> idxSpan,
                                           std::span<const segdoc> segDocs,
                                           std::span<luxir::api::Vector> target, std::pmr::memory_resource& mr)
@@ -456,10 +448,8 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view f
 
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  FieldReader fieldReader(postingsReader);
-  if (!fieldReader.seek(field)) return;
-  SegFieldInfo segFieldInfo;
-  fieldReader.readFieldInfo(segFieldInfo);
+  if (!info) return;
+  const auto& segFieldInfo = *info;
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
@@ -469,7 +459,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view f
   StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }
 
-inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view field,
+inline void loadVectorColForSegmentMulti(SearchRequest& req, const SegFieldInfo* info,
                                          std::span<RowIndex> idxSpan,
                                          std::span<const segdoc> segDocs,
                                          std::span<luxir::api::ArrVector> target, std::pmr::memory_resource& mr)
@@ -480,10 +470,8 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view fi
 
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  FieldReader fieldReader(postingsReader);
-  if (!fieldReader.seek(field)) return;
-  SegFieldInfo segFieldInfo;
-  fieldReader.readFieldInfo(segFieldInfo);
+  if (!info) return;
+  const auto& segFieldInfo = *info;
 
   // Multi-valued vectors: each doc's ArrVector holds numVals Vectors. numVals
   // is known at valIdx==0, so the inner Vector span is allocArray'd then filled
@@ -504,7 +492,7 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view fi
 // leave the slot's kind oneof unset.
 // Multi-valued output:  Column.multi_vec - one ArrVector per doc; missing
 // docs (or docs that indexed an empty list) leave an empty ArrVector.
-inline void loadVectorCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
+inline void loadVectorCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
                           std::span<const segdoc> segDocs, SegmentRuns runs,
                           luxir::api::Column& fieldCol,
                           FieldLoaders* loaders, std::pmr::memory_resource& mr)
@@ -516,15 +504,15 @@ inline void loadVectorCol(SearchRequest& req, std::string_view field, FieldType&
     auto& vecCol = fieldCol.kind.emplace<luxir::api::ColVector>();
     std::span<luxir::api::Vector> target(build::allocArray(vecCol.v, columnSize, mr), columnSize);
 
-    addFieldLoader(loaders, runs, [&req, field, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
-      loadVectorColForSegmentSingle(req, field, idxSpan, segDocs, target, mr);
+    addFieldLoader(loaders, runs, [&req, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+      loadVectorColForSegmentSingle(req, infos.at(segDocs[idxSpan[0]].segment()), idxSpan, segDocs, target, mr);
     });
   } else {
     auto& arrVecCol = fieldCol.kind.emplace<luxir::api::MultiVector>();
     std::span<luxir::api::ArrVector> target(build::allocArray(arrVecCol.v, columnSize, mr), columnSize);
 
-    addFieldLoader(loaders, runs, [&req, field, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
-      loadVectorColForSegmentMulti(req, field, idxSpan, segDocs, target, mr);
+    addFieldLoader(loaders, runs, [&req, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+      loadVectorColForSegmentMulti(req, infos.at(segDocs[idxSpan[0]].segment()), idxSpan, segDocs, target, mr);
     });
   }
 }
@@ -556,15 +544,16 @@ inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const st
 // left empty if the field also lacks a column.  This handles both
 // pre-STORED segments (no SFR at all) and partial-stored segments (SFR
 // present but missing a specific field added later).
-inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
+inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments infos,
                              std::vector<StoredReq> reqsOwned,
                              std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
                              std::pmr::memory_resource& mr)
 {
-  addFieldLoader(loaders, runs, [&req, resourceName, reqs = std::move(reqsOwned), segDocs, &mr](std::span<RowIndex> idxSpan) {
+  addFieldLoader(loaders, runs, [&req, infos, reqs = std::move(reqsOwned), segDocs, &mr](std::span<RowIndex> idxSpan) {
     auto segNum = segDocs[idxSpan[0]].segment();
     auto& postingsReader = req.reader->segments()[segNum].postingsReader();
-    auto sfr = StoredFieldsReader::open(postingsReader, resourceName);
+    auto* info = infos.at(segNum);
+    auto sfr = info ? std::make_unique<StoredFieldsReader>(postingsReader, *info) : nullptr;
 
     // Partition reqs: sfrReqs serve from SFR, colReqs fall back to
     // column.  The fallback is attempted for any STRING/ID field type
@@ -588,7 +577,7 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
     }
 
     for (auto* r : colReqs) {
-      loadStrColForSegment(req, r->fieldName, *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget,
+      loadStrColForSegment(req, r->infos.at(segNum), *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget,
                            r->present, mr);
     }
 
@@ -699,6 +688,8 @@ struct ReturnField {
   std::string_view physicalName;
   FieldType* fieldType;
   bool rows;
+  IndexReader::FieldSegments infos;
+  IndexReader::FieldSegments storedInfos;
 };
 
 // Streams a final ranked list of (segdoc, score) pairs back to the client as
@@ -894,11 +885,15 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 
     // Stored-field retrieval is grouped by resource so that multiple stored
     // fields sharing one resource decompress each chunk only once.
-    boost::unordered_flat_map<std::string_view, std::vector<StoredReq>,
+    struct StoredGroup {
+      IndexReader::FieldSegments infos;
+      std::vector<StoredReq> reqs;
+    };
+    boost::unordered_flat_map<std::string_view, StoredGroup,
                               PackedTermHash, PackedTermEqual> storedByResource;
     // Groups served from their columns instead, and the rows of the group
     // being re-read from the chunk after the column loads (see below).
-    std::vector<std::pair<std::string_view, std::vector<StoredReq>>> columnGroups;
+    std::vector<StoredGroup> columnGroups;
     std::vector<RowIndex> fittedIdx;
     std::vector<std::span<RowIndex>> fittedRuns;
     FieldLoaders loaders;
@@ -940,28 +935,29 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         auto& fieldCol = outputColumn();
         uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                              starget, mtarget, pendingCols, mr);
-        storedByResource[resourceName].push_back(
-            {field, &fieldType, fieldType.multiValued(), starget, mtarget, present});
+        auto& group = storedByResource[resourceName];
+        group.infos = rf.storedInfos;
+        group.reqs.push_back({field, &fieldType, rf.infos, fieldType.multiValued(), starget, mtarget, present});
       };
 
       switch (fieldType.type()) {
         case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           break;
         }
         case FieldType::Type::FLOAT: {
-          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          loadNumCol<FloatColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           break;
         }
         case FieldType::Type::DOUBLE: {
-          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          loadNumCol<DoubleColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           break;
         }
         case FieldType::Type::DATE: {
           // DATE is epoch millis in the int column; emit the raw millis as
           // col_i.  ISO-8601 string rendering is an input-side / JSON-layer
           // concern, not the typed gRPC column.
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           break;
         }
         case FieldType::Type::ID:
@@ -969,7 +965,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           if (fieldType.isStored()) {
             recordStoredReq(fieldType.storedResource_);
           } else if (fieldType.hasColumn() && columnSize != 0) {
-            loadStrCol(req, field, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+            loadStrCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           }
           break;
         }
@@ -981,7 +977,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         }
         case FieldType::Type::VECTOR: {
           if (columnSize != 0) {
-            loadVectorCol(req, field, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
+            loadVectorCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
           }
           break;
         }
@@ -990,7 +986,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     }
 
-    for (auto& [resourceName, reqs] : storedByResource) {
+    for (auto& [resourceName, group] : storedByResource) {
+      auto& reqs = group.reqs;
       // A single-valued STRING or ID column holds the source value except
       // where a normalizer rewrote it (every row) or the term was fitted to
       // the term space (rows recognizable by length, re-read from the chunk
@@ -1006,12 +1003,12 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       });
       if (useColumns) {
         for (const auto& r : reqs) {
-          loadStrColWithTargets(req, r.fieldName, *r.fieldType, r.starget, r.mtarget, r.present,
+          loadStrColWithTargets(req, r.infos, *r.fieldType, r.starget, r.mtarget, r.present,
                                 segDocs, runs, pendingLoaders, mr);
         }
-        columnGroups.emplace_back(resourceName, std::move(reqs));
+        columnGroups.push_back(std::move(group));
       } else {
-        loadStoredFields(req, resourceName, std::move(reqs),
+        loadStoredFields(req, group.infos, std::move(reqs),
                          segDocs, runs, pendingLoaders, mr);
       }
     }
@@ -1037,7 +1034,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // value of that length); re-read those rows from the stored chunk.  The
     // subset keeps sortedIdx's segment order, so loadStoredFields serves it
     // as a small batch with its own segment runs.
-    for (auto& [resourceName, reqs] : columnGroups) {
+    for (auto& group : columnGroups) {
+      auto& reqs = group.reqs;
       loaders.clear();
       fittedIdx.clear();
       fittedRuns.clear();
@@ -1057,7 +1055,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
       if (fittedIdx.empty()) continue;
       tgJoin.tg = tg;
-      loadStoredFields(req, resourceName, std::move(reqs), segDocs, fittedRuns, pendingLoaders, mr);
+      loadStoredFields(req, group.infos, std::move(reqs), segDocs, fittedRuns, pendingLoaders, mr);
       loadFields(tg, loaders, fittedRuns);
       if (tg != nullptr) {
         Signal::emit("emitDocsStoredWait", &req, tg);
@@ -1218,6 +1216,16 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
   }
   if (picked.empty()) return {};
+  boost::unordered_flat_map<std::string_view, IndexReader::FieldSegments, PackedTermHash, PackedTermEqual> resources;
+  for (auto& rf : picked) {
+    if (!rf.fieldType) continue;
+    if (rf.fieldType->type() != FieldType::TEXT) rf.infos = req.reader->field(rf.physicalName);
+    if (rf.fieldType->isStored()) {
+      auto [it, inserted] = resources.try_emplace(rf.fieldType->storedResource_);
+      if (inserted) it->second = req.reader->field(it->first);
+      rf.storedInfos = it->second;
+    }
+  }
   auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * picked.size(),
                                                       alignof(ReturnField));
   std::uninitialized_copy(picked.begin(), picked.end(), out);

@@ -690,7 +690,7 @@ public:
   /// for each docid that has any values.
   /// For example, if docids[4]==1000, and docid 1000 has values {10, 11, 12}, then the callbacks would be:
   /// callback(4, 1000, 10, 0, 3), callback(4, 1000, 11, 1, 3), callback(4, 1000, 12, 2, 3).
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
+  static void getValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
     IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
 
@@ -721,7 +721,7 @@ public:
 
   /// docids is a sorted range of docids to load values for in a multi-valued field.
   /// calls callback(size_t input_index, int32_t docid, int64_t value) for each docid that has any values.
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
     assert(!intColReader.multiValued());
@@ -741,18 +741,6 @@ public:
     }
   }
 
-  /// see getSingleValues(), but starting with a field name.
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, std::string_view field, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(field);
-    if (!found) {
-      return;
-    }
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-
-    getSingleValues(pool, postingsReader, segFieldInfo, sortedDocIds, callback);
-  }
 
 };
 

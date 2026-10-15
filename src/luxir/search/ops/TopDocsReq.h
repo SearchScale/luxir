@@ -270,17 +270,19 @@ public:
 
   // The primary sort column's keys in every segment, by segment ord, for a
   // sort the exact-domain driver can serve; empty otherwise. Read from each
-  // segment's cached leaf metadata (PostingsReader::numericLeafMeta), the
-  // keys the collector's comparator offers once on the segment.
+  // segment's cached Field leaf metadata, as offered by the comparator.
   static std::vector<std::optional<SegmentKeys>> fieldSortSegmentKeys(
       IndexReader& reader, const SortPlan& sortPlan,
       std::optional<Query::ValueEnvelope> envelope) {
     std::vector<std::optional<SegmentKeys>> keys;
     if (!fieldSortCanUseMaskedBestFirst(sortPlan)) return keys;
     const SortField& sortField = sortPlan.clauses[0].getSortField();
+    auto fields = reader.field(sortField.getFieldName());
     keys.reserve(reader.segments().size());
     for (auto& segment : reader.segments()) {
-      if (const auto* meta = segment.postingsReader().numericLeafMeta(sortField.getFieldName())) {
+      auto* info = fields.at((size_t)segment.ord);
+      const auto* meta = info ? info->numericLeafMeta() : nullptr;
+      if (meta) {
         keys.emplace_back(std::in_place, *meta, sortField.isReversed(), envelope);
       } else {
         keys.emplace_back();
@@ -2050,7 +2052,7 @@ public:
             // setSegment calls are correct (slot state survives) but re-seek
             // comparator readers, a real fixed cost on string sorts.
             data->fieldCollector->setSegment(
-                segnum, &seg.postingsReader(), &poolGuard.pool(),
+                seg, &poolGuard.pool(),
                 sortSourceCost);
             bool usedBulk = false;
             int64_t fieldHitsBefore = data->fieldCollector->hitCount;

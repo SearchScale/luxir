@@ -14,7 +14,7 @@
 #include "luxir/index/PointsWriter.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/PointsReader.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
@@ -146,10 +146,9 @@ std::optional<int64_t> weightConstantCount(IndexReader& reader,
 std::optional<SegFieldInfo> tryFieldInfo(IndexReader::Segment& segment,
                                          std::string_view field) {
   MemPool pool;
-  FieldReader fields(segment.postingsReader());
-  if (!fields.seek(field)) return std::nullopt;
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo(field);
+  if (!fields) return std::nullopt;
+  const auto& info = *fields;
   return {info};
 }
 

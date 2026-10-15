@@ -18,7 +18,7 @@
 #include "luxir/api/build.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/reader/BKDReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
@@ -128,10 +128,9 @@ void setGeoSchema(CollectionHelper& helper, bool range = true) {
 
 SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
   MemPool pool;
-  FieldReader fields(segment.postingsReader());
-  if (!fields.seek(field)) throw std::runtime_error("missing geo test field");
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo(field);
+  if (!fields) throw std::runtime_error("missing geo test field");
+  const auto& info = *fields;
   return info;
 }
 

@@ -379,13 +379,15 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   for (const auto& seg : segs) core->segOrds.emplace_back(seg.segInfo.seg_id, seg.ord);
   std::ranges::sort(core->segOrds);
 
-  // Check if we can share ordMaps from the previous reader
+  // Base-segment metadata is unchanged by deletes and overlays.
   if (previous && previous->coreGeneration == core->coreGeneration) {
     IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", core->coreGeneration);
     core->ordMaps = previous->ordMaps;
+    core->fields = previous->fields;
   } else {
     IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", core->coreGeneration);
     core->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
+    core->fields = std::make_shared<FieldRecords>();
   }
 
   IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
@@ -398,6 +400,79 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);
   return it != segOrds.end() && it->first == segId ? &segs[(size_t)it->second] : nullptr;
+}
+
+IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t numSegments,
+                                      size_t first, int32_t ordinal)
+    : name(name), numSegments(numSegments),
+      ordinals(std::make_unique<std::atomic<int32_t>[]>(numSegments)) {
+  for (size_t i = 0; i < numSegments; i++) {
+    ordinals[i].store(i < first ? -1 : UNRESOLVED, std::memory_order_relaxed);
+  }
+  ordinals[first].store(ordinal, std::memory_order_relaxed);
+}
+
+IndexReader::FieldRecord::~FieldRecord() {
+  auto* stats = fieldStats.load(std::memory_order_relaxed);
+  delete stats;
+}
+
+IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
+  const FieldRecord* record = nullptr;
+  auto get = [&](const auto& item) { record = item.second.get(); };
+  if (!core->fields->cvisit(name, get)) {
+    for (size_t i = 0; i < core->segs.size(); i++) {
+      int32_t ordinal = core->segs[i].postingsReader().findOrdinal(name);
+      if (ordinal < 0) continue;
+      auto fresh = std::make_unique<FieldRecord>(name, core->segs.size(), i, ordinal);
+      core->fields->try_emplace(std::string(name), std::move(fresh));
+      core->fields->cvisit(name, get);
+      break;
+    }
+  }
+  return record ? FieldSegments(record, core->segs.data()) : FieldSegments{};
+}
+
+const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
+  if (!record) return nullptr;
+  assert(segment < record->numSegments);
+  auto& postings = segments[segment].postingsReader();
+  int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
+  if (ordinal == FieldRecord::UNRESOLVED) {
+    ordinal = postings.findOrdinal(record->name);
+    record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
+  }
+  return postings.fieldInfo(ordinal);
+}
+
+bool IndexReader::FieldSegments::exists() const noexcept {
+  return record != nullptr;
+}
+
+size_t IndexReader::FieldSegments::size() const noexcept {
+  return record ? record->numSegments : 0;
+}
+
+const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
+  assert(record);
+  auto* stats = record->fieldStats.load(std::memory_order_acquire);
+  if (!stats) {
+    auto fresh = std::make_unique<Similarity::FieldStats>();
+    for (size_t i = 0; i < size(); i++) {
+      fresh->maxDoc += segments[i].maxDoc();
+      if (auto* info = at(i)) {
+        fresh->docsWithField += info->docsWithField;
+        fresh->sumDocFreq += info->sumDocFreq;
+        fresh->sumTotalTermFreq += info->sumTotalTermFreq;
+      }
+    }
+    if (record->fieldStats.compare_exchange_strong(stats, fresh.get(),
+                                                 std::memory_order_release,
+                                                 std::memory_order_acquire)) {
+      stats = fresh.release();
+    }
+  }
+  return *stats;
 }
 
 std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {

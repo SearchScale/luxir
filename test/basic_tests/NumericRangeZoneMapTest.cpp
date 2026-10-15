@@ -12,7 +12,7 @@
 
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
@@ -498,10 +498,9 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
   index.initReader();
 
   auto& segment = index.reader->segments()[0];
-  FieldReader fields(segment.postingsReader());
-  ASSERT_TRUE(fields.seek("predicted_cross_i"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo("predicted_cross_i");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   IntColReader column(segment.postingsReader(), info);
   ASSERT_EQ(column.numBlocks(), 1);
   EXPECT_NE(column.blockInfo(0).scaledSlope, 0);

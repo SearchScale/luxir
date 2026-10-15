@@ -61,12 +61,8 @@ struct SegFieldInfo {
   int64_t nTerms;
   int32_t docsWithField;
 
-  // I don't know if things like nTerms, sumDocFreq, sumTotalTermFreq will stay in fieldInfo
-  // or perhaps be moved into the terms section of the postings (i.e. pushed down so one needs
-  // a TermsEnum to read them).  To be safe, we should only access through TermsEnum for now.
-  // Only reason to keep at this level would be if they are sometimes needed even without a TermsEnum.
-  // They could be written right before the termBlock offsets that termBlockIndexLoc points to.
-  // One advantage of keeping this stuff here is it makes the TermBlockOffsets fixed size.
+  // Immutable header totals used directly for BM25 field statistics. These
+  // include deleted documents; live-doc filtering does not change them.
   int64_t sumDocFreq;
   int64_t sumTotalTermFreq;
   seg_location trieLoc;

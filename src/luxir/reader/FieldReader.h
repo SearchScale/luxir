@@ -16,7 +16,7 @@ class FieldReader {
   InputStream fieldIS;
   int32_t nFields;
   int32_t currField = -1;
-  uint32_t* fieldOffsets;  // the array of field offsets, written by PostingsWriter::writeFieldIndex()
+  const uint32_t* fieldOffsets;  // the array of field offsets, written by PostingsWriter::writeFieldIndex()
   int64_t fieldOffsetsLoc; // location in the file of the above array
 
   PackedTerm fieldname{nullptr};
@@ -26,42 +26,19 @@ class FieldReader {
 public:
   explicit FieldReader(PostingsReader& postingsReader) {
     fieldIS = postingsReader.getInputStream(0);
-    fieldIS.seek(postingsReader.segInfoOffset - sizeof(int32_t));
-    fieldOffsetsLoc = fieldIS.offset();
-    auto fieldLocEnd = fieldIS.ptr();
-    nFields = fieldIS.readInt();
-    fieldOffsets = ((uint32_t*)(fieldLocEnd)) - nFields;
-    fieldOffsetsLoc -= nFields * sizeof(uint32_t);
+    nFields = postingsReader.nFields;
+    fieldOffsets = postingsReader.fieldOffsets;
+    fieldOffsetsLoc = postingsReader.fieldOffsetsLoc;
   }
 
-  int32_t numFields() {
-    return nFields;
+private:
+  friend class PostingsReader;
+  FieldReader(PostingsReader& reader, int32_t ordinal) : FieldReader(reader) {
+    currField = ordinal - 1;
+    if (!readNextField()) throw std::logic_error("Invalid field ordinal");
   }
 
-  // TODO: we could make a readFieldInfo(std::string_view fieldName) that is thread safe (doesn't modify the FieldReader)
-  // Although it might just be simpler to make a copy?
-  // IndexReader could return an array of const FieldReaders
-
-  [[nodiscard]] bool seek(const std::string_view fieldName) {
-    auto comparator = [&](const int32_t fieldOff, const std::string_view key) {
-      auto fieldNameFound = fieldIS.readPackedTerm(fieldOffsetsLoc - fieldOff);
-      return fieldNameFound < key;
-    };
-    auto endPtr = fieldOffsets + nFields;
-    uint32_t* fieldOffPtr = std::lower_bound(fieldOffsets, endPtr, fieldName, comparator);
-    if (fieldOffPtr != endPtr) {
-      // This may be slightly repeated work (additional read term and compare), but it may not be worth it to eliminate.
-      auto fieldNameFound = fieldIS.readPackedTerm(fieldOffsetsLoc - *fieldOffPtr);
-
-      if (fieldNameFound == fieldName) {
-        currField = fieldOffPtr - fieldOffsets - 1;  // back up to previous field since we will increment in readNextField
-        return readNextField();
-      }
-    }
-    return false;
-  }
-
-
+public:
   // TODO: should this read into a different structure?  Only if we want to iterate over all fields but not read them?
   // one possible use case: a wildcard in field names (fast iteration would be a bonus)
   [[nodiscard]] bool readNextField() {
@@ -79,7 +56,7 @@ public:
     return true;
   }
 
-  // only valid after readNextField() returns true or seek() returns true.
+  // only valid after readNextField() returns true.
   // The SegFieldInfo produced is independent of FieldReader.
   void readFieldInfo(SegFieldInfo& fieldInfo) {
     assert(fieldIS.left() > 0); // this triggers if this fieldReader is unpositioned.

@@ -4,7 +4,7 @@
 #pragma once
 
 #include "luxir/codec/StreamVByte.h"
-#include "FieldReader.h"
+#include "PostingsReader.h"
 #include "Postings.h"
 #include "TrieReader.h"
 

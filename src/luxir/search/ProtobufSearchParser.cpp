@@ -472,7 +472,8 @@ public:
         options.fieldResolver = &fields;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
-        return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program);
+        auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
+        return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
@@ -582,9 +583,8 @@ public:
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
         }
-        auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
         facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, facetReq,
-            facetField, facetName, limit, minCount, missing, range, selectedInts);
+            facetField, facetName, limit, minCount, missing, selectedInts);
         break;
       }
       case FieldType::Type::ID:

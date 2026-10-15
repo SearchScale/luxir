@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -3028,23 +3029,18 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
-  FieldReader fieldReader(reader);
-  if (!fieldReader.seek("id")) {
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
     return;
   }
 
-  SegFieldInfo idFieldInfo;
-  fieldReader.readFieldInfo(idFieldInfo);
-  TermsEnum termsEnum(pool, reader, idFieldInfo);
+  TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
   // Also get the "_version_" field for version comparison
-  FieldReader versionFieldReader(reader);
-  SegFieldInfo versionFieldInfo;
   std::optional<IntColReader> versionColReader;
-  if (versionFieldReader.seek("_version_")) {
-    versionFieldReader.readFieldInfo(versionFieldInfo);
-    versionColReader.emplace(reader, versionFieldInfo);
+  if (auto* versionFieldInfo = reader.fieldInfo("_version_")) {
+    versionColReader.emplace(reader, *versionFieldInfo);
     assert(!versionColReader->multiValued());
   }
 

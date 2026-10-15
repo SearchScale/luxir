@@ -13,7 +13,7 @@
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ExistsQuery.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/schema/Schema.h"
 #include "test/CollectionHelper.h"
@@ -80,10 +80,10 @@ std::vector<std::string> expectedIds(
 SegFieldInfo readFieldInfo(IndexReader::Segment& segment,
                            std::string_view field) {
   MemPool pool;
-  FieldReader reader(segment.postingsReader());
-  if (!reader.seek(field)) throw std::runtime_error("missing test field");
+  auto* reader = segment.postingsReader().fieldInfo(field);
+  if (!(reader != nullptr)) throw std::runtime_error("missing test field");
   SegFieldInfo info{};
-  reader.readFieldInfo(info);
+  info = *reader;
   return info;
 }
 

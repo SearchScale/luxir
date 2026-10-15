@@ -18,7 +18,7 @@
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/ops/FacetExecution.h"
 #include "luxir/search/ops/StrFacetReplay.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/SegmentMergeDriver.h"
@@ -33,6 +33,7 @@ class ExprStatsOp : public SearchOp {
       "facet aggregate state";
 
   AggregateProgram& aggregate;
+  std::span<const ValueFieldInfos> fields;
   const DenseFacetStateOps* denseFacetState = nullptr;
 
   const DenseFacetStateOps* resolveDenseFacetState() {
@@ -49,13 +50,13 @@ class ExprStatsOp : public SearchOp {
         || input.columnMultiValued) {
       return nullptr;
     }
+    auto infos = fields[0][leaf.input->rootNode];
     for (auto& segment : req.reader->segments()) {
       auto& postings = segment.postingsReader();
       if (postings.maxDoc() == 0) continue;
-      FieldReader reader(postings);
-      if (!reader.seek(input.text)) return nullptr;
-      SegFieldInfo info;
-      reader.readFieldInfo(info);
+      auto* field = infos.at((size_t)segment.ord);
+      if (!field) return nullptr;
+      const auto& info = *field;
       if (info.docsWithField != postings.maxDoc()) return nullptr;
     }
     return leaf.resolved.denseFacetState;
@@ -81,8 +82,8 @@ class ExprStatsOp : public SearchOp {
 
 public:
   ExprStatsOp(SearchRequest& req, std::string_view name,
-              AggregateProgram& aggregate)
-      : SearchOp(req, name), aggregate(aggregate) {}
+              AggregateProgram& aggregate, std::span<const ValueFieldInfos> fields)
+      : SearchOp(req, name), aggregate(aggregate), fields(fields) {}
 
   void init() override {
     SearchOp::init();
@@ -191,7 +192,7 @@ public:
           MemPool& pool = poolGuard.pool();
           auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
           std::vector<BoundAggregateInput> bindings = bindAggregateInputs(
-              thisOp().aggregate, pool, segment);
+              thisOp().aggregate, pool, segment, thisOp().fields);
 
           int32_t maxDoc = segment.postingsReader().maxDoc();
           for (BoundAggregateInput& binding : bindings) {
@@ -403,7 +404,7 @@ public:
       try {
         MemPool& pool = MemPool::threadLocal();
         auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
-        bindings = bindAggregateInputs(thisOp().aggregate, pool, segment);
+        bindings = bindAggregateInputs(thisOp().aggregate, pool, segment, thisOp().fields);
       } catch (const ValueEvaluationError&) {
         bindings.clear();
         segmentFailure = AggregateFailure::VALUE_EVALUATION;
@@ -492,10 +493,9 @@ public:
       auto& postings = segment.postingsReader();
       int32_t maxDoc = postings.maxDoc();
 
-      FieldReader parentReader(postings);
-      if (!parentReader.seek(source.field)) return;
-      SegFieldInfo parentInfo;
-      parentReader.readFieldInfo(parentInfo);
+      auto* info = source.segInfos.at((size_t)segnum);
+      if (!info) return;
+      const auto& parentInfo = *info;
       OrdColReader parentColumn(postings, parentInfo);
       auto mapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(mapping, selectedBuckets);
@@ -504,7 +504,7 @@ public:
       bool bindingFailed = false;
       try {
         bindings = bindAggregateInputs(
-            child.aggregate, poolGuard.pool(), segment);
+            child.aggregate, poolGuard.pool(), segment, child.fields);
       } catch (const ValueEvaluationError&) {
         bindings.clear();
         bindingFailed = true;

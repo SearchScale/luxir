@@ -60,7 +60,7 @@ struct SelectedFacetBucket {
 // ids are global ordinals for this OrdMap epoch; domains are the parent's
 // incoming domains and remain pinned for synchronous binding execution.
 struct StringFacetColumnSource {
-  std::string_view field;
+  IndexReader::FieldSegments segInfos;
   const OrdMap& ordMap;
   std::span<const DomainHandle> domains;
   std::span<const SelectedFacetBucket<std::string_view>> buckets;

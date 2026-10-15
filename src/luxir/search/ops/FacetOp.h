@@ -42,11 +42,16 @@ public:
   bool missing;
 
   std::string_view facetName;
+  IndexReader::FieldSegments segInfos;
+
+  const SegFieldInfo* fieldInfo(int32_t segnum) const {
+    return segInfos.at((size_t)segnum);
+  }
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
     int64_t limit, int64_t minCount, bool missing)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
-      facetName(facetName) {
+      facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
   }
 
   virtual ~FacetReq() = default;
@@ -62,21 +67,20 @@ public:
     SearchOp::init();
   }
 
-  // Open the segment column under a pool scope. An absent field adds the
+  // Open the segment column. An absent field adds the
   // whole domain to missing_num; otherwise the visitor owns the column walk.
   bool withIntColumn(DocSet* domain, int32_t segnum, int64_t& missing_num,
-                     SegFieldInfo& segFieldInfo, auto&& visitColumn) {
+                     auto&& visitColumn) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(fieldName);
+    auto* info = fieldInfo(segnum);
+    bool found = info != nullptr;
     if (!found) {
       // field absent in this segment: every in-domain doc is missing.
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *info;
     IntColReader intColReader(postingsReader, segFieldInfo);
     visitColumn(intColReader, maxDoc);
     return true;
@@ -85,20 +89,18 @@ public:
   // utility template method that calls callback with (int32 docid, int64_t value) for each doc in the domain that has
   // a value in the int column field (single or multi-valued).
   // missing is an out parameter that is incremented for every domain doc that does not have the field.
-  // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
-  bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, SegFieldInfo& segFieldInfo, auto&& callback) {
+  bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, auto&& callback) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(fieldName);
+    auto* info = fieldInfo(segnum);
+    bool found = info != nullptr;
     if (!found) {
       // field absent in this segment: every in-domain doc is missing.
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *info;
     // Walk the domain over the int column.  forEachIntColValue owns the
     // domain-type x single/multi x dense/sparse dispatch (and the one
     // (BitDocSet*)/(ArrDocSet*) cast); callback is per value.
@@ -110,17 +112,15 @@ public:
   // callback(docid, ord) per value, ord 0-based in `ordSpace`
   // (forEachOrdValue).
   bool facetSegOrdCol(DocSet* domain, int32_t segnum, int64_t& missing_num,
-                      SegFieldInfo& segFieldInfo,
                       const OrdMap::SegToGlobal& ordSpace, auto&& callback) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    if (!fieldReader.seek(fieldName)) {
+    auto* info = fieldInfo(segnum);
+    if (!info) {
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *info;
     OrdColReader ordColReader(postingsReader, segFieldInfo);
     forEachOrdValue(domain, ordColReader, ordSpace, maxDoc, missing_num,
                     callback);
@@ -241,15 +241,13 @@ public:
 
     DomainHandle materializeTermDomain(
         int32_t segnum, std::string_view term, DocSet* inputDomain) {
-      SegFieldInfo segFieldInfo;
       auto& postingsReader =
           fieldOp().reader.segments()[(size_t)segnum].postingsReader();
       int32_t maxDoc = postingsReader.maxDoc();
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(postingsReader);
       std::unique_ptr<DocSet> domain;
-      if (fieldReader.seek(fieldOp().fieldName)) {
-        fieldReader.readFieldInfo(segFieldInfo);
+      if (auto* info = fieldOp().fieldInfo(segnum)) {
+        const auto& segFieldInfo = *info;
         TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
         if (terms.seek(term)) {
           int32_t docFreq = terms.docFreq();
@@ -550,34 +548,30 @@ public:
     bool useVector = false;
   };
 
-  // ProtobufSearchParser computes globalMin/globalMax/useVector via
-  // scanGlobalRange and passes them in (see TopDocsReq's ctor comment).
   IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
-    const GlobalRange& range,
     std::span<const int64_t> selected) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
-                selected, {}),
-  globalMin(range.min), globalMax(range.max), useVector(range.useVector) {}
+                selected, {}) {
+    auto range = scanGlobalRange(reader, segInfos);
+    globalMin = range.min;
+    globalMax = range.max;
+    useVector = range.useVector;
+  }
 
   bool canEmitAsBucketChild() const override {
     return true;
   }
 
   // Scan every segment for the column's min/max and decide vector vs map
-  // storage based on the resulting range.  Runs during parsing so the result
-  // can be passed to the IntFacetReq ctor.
-  static GlobalRange scanGlobalRange(IndexReader& reader, std::string_view fieldName) {
+  // storage based on the resulting range.
+  static GlobalRange scanGlobalRange(IndexReader& reader, IndexReader::FieldSegments infos) {
     GlobalRange r;
     for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
       auto& postingsReader = reader.segments()[segnum].postingsReader();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(postingsReader);
-      bool found = fieldReader.seek(fieldName);
-      if (!found) continue;
-
-      SegFieldInfo segFieldInfo;
-      fieldReader.readFieldInfo(segFieldInfo);
+      auto* info = infos.at(segnum);
+      if (!info) continue;
+      const auto& segFieldInfo = *info;
       if (segFieldInfo.numValues == 0) continue;
 
       IntColReader intColReader(postingsReader, segFieldInfo);
@@ -640,8 +634,7 @@ public:
               forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_DENSE,
               forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_SPARSE);
           int64_t keyBase = thisOp().useVector ? thisOp().globalMin : 0;
-          SegFieldInfo info;
-          thisOp().withIntColumn(domain, segnum, data.missing_num, info,
+          thisOp().withIntColumn(domain, segnum, data.missing_num,
               [&](IntColReader& column, int32_t maxDoc) {
                 if (!column.multiValued()) {
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
@@ -679,7 +672,6 @@ public:
       }
       if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
       driver.contribute([&](MergeableIntFacet& data) {
-        SegFieldInfo segFieldInfo;
         auto& facetReq = (FacetReq&)getOp();
         // Initialize storage based on the pre-determined type (first segment).
         if (std::holds_alternative<std::monostate>(data.counts)) {
@@ -693,14 +685,14 @@ public:
         }
         if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
           int64_t minVal = data.minValue;
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo,
+          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
             [countVec, minVal](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countVec)[val - minVal]++;
             });
         } else {
           auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo,
+          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
             [countMap](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countMap)[val]++;
@@ -804,10 +796,9 @@ public:
       return buildFacetBucketDomains(
           thisOp().reader.segments()[segnum].maxDoc(), buckets.size(),
           [&](auto&& accept) {
-            SegFieldInfo info;
             int64_t missing = 0;
             thisOp().facetSegIntCol(input[segnum].get(), (int32_t)segnum,
-                                    missing, info, accept);
+                                    missing, accept);
           }, [&](int64_t value) {
             auto it = builderOfValue.find(value);
             return it == builderOfValue.end() ? -1 : it->second;
@@ -978,18 +969,17 @@ public:
       if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
       driver.contribute([&](MergeableStrFacet& data) {
         boost::unordered_flat_map<std::string, int64_t>& counts = data.counts;
-        SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
         DomainView domainView(domain, maxDoc);
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(postingsReader);
-        if (!fieldReader.seek(thisOp().fieldName)) {
+        auto* info = thisOp().fieldInfo(segnum);
+        if (!info) {
           // field absent in this segment: all in-domain docs are missing
           data.missing_num += domainView.card;
           return;
         }
-        fieldReader.readFieldInfo(segFieldInfo);
+        const auto& segFieldInfo = *info;
         if (domainView.compCard != 0) {
           domainView.materializeBits(poolGuard.pool());
         }
@@ -1022,13 +1012,12 @@ public:
         data.counts.initialize(0, false, true);
         auto& postings = thisOp().reader.segments()[(size_t)segnum].postingsReader();
         DomainView view(domain, postings.maxDoc());
-        FieldReader field(postings);
-        if (!field.seek(thisOp().fieldName)) {
+        auto* field = thisOp().fieldInfo(segnum);
+        if (!field) {
           data.missing_num += view.card;
           return;
         }
-        SegFieldInfo info;
-        field.readFieldInfo(info);
+        const auto& info = *field;
         TermsEnum terms(MemPool::threadLocal(), postings, info);
         int32_t lastDoc = -1;
         while (terms.nextTerm()) {
@@ -1469,7 +1458,6 @@ public:
     void collectSegment(
         MergeableFixedBuckets& data, int32_t segnum,
         DocSet* domain) override {
-      SegFieldInfo segFieldInfo;
       int64_t start = rangeOp().fences.front();
       int64_t end = rangeOp().fences.back();
       auto& segment = rangeOp().reader.segments()[segnum];
@@ -1478,9 +1466,8 @@ public:
           && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
           && start < end) {
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(segment.postingsReader());
-        if (fieldReader.seek(rangeOp().fieldName)) {
-          fieldReader.readFieldInfo(segFieldInfo);
+        if (auto* info = rangeOp().fieldInfo(segnum)) {
+          const auto& segFieldInfo = *info;
           bool oneDimensionalNumeric = segFieldInfo.type == FieldType::INT
                                       || segFieldInfo.type == FieldType::FLOAT
                                       || segFieldInfo.type == FieldType::DOUBLE
@@ -1512,7 +1499,7 @@ public:
         }
       }
       rangeOp().facetSegIntCol(
-          domain, segnum, data.missing_num, segFieldInfo,
+          domain, segnum, data.missing_num,
           // Captured by value: through a by-reference capture the counts
           // store may alias the op's fences and the count vector itself, so
           // each value would reload them.
@@ -1540,10 +1527,9 @@ public:
       return buildFacetBucketDomains(
           rangeOp().reader.segments()[segnum].maxDoc(), buckets.size(),
           [&](auto&& accept) {
-            SegFieldInfo info;
             int64_t missing = 0;
             rangeOp().facetSegIntCol(input[segnum].get(), (int32_t)segnum,
-                                     missing, info, accept);
+                                     missing, accept);
           }, [&](int64_t value) {
             return value < start || value >= end
                 ? -1 : builderOfBucket[rangeOp().bucketOf(value)];

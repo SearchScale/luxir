@@ -24,7 +24,7 @@
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/search/DocSet.h"
@@ -326,7 +326,7 @@ struct CachedTermInfo {
 };
 
 struct CachedFieldInfo {
-  std::span<SegFieldInfo*> segInfos = {};
+  IndexReader::FieldSegments segInfos;
   Similarity::FieldStats fieldStats = {};
   std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
@@ -1260,22 +1260,21 @@ public:
     std::shared_ptr<FilterCache::UseRegistry>& filterUses;
     FilterKeyContext& filterKeyContext;
     Limits& limits;
-    std::span<FieldReader> fieldReaders;
     FieldInfoMap fieldInfoMap;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
-            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap)
+            FieldInfoMap&& fieldInfoMap)
       : planning(planning), allocationArena(&arena),
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {}
+        fieldInfoMap(std::move(fieldInfoMap)) {}
 
     // Arena-owned form used by standalone embedders that do not already have
     // serial planning state.
     Context(google::protobuf::Arena& arena, MemPool& pool,
             IndexReader& topReader,
-            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
+            FieldInfoMap&& fieldInfoMap,
             Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
             FilterKeyContext filterKeyContext = {},
             std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
@@ -1285,7 +1284,7 @@ public:
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {}
+        fieldInfoMap(std::move(fieldInfoMap)) {}
 
     // Convenience ctor for stack-allocated Contexts (tests, non-arena code).
     Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -1301,31 +1300,13 @@ public:
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
         fieldInfoMap(4, pool.getAllocator()) {
-      auto numSegs = topReader.segments().size();
-      fieldReaders = {
-        (FieldReader*)pool.alloc(
-            sizeof(FieldReader) * numSegs, alignof(FieldReader)),
-        numSegs
-      };
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&fieldReaders[i]) FieldReader(
-            topReader.segments()[i].postingsReader());
-      }
     }
 
     static Context* create(google::protobuf::Arena* arena,
                            PlanningContext& planning) {
-      auto numSegs = planning.topReader.segments().size();
-      auto* readers = (FieldReader*)planning.pool.alloc(
-          sizeof(FieldReader) * numSegs, alignof(FieldReader));
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&readers[i]) FieldReader(
-            planning.topReader.segments()[i].postingsReader());
-      }
       FieldInfoMap map(4, planning.pool.getAllocator());
       return luxir::arenaCreate<Context>(
-          *arena, *arena, planning,
-          std::span<FieldReader>(readers, numSegs), std::move(map));
+          *arena, *arena, planning, std::move(map));
     }
 
     static Context* create(
@@ -1334,17 +1315,9 @@ public:
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
         std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr) {
-      auto numSegs = topReader.segments().size();
-      auto* readers = (FieldReader*)pool.alloc(
-          sizeof(FieldReader) * numSegs, alignof(FieldReader));
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&readers[i]) FieldReader(
-            topReader.segments()[i].postingsReader());
-      }
       FieldInfoMap map(4, pool.getAllocator());
       return luxir::arenaCreate<Context>(
-          *arena, *arena, pool, topReader,
-          std::span<FieldReader>(readers, numSegs), std::move(map),
+          *arena, *arena, pool, topReader, std::move(map),
           limits, warnings, filterKeyContext, std::move(filterUses));
     }
 
@@ -1392,65 +1365,34 @@ public:
       return topReader.segments().size();
     }
 
-    std::span<SegFieldInfo*> readSegInfos(std::string_view field) {
-      auto numSegs = numSegments();
-      int foundCount = 0;
-      auto savepoint = pool.getSavePoint();
-      std::span<SegFieldInfo*> segInfos = {pool.make_arr<SegFieldInfo*>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
-        if (fieldReaders[i].seek(field)) {
-          segInfos[i] = pool.make<SegFieldInfo>();
-          fieldReaders[i].readFieldInfo(*segInfos[i]);
-          foundCount++;
-        } else {
-          segInfos[i] = nullptr;
-        }
-      }
-      if (foundCount == 0) {
-        // no segments have this field, so we can rewind the pool to deallocate the arr
-        pool.rewind(savepoint);
-        return {};
-      }
-      return segInfos;
-    }
-
-    /// Returns nullptr if the field is not found in any segment
+    /// Returns nullptr if the field is not found in any segment.
     CachedFieldInfo* getCachedFieldInfo(std::string_view field) {
       auto [iter, inserted] = fieldInfoMap.try_emplace(field, pool, 4);
       CachedFieldInfo& result = iter->second;
-      if (!inserted) {
-        return &result;
-      }
-
-      result.segInfos = readSegInfos(field);
-      if (result.segInfos.empty()) {
-        // field doesn't exist in any segment.
-        fieldInfoMap.erase(iter);
-        // we can't rewind the pool here because we still emplaced on the map.  We could do a lookup first if it's important.
-        return nullptr;
-      }
-
-      // TODO: make caching of the terms enums optional?
-      auto numSegs = numSegments();
-      result.termsEnums = {pool.make_arr<TermsEnum *>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
-        auto &segFieldInfo = result.segInfos[i];
-        if (!segFieldInfo) {
-          result.termsEnums[i] = nullptr;
-          continue;
+      if (inserted) {
+        result.segInfos = topReader.field(field);
+        if (result.segInfos.exists()) {
+          result.fieldStats = result.segInfos.stats();
+          result.termsEnums = pool.make_span_zeroed<TermsEnum*>(numSegments());
         }
-        TermsEnum *termsEnum = pool.make<TermsEnum>(pool, topReader.segments()[i].postingsReader(), *segFieldInfo);
-        result.termsEnums[i] = termsEnum;
-
-        // add the stats from this termsEnum to fieldStats
-        result.fieldStats.sumTotalTermFreq += termsEnum->sumTotalTermFreq();
-        result.fieldStats.sumDocFreq += termsEnum->sumDocFreq();
-        result.fieldStats.docsWithField += termsEnum->docsWithField();
       }
-
-      return &result;
+      return result.segInfos.exists() ? &result : nullptr;
     }
 
+  private:
+    // The cached dictionary outlives temporary pool rewinds. Call only before
+    // taking a savepoint that may be rewound, or outside any rewind scope.
+    TermsEnum* getTermsEnum(CachedFieldInfo& field, size_t segnum) {
+      auto*& terms = field.termsEnums[segnum];
+      if (!terms) {
+        if (auto* info = field.segInfos.at(segnum)) {
+          terms = pool.make<TermsEnum>(pool, topReader.segments()[segnum].postingsReader(), *info);
+        }
+      }
+      return terms;
+    }
+
+  public:
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
       CachedTermInfo& result = iter->second;
@@ -1458,13 +1400,16 @@ public:
         return &result;
       }
 
-      auto savepoint = pool.getSavePoint();
       auto numSegs = numSegments();
+      // TermsEnums survive missing-term lookups; allocate them before the
+      // temporary postings states that can be rewound below.
+      for (size_t i = 0; i < numSegs; i++) getTermsEnum(cachedFieldInfo, i);
+      auto savepoint = pool.getSavePoint();
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
       for (int i = 0; i < numSegs; ++i) {
-        auto& termsEnum = cachedFieldInfo.termsEnums[i];
+        auto* termsEnum = cachedFieldInfo.termsEnums[i];
         if (!termsEnum || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;
           continue;
@@ -1489,7 +1434,7 @@ public:
       result = {};
       bool found = false;
       for (int i = 0; i < (int)numSegments(); ++i) {
-        auto& termsEnum = cachedFieldInfo.termsEnums[i];
+        auto* termsEnum = getTermsEnum(cachedFieldInfo, (size_t)i);
         if (!termsEnum || !termsEnum->seek(term)) {
           continue;
         }

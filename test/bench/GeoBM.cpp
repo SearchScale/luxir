@@ -19,7 +19,7 @@
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/reader/BKDReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/geo.h"
@@ -420,12 +420,11 @@ public:
   SegFieldInfo fieldInfo() {
     MemPool pool;
     auto& segment = index.reader->segments()[0];
-    FieldReader fields(segment.postingsReader());
-    if (!fields.seek(FIELD)) {
+    auto* fields = segment.postingsReader().fieldInfo(FIELD);
+    if (!fields) {
       throw std::logic_error("geo benchmark field is missing");
     }
-    SegFieldInfo info;
-    fields.readFieldInfo(info);
+    const auto& info = *fields;
     return info;
   }
 };

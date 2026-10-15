@@ -87,12 +87,11 @@ public:
 template <class QueryType, class Relation>
 class GeoQueryWeight final : public Query::Weight {
   QueryType& query;
-  std::span<SegFieldInfo*> segInfos;
+  IndexReader::FieldSegments segInfos;
   float constantScore;
 
-  bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& info) const {
-    if (segInfos.empty()) return false;
-    info = segInfos[(size_t)segment.ord];
+  bool segmentInfo(IndexReader::Segment& segment, const SegFieldInfo*& info) const {
+    info = segInfos.at((size_t)segment.ord);
     return info != nullptr && info->columnLoc.offset() > 0;
   }
 
@@ -112,7 +111,7 @@ public:
       : Query::Weight(context, query, flags), query(query),
         constantScore(constantScore) {
     traits |= IS_CONSTANT_SCORING;
-    segInfos = context.readSegInfos(query.getField());
+    segInfos = context.topReader.field(query.getField());
   }
 
   class Supplier final : public Query::ScorerSupplier {
@@ -331,7 +330,7 @@ public:
       Query::SupplierExecutionMode executionMode) override {
     unused(executionMode);
     if (query.isEmpty()) return nullptr;
-    SegFieldInfo* info = nullptr;
+    const SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
     if (info->type != FieldType::GEO_POINT) wrongFieldType();
     auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *info);
@@ -364,7 +363,7 @@ public:
   Query::Scorer* createScanScorerForTests(
       MemPool& targetPool, IndexReader::Segment& segment) {
     if (query.isEmpty()) return nullptr;
-    SegFieldInfo* info = nullptr;
+    const SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
     if (info->type != FieldType::GEO_POINT) wrongFieldType();
     auto* reader = targetPool.make<IntColReader>(segment.postingsReader(),

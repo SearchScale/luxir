@@ -170,6 +170,50 @@ TEST_F(EmitDocsTest, siblingFailureDuringColumnLoads) {
   }
 }
 
+TEST_F(EmitDocsTest, defaultWideProjectionDecodesOnlyHitSegments) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  constexpr int FIELDS = 200;
+  for (int seg = 0; seg < 4; seg++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 20; doc++) {
+      Doc values = flatdoc("id", std::format("{}-{}", seg, doc));
+      for (int f = 0; f < FIELDS; f++) {
+        values.push_back({std::format("f{:04}_i", f), (int64_t)(1000 * seg + doc)});
+      }
+      docs.push_back(std::move(values));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(4u, reader->segments().size());
+  std::vector<PostingsReader::FieldCacheStats> before;
+  for (auto& seg : reader->segments()) before.push_back(seg.postingsReader().fieldCacheStats());
+  for (int parallel : {-1, 0, 1}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().limit(10)
+        .documentFormat(api::DocFormat::COLUMNS);
+    req->execute(parallel);
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
+    ASSERT_EQ(10u, docs.size());
+    for (int doc = 0; doc < 10; doc++) {
+      auto* id = find(docs[(size_t)doc], "id");
+      auto* value = find(docs[(size_t)doc], "f0000_i");
+      ASSERT_NE(nullptr, id);
+      ASSERT_NE(nullptr, value);
+      EXPECT_EQ(std::format("0-{}", doc), std::get<std::string>(*id));
+      EXPECT_EQ(doc, std::get<int64_t>(*value));
+    }
+    EXPECT_GE(reader->segments()[0].postingsReader().fieldCacheStats().entries, (size_t)FIELDS);
+    for (size_t seg = 1; seg < reader->segments().size(); seg++) {
+      auto stats = reader->segments()[seg].postingsReader().fieldCacheStats();
+      EXPECT_EQ(before[seg].entries, stats.entries) << seg;
+      EXPECT_EQ(before[seg].pages, stats.pages) << seg;
+    }
+  }
+}
+
 TEST_F(EmitDocsTest, siblingFailureDuringStoredRereads) {
   siblingFailure(false, false, true);
 }

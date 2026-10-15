@@ -164,7 +164,7 @@ public:
             (luxir::Similarity::BM25Scorer*)nullptr, boost);
       }
 
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
+      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this segFieldInfo can't be null at this point
       luxir::NormsReader* normsReader = nullptr;
       luxir::IntColReader* valueReader = nullptr;
       luxir::OrdColReader* ordReader = nullptr;

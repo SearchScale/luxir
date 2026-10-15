@@ -480,6 +480,7 @@ public:
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       IndexReader& reader = ctx.reader;
+      auto segInfos = reader.field(query.getField());
       size_t numSegs = reader.segments().size();
       std::vector<std::vector<Hit>> perSegHits(numSegs);
 
@@ -521,15 +522,6 @@ public:
       // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
       std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
-      std::vector<SegFieldInfo> segInfoStorage(numSegs);
-      std::vector<SegFieldInfo*> segInfos(numSegs, nullptr);
-      for (size_t i = 0; i < numSegs; i++) {
-        FieldReader fieldReader(reader.segments()[i].postingsReader());
-        if (fieldReader.seek(query.getField())) {
-          fieldReader.readFieldInfo(segInfoStorage[i]);
-          segInfos[i] = &segInfoStorage[i];
-        }
-      }
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
@@ -547,10 +539,10 @@ public:
         && !query.getFieldType().normalizeOnWrite();
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
-        if (segInfos[i] != nullptr) {
+        if (segInfos.at(i) != nullptr) {
           // FIXED_SIZE vector column.  numVectors == #docs-with-field for
           // single-valued, or the total vector count for multi-valued.
-          VectorReader vr(reader.segments()[i].postingsReader(), *segInfos[i]);
+          VectorReader vr(reader.segments()[i].postingsReader(), *segInfos.at(i));
           segCount = vr.numVectors();
           if (segCount > 0) {
             if (vr.dims() != dims) {
@@ -639,7 +631,7 @@ public:
       bool approximateEngine = false;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
-        if (segCount <= 0 || segInfos[i] == nullptr) continue;
+        if (segCount <= 0 || segInfos.at(i) == nullptr) continue;
         IndexReader::Segment& seg = reader.segments()[i];
         DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
         // Domain contract (Query.h): a present domain is live-filtered and
@@ -687,7 +679,7 @@ public:
         } else {
           slots.push_back({
             .engine = std::make_unique<SegmentFlatColumnVectorEngine>(
-              (int32_t)i, seg, segInfos[i], v2dPerSeg[i], domain,
+              (int32_t)i, seg, segInfos.at(i), v2dPerSeg[i], domain,
               dims, metric, normalizeColumnOnCosineRescore),
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
@@ -939,7 +931,7 @@ public:
       if (!candidateScoresExact && !candidateHits.empty()) {
         rescoreAndCollapseCandidates(candidateHits,
                                      reader,
-                                     std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
+                                     segInfos,
                                      v2dSpan,
                                      std::span<const char>(segApproxInPool.data(), segApproxInPool.size()),
                                      queryPtr, dims, metric, normalizeColumnOnCosineRescore,
@@ -1290,7 +1282,7 @@ public:
     class SegmentFlatColumnVectorEngine final : public VectorEngine {
       int32_t segOrd;
       IndexReader::Segment& seg;
-      SegFieldInfo* segInfo;
+      const SegFieldInfo* segInfo;
       const SegV2D& v2d;
       DocSet* domain;
       int32_t dims;
@@ -1300,7 +1292,7 @@ public:
     public:
       SegmentFlatColumnVectorEngine(int32_t segOrd,
                                     IndexReader::Segment& seg,
-                                    SegFieldInfo* segInfo,
+                                    const SegFieldInfo* segInfo,
                                     const SegV2D& v2d,
                                     DocSet* domain,
                                     int32_t dims,
@@ -2170,7 +2162,7 @@ private:
   /// rescoreTaskGrainCandidates fold inline on the calling thread.
   static void rescoreAndCollapseCandidates(std::vector<VectorEngineHit>& candidates,
                                            IndexReader& reader,
-                                           std::span<SegFieldInfo* const> segInfos,
+                                           IndexReader::FieldSegments segInfos,
                                            std::span<const SegV2D> v2dPerSeg,
                                            std::span<const char> segApprox,
                                            const float* queryPtr,
@@ -2198,7 +2190,7 @@ private:
       if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
         throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
       }
-      SegFieldInfo* info = segInfos[(size_t)segOrd];
+      const SegFieldInfo* info = segInfos.at((size_t)segOrd);
       if (info == nullptr) {
         throw std::runtime_error("KnnQuery: vector candidate segment has no field info");
       }

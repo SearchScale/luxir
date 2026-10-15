@@ -302,7 +302,7 @@ class OrdMapBuilder {
     std::optional<OrdColumnFormat::PredictedBlockInfo> singleFitPlan;
 
     TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader,
-                 SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
+                 const SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
         : idx(idx), tenum(pool, postingsReader, finfo), encoding(encoding) {
       if (encoding == OrdMap::DeltaEncoding::PREDICTED) {
         deltas.emplace<PredictedDeltaBlocks>();
@@ -363,20 +363,15 @@ public:
     std::vector<u_ptr<TermsEnumIdx>> allTermsEnums;
     allTermsEnums.reserve(nsegs);
 
+    auto fields = reader.field(field);
     int segsWithValue = 0;
     for (auto i=0u; i<nsegs; i++) {
       auto& seg = segs[i];
-      // Allocate FieldReader in pool so it has same lifetime as SegFieldInfo
-      auto* fieldReader = pool.make<FieldReader>(seg.postingsReader());
-      if (!fieldReader->seek(field)) {
-        // Field not found in this segment
+      auto* fieldInfo = fields.at(i);
+      if (fieldInfo == nullptr) {
         allTermsEnums.emplace_back(nullptr);
         continue;
       }
-      auto* fieldInfo = pool.make<SegFieldInfo>();  // Allocate in pool to avoid stack-use-after-scope
-      fieldReader->readFieldInfo(*fieldInfo);
-      //       TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& finfo) : idx(idx), tenum(pool, postingsReader, finfo), deltas(pool) {}
-
 
       allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(
           i, pool, seg.postingsReader(), *fieldInfo, deltaEncoding));

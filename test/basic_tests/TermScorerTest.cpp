@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include <luxir/query/AllQuery.h>
 #include <algorithm>
 #include <array>
@@ -5903,10 +5904,9 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  ASSERT_TRUE(fieldReader.seek("body_w"));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = postingsReader.fieldInfo("body_w");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordy"));
 
@@ -5987,10 +5987,9 @@ TEST_F(TermScorerTest, docsTierAdvanceCoversBlockEncodingsAndSkips) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  ASSERT_TRUE(fieldReader.seek("body_w"));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = postingsReader.fieldInfo("body_w");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
 
   auto checkAdvance = [&](std::string_view term, const std::vector<int32_t>& expected,
                           std::initializer_list<int32_t> targets) {

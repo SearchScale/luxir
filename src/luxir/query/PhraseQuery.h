@@ -363,7 +363,7 @@ public:
         IndexReader::Segment& segment, bool disableSort,
         bool disableRepeatDedup) const {
       if (cachedFieldInfo == nullptr
-          || cachedFieldInfo->segInfos[segment.ord] == nullptr) {
+          || cachedFieldInfo->segInfos.at(segment.ord) == nullptr) {
         return {};
       }
       std::vector<const TermsEnum::PostingsState*> states;
@@ -469,7 +469,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         const EstimateMemo& estimate) {
       if (!estimate.nonempty) return nullptr;
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
+      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
       assert(segFieldInfo != nullptr);
 
       auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());

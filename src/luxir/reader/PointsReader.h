@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "FieldReader.h"
+#include "PostingsReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/util/screaming.h"

@@ -15,7 +15,7 @@
 
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/reader/BKDReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
@@ -72,10 +72,9 @@ double exactMeters(double lat1, double lon1, double lat2, double lon2) {
 
 SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
   MemPool pool;
-  FieldReader fields(segment.postingsReader());
-  if (!fields.seek(field)) throw std::runtime_error("missing geo test field");
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo(field);
+  if (!fields) throw std::runtime_error("missing geo test field");
+  const auto& info = *fields;
   return info;
 }
 

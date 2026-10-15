@@ -774,7 +774,7 @@ public:
   using PointsBitBulkScorer = PointsMaterialize::PointsBitBulkScorer;
   class Weight final : public Query::Weight {
     NumericPredicateQuery& query;
-    std::span<SegFieldInfo*> segInfos;
+    IndexReader::FieldSegments segInfos;
     float constantScore;
 
     static int64_t estimateCost(IntColReader& reader,
@@ -822,9 +822,8 @@ public:
       return count;
     }
 
-    bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& segInfo) const {
-      if (segInfos.empty()) return false;
-      segInfo = segInfos[segment.ord];
+    bool segmentInfo(IndexReader::Segment& segment, const SegFieldInfo*& segInfo) const {
+      segInfo = segInfos.at(segment.ord);
       return segInfo != nullptr && segInfo->columnLoc.offset() > 0;
     }
 
@@ -834,7 +833,7 @@ public:
         : Query::Weight(context, query, flags), query(query),
           constantScore(constantScore) {
       traits |= IS_CONSTANT_SCORING;
-      segInfos = context.readSegInfos(query.getField());
+      segInfos = context.topReader.field(query.getField());
     }
 
     // Exact count from predicate structures alone, never a column scan: a
@@ -846,7 +845,7 @@ public:
     // constant probe.
     std::optional<int64_t> constantCount(
         IndexReader::Segment& segment, DocSet* domain) override {
-      SegFieldInfo* segInfo = nullptr;
+      const SegFieldInfo* segInfo = nullptr;
       if (!segmentInfo(segment, segInfo)) {
         return 0;
       }
@@ -1349,7 +1348,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       unused(executionMode);
-      SegFieldInfo* segInfo = nullptr;
+      const SegFieldInfo* segInfo = nullptr;
       if (!segmentInfo(segment, segInfo)) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
@@ -1431,7 +1430,7 @@ public:
     // Test/benchmark baseline: the exact pre-change full block-decode scan.
     Query::Scorer* createFullScanScorerForTests(MemPool& targetPool,
                                                 IndexReader::Segment& segment) {
-      SegFieldInfo* segInfo = nullptr;
+      const SegFieldInfo* segInfo = nullptr;
       if (!segmentInfo(segment, segInfo)) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
@@ -1445,7 +1444,7 @@ public:
 
     Query::Scorer* createZoneMapScorerForTests(MemPool& targetPool,
                                                IndexReader::Segment& segment) {
-      SegFieldInfo* segInfo = nullptr;
+      const SegFieldInfo* segInfo = nullptr;
       if (!segmentInfo(segment, segInfo)) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
