@@ -101,6 +101,10 @@ inline InlineFacetEntryMode initInlineFacetEntryMode() {
 inline InlineFacetEntryMode forcedInlineFacetEntryMode =
     initInlineFacetEntryMode();
 
+// Test/bench baseline: visit every matching document under collapse, retaining
+// the same limit and admission policy. Totals and result order are unchanged.
+inline bool disableCollapsePruningForTests = false;
+
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key
 // bounds and the request needs no exact count or domain.

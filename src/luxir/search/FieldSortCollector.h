@@ -324,7 +324,7 @@ public:
   // conservatively disables candidate activation.
   void setSegment(const IndexReader::Segment& segment,
                   MemPool* pool = nullptr, int64_t sourceCost = -1) {
-    if constexpr (Collapsed) groups->reader.setSegment(segment.ord);
+    if constexpr (Collapsed) groups->setSegment(segment.ord, topCount, sourceCost);
     segmentPool = pool;
     candidates = nullptr;
     candidateLo = 0;
@@ -441,15 +441,8 @@ public:
     int64_t heapSize = (int64_t)pq.size() * depth / topCount;
     auto bottom = predictBottom(*primaryKeys, card, depth, heapSize,
                                 bottomKey);
-    if constexpr (Collapsed) {
-      // Document quantiles are only a cost prior for groups. At a tied
-      // bottom, every tied leaf can contain a winning group key.
-      return bottom.has_value() ? primaryKeys->leavesBoundedAtOrBefore(*bottom)
-                                : primaryKeys->leafCount();
-    } else {
-      return bottom.has_value() ? visitFloorAt(*primaryKeys, *bottom, card, depth)
-                                : primaryKeys->leafCount();
-    }
+    return bottom.has_value() ? visitFloorAt(*primaryKeys, *bottom, card, depth)
+                              : primaryKeys->leafCount();
   }
 
   // Where a doc-order walk of the current segment meets its best keys: the
@@ -575,19 +568,13 @@ public:
     return 0;
   }
 
-  // Rank values order groups; only member selection uses the document tie.
+  // Groups and their members share the same rank, then document order.
   int compare(const SortDoc& docA, const SortDoc& docB,
               CompareSource source = CompareSource::LOCAL,
               const FieldCollector* other = nullptr) const {
     int cmp = compareRank(docA, docB, source, other);
     if (cmp != 0) return cmp;
-    if constexpr (Collapsed) {
-      assert(source != CompareSource::CURRENT_DOC);
-      const auto& a = groups->keys[(size_t)docA.slot];
-      const auto& b = (source == CompareSource::OTHER ? other : this)->groups->keys[(size_t)docB.slot];
-      auto keyCmp = a <=> b;
-      return (keyCmp > 0) - (keyCmp < 0);
-    } else return (docA.doc > docB.doc) - (docA.doc < docB.doc);
+    return (docA.doc > docB.doc) - (docA.doc < docB.doc);
   }
 
   // The rejected-doc path must stay small enough to inline into the collectTopK
@@ -606,28 +593,24 @@ public:
     int cmp;
     if (soleColumn != nullptr) [[likely]] {
       cmp = soleColumn->compareBottom(bottom.slot, bottom.doc, doc);
-      if constexpr (!Collapsed) {
-        if (cmp == 0) cmp = (bottom.doc > doc) - (bottom.doc < doc);
-      }
+      if (cmp == 0) cmp = (bottom.doc > doc) - (bottom.doc < doc);
     } else if (soleExpr != nullptr) {
       cmp = soleExpr->compareCurrent(bottom.slot, doc, score);
-      if constexpr (!Collapsed) {
-        if (cmp == 0) cmp = (bottom.doc > doc) - (bottom.doc < doc);
-      }
+      if (cmp == 0) cmp = (bottom.doc > doc) - (bottom.doc < doc);
     } else {
       cmp = compareCurrentDoc(bottom, doc, score);
     }
-    // Also used before two-phase exact verification: a tied rank is a
-    // candidate superset until its identity decides group admission.
-    if constexpr (Collapsed) return cmp >= 0;
-    else return cmp > 0;
+    // Losing to the floor cannot enter a new group or improve a retained
+    // head, which ranks at or above it. The floor's segdoc makes this strict
+    // test sound even when blocks or segments arrive out of document order.
+    return cmp > 0;
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
     if constexpr (Collapsed) {
       if (!groups->plan.getNumber && (topCount == 0
           || (heapFull() && !competitiveCandidate(segment, docid, score)))) return;
-      const auto* key = groups->reader.read(segment, docid);
+      const auto* key = groups->read(segment, docid);
       if (key == nullptr) return;
       hitCount++;
       groups->count(*key);
@@ -667,11 +650,12 @@ public:
   static BlockClass classifyKeyBlock(int32_t segment, int32_t firstUnseenDoc,
                                      int64_t best, int64_t bottomKey,
                                      segdoc bottomDoc, bool soleSort) {
-    // L distinct retained groups certify this primary-key floor. Strictly
-    // worse docs cannot enter or improve a retained member. Equal bounds
-    // remain eligible for group-key ties and out-of-order member ties.
+    // L retained groups certify the same (rank, doc) floor as document top-k.
+    // A losing doc can neither enter a new group nor improve a retained head.
+    // At a sole-clause bound tie, compare the block's first unseen segdoc to
+    // the floor's doc, so the proof also holds for out-of-order block visits.
     if (best > bottomKey) return BlockClass::SKIP_STRICT;
-    if (best == bottomKey && soleSort && !Collapsed
+    if (best == bottomKey && soleSort
         && segdoc(segment, firstUnseenDoc) >= bottomDoc) {
       return BlockClass::SKIP_TIE;
     }
@@ -933,9 +917,12 @@ private:
       // enters the same keyed admission/update policy before heap truncation.
       for (size_t i = 0; i < docs.size(); i++) {
         int64_t key = keys[i];
-        if (!groups->plan.getNumber && heapFull()
-            && key > batch->slotKeys[pq.top().slot]) continue;
-        const auto* identity = groups->reader.read(segment, docs[i]);
+        if (!groups->plan.getNumber && heapFull()) {
+          int64_t bottom = batch->slotKeys[pq.top().slot];
+          if (key > bottom || (key == bottom
+              && segdoc(segment, docs[i]) >= pq.top().doc)) continue;
+        }
+        const auto* identity = groups->read(segment, docs[i]);
         if (identity == nullptr) continue;
         hitCount++;
         groups->count(*identity);
@@ -1037,12 +1024,12 @@ private:
       return {from, nextProbeDoc};
     }
     FieldComparator::CompetitiveOrdState state;
-    // Closing the bottom term by document order is invalid for groups:
-    // any remaining document at that term may carry a smaller group key.
-    // The primary ord interval stays inclusive, also for secondary clauses.
+    // A sole-clause bottom term closes once every remaining segdoc loses
+    // the floor's doc tie, for groups as well as documents. Secondary clauses
+    // still require an inclusive primary ordinal interval.
     auto status = clauses[0].comparator->competitiveOrdInterval(
         state, pq.top().slot, pq.top().doc, segment, from,
-        !Collapsed && clauses.size() == 1);
+        clauses.size() == 1);
     if (status == FieldComparator::OrdIntervalStatus::UNSUPPORTED) {
       candidatesDisabled = true;
       return {from, PostingsReader::END};
@@ -1284,8 +1271,7 @@ private:
 
   LUXIR_NOINLINE int compareCurrentDoc(const SortDoc& bottom, segdoc doc, float score) const {
     SortDoc candidate(doc, score, -1);
-    if constexpr (Collapsed) return compareRank(bottom, candidate, CompareSource::CURRENT_DOC);
-    else return compare(bottom, candidate, CompareSource::CURRENT_DOC);
+    return compare(bottom, candidate, CompareSource::CURRENT_DOC);
   }
 
   LUXIR_NOINLINE void admit(SortDoc& bottom, segdoc doc, float score) {
@@ -1313,7 +1299,7 @@ private:
     } else {
       const auto& bottom = pq.top();
       int cmp = rank(bottom);
-      if (cmp < 0 || (cmp == 0 && key >= groups->keys[(size_t)bottom.slot])) return false;
+      if (cmp < 0 || (cmp == 0 && bottom.doc <= candidate.doc)) return false;
       slot = bottom.slot;
       groups->retain(key, (size_t)slot);
     }
@@ -1349,8 +1335,9 @@ public:
 
     if constexpr (Collapsed) {
       groups->mergeCounts(*other.groups);
+      groups->finishSegment();
       // As for score collapse, local top-L groups suffice globally. Merge
-      // compares rank then key; equal-rank member updates compare documents.
+      // compares rank then document, deduplicating by global identity.
       if (topCount == 0) return;
       for (const SortDoc& member : other.pq.span()) {
         admitGroup(other.groups->keys[(size_t)member.slot], member,

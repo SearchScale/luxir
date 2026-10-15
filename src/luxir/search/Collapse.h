@@ -24,16 +24,11 @@ struct CollapseKey {
   struct Component {
     bool present = false;
     int64_t value = 0;
-    auto operator<=>(const Component&) const = default;
+    bool operator==(const Component&) const = default;
   };
-  // Ordinary tuples sort before expand singletons; null precedes a value.
+  // Singleton and component tags are identities, never result-order keys.
   std::optional<uint64_t> singleton;
   boost::container::small_vector<Component, 2> components;
-  auto operator<=>(const CollapseKey& other) const {
-    auto cmp = singleton <=> other.singleton;
-    return cmp != 0 ? cmp : std::lexicographical_compare_three_way(
-        components.begin(), components.end(), other.components.begin(), other.components.end());
-  }
   bool operator==(const CollapseKey& other) const {
     return singleton == other.singleton && components == other.components;
   }
@@ -114,8 +109,9 @@ struct CollapsePlan {
   }
 };
 
-// Segment-local decode state. Identities contain global ords and actual int64
-// values, so independent workers compare and union keys without an interner lock.
+// Shared segment-local decode state. Facet walks use global ords and actual
+// int64 values. Collapse can keep local ords until admission, then translate
+// retained keys for output and cross-worker merge. No interner lock.
 class CollapseKeyReader {
   struct Column {
     std::optional<OrdColReader> ords;
@@ -152,7 +148,7 @@ public:
     }
   }
 
-  const CollapseKey* read(int32_t segment, int32_t doc) {
+  const CollapseKey* read(int32_t segment, int32_t doc, bool localOrds = false) {
     // Bound-order and seeded field drivers may rewind within a segment.
     // Reset presence cursors only on an actual backward read; looking ahead
     // over a missing value must retain the future position.
@@ -171,7 +167,13 @@ public:
       component = {};
       if (column.ords) {
         int32_t ord = column.ords->ordAt(doc);
-        if (ord != 0) component = {true, column.mapping.globalOrd((int64_t)ord - 1)};
+        if (ord != 0) {
+          int64_t value = (int64_t)ord - 1;
+          if (!localOrds && column.mapping.bits != 0) {
+            value = column.mapping.globalOrd(value);
+          }
+          component = {true, value};
+        }
       } else if (column.values) {
         // A missing doc can leave the sparse iterator on a future value.
         // Its forward-seek contract requires target > current.
@@ -181,6 +183,73 @@ public:
       missing |= !component.present;
     }
     return plan.finishKey(scratch, missing, segment, doc);
+  }
+
+  // Invert only the retained ords, in global order. Nothing proportional to
+  // maxDoc or the segment dictionary is allocated. An absent component means
+  // that retained tuple cannot occur in this segment, not that it is null.
+  void remapRetained(std::span<const CollapseKey> keys,
+                     std::vector<CollapseKey>& local,
+                     std::vector<uint8_t>& available) const {
+    local.assign(keys.begin(), keys.end());
+    available.assign(keys.size(), true);
+    std::vector<size_t> order;
+    order.reserve(keys.size());
+    for (size_t component = 0; component < columns.size(); component++) {
+      if (!plan.fields[component].ordinal()) continue;
+      const auto& column = columns[component];
+      order.clear();
+      for (size_t slot = 0; slot < keys.size(); slot++) {
+        if (available[slot] && !keys[slot].singleton
+            && keys[slot].components[component].present) order.push_back(slot);
+      }
+      std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return keys[a].components[component].value < keys[b].components[component].value;
+      });
+      int64_t cursor = 0;
+      const auto& mapping = column.mapping;
+      auto globalAt = [&](int64_t ord) {
+        skipCount(SkipStats::collapseRemapProbes);
+        return mapping.globalOrd(ord);
+      };
+      for (size_t slot : order) {
+        int64_t global = keys[slot].components[component].value;
+        cursor = mapping.bits == 0 ? std::min(global, mapping.numOrds)
+            : screaming::gallopLowerBound(cursor, mapping.numOrds, global, globalAt);
+        if (cursor == mapping.numOrds || globalAt(cursor) != global) available[slot] = false;
+        else local[slot].components[component].value = cursor;
+      }
+    }
+  }
+
+  // Price L inverse lookups against the documents this segment can supply.
+  // Deep heaps use direct translation; identity maps need no remap at all.
+  bool remapPays(int64_t depth, int64_t sourceCost) const {
+    if (sourceCost <= 0) return false;
+    int64_t work = 0;
+    bool encoded = false;
+    for (const auto& column : columns) {
+      if (column.mapping.bits == 0) continue;
+      encoded = true;
+      int64_t probes = 1 + (int64_t)std::bit_width((uint64_t)depth)
+          + (int64_t)std::bit_width((uint64_t)(column.mapping.numOrds
+              / std::max<int64_t>(depth, 1)));
+      // Include sorting the retained ords; cap before multiplying, including
+      // unbounded limits whose depth spans the whole reader.
+      if (depth > (sourceCost - work) / probes) return false;
+      work += depth * probes;
+    }
+    return encoded && work < sourceCost;
+  }
+
+  void globalize(CollapseKey& key) const {
+    if (key.singleton) return;
+    for (size_t i = 0; i < columns.size(); i++) {
+      auto& component = key.components[i];
+      if (component.present && columns[i].mapping.bits != 0) {
+        component.value = columns[i].mapping.globalOrd(component.value);
+      }
+    }
   }
 
 private:
@@ -315,6 +384,9 @@ class CollapseAdmission {
     bool operator()(size_t slot, const CollapseKey& key) const { return (*keys)[slot] == key; }
     bool operator()(const CollapseKey& key, size_t slot) const { return (*this)(slot, key); }
   };
+  bool segmentLocal = false;
+  std::vector<CollapseKey> localKeys;
+  std::vector<uint8_t> localAvailable;
 public:
   const CollapsePlan& plan;
   CollapseKeyReader reader;
@@ -331,9 +403,42 @@ public:
     }
   }
 
-  // Hash/equality callbacks point to this keys object, so its address is stable.
+  // Hash/equality callbacks point to the key vectors, whose addresses are stable.
   CollapseAdmission(const CollapseAdmission&) = delete;
   CollapseAdmission& operator=(const CollapseAdmission&) = delete;
+
+  void setSegment(int32_t segment, int64_t depth, int64_t sourceCost = -1) {
+    reader.setSegment(segment);
+    if (sourceCost < 0) sourceCost = plan.reader.segments()[(size_t)segment].maxDoc();
+    // Exact totals need every global identity; remapping just retained groups
+    // cannot replace that work. Facet walks also keep their global key space.
+    bool nextLocal = !plan.getNumber && reader.remapPays(depth, sourceCost);
+    if (!segmentLocal && !nextLocal) return;
+    if (segmentLocal == nextLocal) retained.clear();
+    else {
+      // Rebind once on a key-space transition, keeping hash/equality as the
+      // original direct slot-to-key lookup on every hit. Ordinary global
+      // segments retain their table across switches, without a rebuild.
+      auto* indexed = nextLocal ? &localKeys : &keys;
+      retained = decltype(retained)(0, SlotHash{indexed}, SlotEqual{indexed});
+    }
+    segmentLocal = nextLocal;
+    if (segmentLocal) reader.remapRetained(keys, localKeys, localAvailable);
+    for (size_t slot = 0; slot < keys.size(); slot++) {
+      if (!segmentLocal || localAvailable[slot]) retained.insert(slot);
+    }
+  }
+
+  const CollapseKey* read(int32_t segment, int32_t doc) {
+    return reader.read(segment, doc, segmentLocal);
+  }
+
+  void finishSegment() {
+    if (!segmentLocal) return;
+    retained = decltype(retained)(0, SlotHash{&keys}, SlotEqual{&keys});
+    segmentLocal = false;
+    for (size_t slot = 0; slot < keys.size(); slot++) retained.insert(slot);
+  }
 
   void count(const CollapseKey& key) {
     if (!plan.getNumber) return;
@@ -358,8 +463,21 @@ public:
   }
 
   size_t retain(const CollapseKey& key, size_t slot) {
+    if (slot < keys.size() && (!segmentLocal || localAvailable[slot])) retained.erase(slot);
     if (slot == keys.size()) keys.push_back(key);
-    else { retained.erase(slot); keys[slot] = key; }
+    else keys[slot] = key;
+    if (segmentLocal) {
+      if (slot == localKeys.size()) {
+        localKeys.push_back(key);
+        localAvailable.push_back(true);
+      } else {
+        localKeys[slot] = key;
+        localAvailable[slot] = true;
+      }
+      // Local hits of retained groups never translate. Only admission of a
+      // new group needs a global identity for output and cross-worker merge.
+      reader.globalize(keys[slot]);
+    }
     retained.insert(slot);
     return slot;
   }

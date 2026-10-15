@@ -55,6 +55,7 @@ struct NoCollapseAdmission {};
 template <bool Collapsed = false>
 class ScoreCollector {
   public:
+  static constexpr bool isCollapsed = Collapsed;
 
   // Having this packed helped both memory and CPU (presumably better cache hits?)
   LUXIR_UNALIGNED_START
@@ -71,16 +72,6 @@ class ScoreCollector {
 
   [[no_unique_address]] std::conditional_t<Collapsed,
       std::unique_ptr<CollapseAdmission>, NoCollapseAdmission> groups;
-
-  struct GroupComparator {
-    const ScoreCollector* collector;
-    bool operator()(const ScoreDoc& a, const ScoreDoc& b) const {
-      return a.score == b.score
-          ? collector->groups->keys[(size_t)a.slot] < collector->groups->keys[(size_t)b.slot]
-          : a.score > b.score;
-    }
-  };
-
 
   int64_t hitCount = 0;
 
@@ -101,16 +92,11 @@ class ScoreCollector {
   // The storage expands on demand: topCount bounds the heap but is not allocated up
   // front, which matters for deep or unbounded limits (limit=-1 maps to maxDoc) and for
   // the per-slice collectors that never see topCount hits.
-  using Comparator = std::conditional_t<Collapsed, GroupComparator, decltype(scoreAndDocComp)>;
+  using Comparator = decltype(scoreAndDocComp);
   ExpandingPQ<ScoreDoc, Comparator, Collapsed> pq;
 
-  static Comparator comparator(const ScoreCollector* collector) {
-    if constexpr (Collapsed) return {collector};
-    else { unused(collector); return scoreAndDocComp; }
-  }
-
   ScoreCollector(int64_t topCount, const CollapsePlan* collapse = nullptr)
-      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0), comparator(this)) {
+      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0), scoreAndDocComp) {
     if constexpr (Collapsed) groups = std::make_unique<CollapseAdmission>(*collapse);
     else unused(collapse);
     // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
@@ -120,10 +106,12 @@ class ScoreCollector {
 
   void collect(int32_t segment, int32_t docid, float score) {
     if constexpr (Collapsed) {
-      // Without totals, hitCount is not consumed: collapse has no child ops
-      // or fusion sink. Eligibility matters only for admission and counts.
-      if (!groups->plan.getNumber && (topCount == 0 || score < minCompetitiveVal)) return;
-      const auto* key = groups->reader.read(segment, docid);
+      // A doc losing to (bottom score, bottom doc) cannot enter as a new
+      // group or improve a retained group: its head is already at or above
+      // that floor, and at an equal score is the earlier doc. This uses the
+      // floor's segdoc, independent of traversal order, just as document top-k.
+      if (!groups->plan.getNumber && (topCount == 0 || losesToFloor(segment, docid, score))) return;
+      const auto* key = groups->read(segment, docid);
       if (key == nullptr) return;
       hitCount++;
       groups->count(*key);
@@ -157,8 +145,14 @@ class ScoreCollector {
     }
   }
 
-  void setSegment(int32_t segment) requires Collapsed {
-    groups->reader.setSegment(segment);
+  bool losesToFloor(int32_t segment, int32_t docid, float score) const requires Collapsed {
+    if (pq.size() < (size_t)topCount) return false;
+    const ScoreDoc& floor = pq.top();
+    return score < floor.score || (score == floor.score && segdoc(segment, docid) > floor.doc);
+  }
+
+  void setSegment(int32_t segment, int64_t sourceCost = -1) requires Collapsed {
+    groups->setSegment(segment, topCount, sourceCost);
   }
 
   void offer(const CollapseKey& key, segdoc doc, float score) requires Collapsed {
@@ -167,7 +161,7 @@ class ScoreCollector {
     if (found != groups->retained.end()) {
       size_t slot = *found;
       auto& member = pq.atSlot((size_t)slot);
-      // Group rank ties use the key; member ties still use the document.
+      // Group and member rank ties both use document order.
       if (score < member.score || (score == member.score && doc >= member.doc)) return;
       member = {score, doc, slot};
       pq.updateSlot((size_t)slot);
@@ -177,7 +171,7 @@ class ScoreCollector {
     } else {
       const auto& bottom = pq.top();
       if (score < bottom.score || (score == bottom.score
-          && key >= groups->keys[(size_t)bottom.slot])) return;
+          && doc >= bottom.doc)) return;
       size_t slot = groups->retain(key, bottom.slot);
       pq.top() = {score, doc, slot};
       pq.updateTop();
@@ -185,17 +179,12 @@ class ScoreCollector {
     if (pq.size() == (size_t)topCount) minCompetitiveVal = pq.top().score;
   }
 
-  // The heap floor stays inclusive because an equal-scoring doc with a
-  // smaller total-order key can replace its root. For a monotone segment
-  // stream, once its next key is past the root, equal scores cannot enter and
-  // the scorer may use the next representable float as an exclusive floor.
+  // A later segdoc loses an equal score, even under collapse. Publish the
+  // next float only for that stream; sibling streams retain an inclusive floor.
   float minCompetitiveScoreForNextDoc(int32_t segment, int32_t docid) const {
     if (topCount == 0 || pq.size() < topCount) {
       return std::numeric_limits<float>::lowest();
     }
-    // A later segdoc can carry a smaller group key at this score. The
-    // document stream's one-ULP shortcut is therefore unsound for groups.
-    if constexpr (Collapsed) { unused(segment, docid); return minCompetitiveVal; }
     const ScoreDoc& floor = pq.top();
     if (segdoc(segment, docid) > floor.doc) {
       return std::nextafter(floor.score, std::numeric_limits<float>::infinity());
@@ -221,6 +210,7 @@ class ScoreCollector {
     if constexpr (Collapsed) {
       hitCount += other.hitCount;
       groups->mergeCounts(*other.groups);
+      groups->finishSegment();
       // Local top-L groups suffice globally: an omitted group has L local
       // groups ahead of its best local witness, hence L global groups ahead.
       for (const auto& member : other.pq.span()) {
@@ -244,7 +234,7 @@ class ScoreCollector {
     // sort_heap must use the same comparator the heap was built with (scoreAndDocComp),
     // which also gives the stable response order: score desc, then (seg, docid) asc at ties.
     std::span<ScoreDoc> docs = pq.span();
-    std::sort_heap(docs.begin(), docs.end(), comparator(this));
+    std::sort_heap(docs.begin(), docs.end(), scoreAndDocComp);
     return docs;
   }
 
@@ -766,6 +756,15 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
   assert(scorer != nullptr);
   assert(topCount > 0);
   int64_t collected = 0;
+  auto complete = [&](int32_t doc) {
+    if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+      // This pull is in doc order with one constant score. Stop only once
+      // L distinct groups are held and this stream has reached their floor's
+      // segdoc. An earlier segment must still improve later tied heads.
+      return collector.size() == topCount
+          && segdoc(segnum, doc) >= collector.pq.top().doc;
+    } else { unused(doc); return collected >= topCount; }
+  };
   auto collectOne = [&](int32_t doc) {
     collector.collect(segnum, doc, scorer->score());
     collected++;
@@ -774,7 +773,7 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*) filter;
     auto* domainBits = bitDocs == nullptr ? nullptr : &bitDocs->bits();
-    while (collected < topCount) {
+    while (!complete(0)) {
       int32_t doc = scorer->next();
       if (doc == PostingsReader::END) {
         break;
@@ -783,6 +782,7 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
         continue;
       }
       collectOne(doc);
+      if (complete(doc)) break;
     }
   } else {
     for (int32_t doc : ((ArrDocSet*) filter)->docs()) {
@@ -793,10 +793,13 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
         continue;
       }
       collectOne(doc);
-      if (collected >= topCount) {
+      if (complete(doc)) {
         break;
       }
     }
+  }
+  if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+    if (SkipStats::enabled) SkipStats::collapseDocsVisited += collected;
   }
   return collected;
 }

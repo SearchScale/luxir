@@ -11,7 +11,7 @@
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/query/QueryPrep.h"
-#include <map>
+#include <set>
 #include <random>
 
 using namespace luxir;
@@ -76,28 +76,15 @@ struct Oracle {
   int64_t eligible = 0;
 };
 
-// G0: exhaustive ordinary ranked documents select the first member per key.
-// Consecutive equal rank values form a band; only group identity reorders
-// that band. This oracle neither constructs nor consults engine collectors.
-Oracle fieldOracle(LocalReq& full, const std::vector<std::string>& keyFields,
-                   std::string_view missing, const std::vector<std::string>& rankFields) {
-  std::map<Key, std::pair<size_t, Row>> heads;
-  std::vector<Part> previous;
-  size_t band = 0;
+// Exhaustive ordinary ranking, dropping later same-key documents. This
+// computes expected heads without consulting collapse admission or pruning.
+Oracle oracle(LocalReq& full, const std::vector<std::string>& keyFields,
+              std::string_view missing) {
+  std::set<Key> seen;
   size_t docOrder = 0;
   Oracle result;
   for (auto* response : full.responses) {
     for (const auto& doc : response->proto.ops.at("q")->docList()->docs) {
-      std::vector<Part> rank;
-      for (const auto& field : rankFields) {
-        auto* value = doc.fields.find(field);
-        if (field == "_doc_") rank.emplace_back((int64_t)docOrder);
-        else if (field == "score") rank.emplace_back((int64_t)std::bit_cast<uint32_t>(
-            std::get<float>(doc.fields.at("_score_")->kind)));
-        else rank.push_back(part(value ? &**value : nullptr));
-      }
-      if (docOrder != 0 && rank != previous) band++;
-      previous = std::move(rank);
       Key key;
       bool absent = false;
       for (const auto& field : keyFields) {
@@ -110,18 +97,15 @@ Oracle fieldOracle(LocalReq& full, const std::vector<std::string>& keyFields,
         if (absent && missing == "expand") {
           key.parts.clear(); key.singleton = true; key.docOrder = docOrder;
         }
-        auto* score = doc.fields.find("_score_");
-        heads.try_emplace(key, band, Row{std::string(doc.fields.at("id")->asString()),
-            score ? std::get<float>((*score)->kind) : 0.0f, key.parts, key.singleton});
+        if (seen.insert(key).second) {
+          auto* score = doc.fields.find("_score_");
+          result.groups.push_back(Row{std::string(doc.fields.at("id")->asString()),
+              score ? std::get<float>((*score)->kind) : 0.0f, key.parts, key.singleton});
+        }
       }
       docOrder++;
     }
   }
-  std::vector<std::pair<Key, std::pair<size_t, Row>>> ordered(heads.begin(), heads.end());
-  std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-    return a.second.first == b.second.first ? a.first < b.first : a.second.first < b.second.first;
-  });
-  for (auto& entry : ordered) result.groups.push_back(std::move(entry.second.second));
   return result;
 }
 
@@ -179,33 +163,9 @@ TEST_F(CollapseTest, bruteForceOracle) {
       for (const std::vector<std::string>& fields : {
           std::vector<std::string>{"key_s"}, {"key_i"}, {"when_dt"}, {"id"}, {"key_s", "key_i"}}) {
         for (std::string missing : {"expand", "group", "drop"}) {
-          std::map<Key, Row> groups;
-          size_t rank = 0;
-          int64_t eligible = 0;
-          for (auto* response : full->responses) {
-            const auto& list = *response->proto.ops.at("q")->docList();
-            for (const auto& doc : list.docs) {
-              Key key;
-              bool absent = false;
-              for (const auto& field : fields) {
-                auto* value = doc.fields.find(field);
-                key.parts.push_back(part(value ? &**value : nullptr));
-                absent |= std::holds_alternative<std::monostate>(key.parts.back());
-              }
-              if (absent && missing == "drop") { rank++; continue; }
-              eligible++;
-              if (absent && missing == "expand") { key.parts.clear(); key.singleton = true; key.docOrder = rank; }
-              groups.try_emplace(key, Row{std::string(doc.fields.at("id")->asString()),
-                  std::get<float>(doc.fields.at("_score_")->kind), key.parts, key.singleton});
-              rank++;
-            }
-          }
-          std::vector<std::pair<Key, Row>> expected(groups.begin(), groups.end());
-          std::sort(expected.begin(), expected.end(), [](const auto& a, const auto& b) {
-            return a.second.score == b.second.score ? a.first < b.first : a.second.score > b.second.score;
-          });
-          std::vector<Row> all;
-          for (const auto& entry : expected) all.push_back(entry.second);
+          auto expected = oracle(*full, fields, missing);
+          const auto& all = expected.groups;
+          int64_t eligible = expected.eligible;
           auto collapse = spec(fields, missing);
           for (int32_t parallel : {1, -1}) {
             SCOPED_TRACE(collection + " " + query + " " + collapse + " parallel=" + std::to_string(parallel));
@@ -264,14 +224,14 @@ TEST_F(CollapseTest, wireAndEmptyPages) {
   std::pmr::monotonic_buffer_resource arena;
   ASSERT_TRUE(luxir::api::decode(decoded, std::span(binary).first(size), arena));
   EXPECT_EQ(2, decoded.ops.at("q")->docList()->groups.size());
-  EXPECT_EQ(INT64_MAX, std::get<int64_t>(decoded.ops.at("q")->docList()->groups[0].component[1].value));
+  EXPECT_EQ(INT64_MIN, std::get<int64_t>(decoded.ops.at("q")->docList()->groups[0].component[1].value));
   std::string listJson;
   ASSERT_TRUE(luxir::api::write_json(*req->docList(), listJson));
   luxir::api::DocList jsonList;
   ASSERT_TRUE(luxir::api::read_json(jsonList, listJson, arena)) << listJson;
   EXPECT_EQ(2, jsonList.groups.size());
   EXPECT_EQ(3, jsonList.found_docs);
-  EXPECT_EQ(INT64_MAX, std::get<int64_t>(jsonList.groups[0].component[1].value));
+  EXPECT_EQ(INT64_MIN, std::get<int64_t>(jsonList.groups[0].component[1].value));
   auto empty = run("main", "*:*", R"("key_s")", 10, 500);
   EXPECT_EQ(0, empty->docList()->row_count);
   EXPECT_EQ(500, empty->docList()->offset);
@@ -434,7 +394,7 @@ TEST_F(CollapseTest, fieldSortOracle) {
         for (const std::vector<std::string>& fields : {
             std::vector<std::string>{"key_s"}, {"key_i"}, {"key_s", "key_i", "when_dt"}}) {
           for (std::string missing : {"expand", "group", "drop"}) {
-            auto expected = fieldOracle(*full, fields, missing, sort.fields);
+            auto expected = oracle(*full, fields, missing);
             auto collapse = spec(fields, missing);
             for (int32_t parallel : {1, -1}) {
               SCOPED_TRACE(collection + " " + query + " " + sort.json + " " + collapse
@@ -489,7 +449,7 @@ TEST_F(CollapseTest, fieldSortDrivers) {
       for (std::string query : {"*:*", "body_w:alpha OR body_w:beta", "body_w:alpha"}) {
         SCOPED_TRACE(missing + " " + sort + " " + query);
         auto full = run("main", query, {}, -1, 0, 1, true, 2000, sort, false);
-        auto expected = fieldOracle(*full, {"key_i", "key_s"}, missing, {"sort_i"});
+        auto expected = oracle(*full, {"key_i", "key_s"}, missing);
         expected.groups.resize(17);
         for (int32_t arm = 0; arm < 6; arm++) {
           auto savedBest = forceFieldSortBestFirst;
@@ -527,14 +487,14 @@ TEST_F(CollapseTest, fieldSortDrivers) {
       }
     }
   }
-  // Candidate ord intervals must retain the bottom term at ties. Exercise
-  // the single-segment global-ord comparator, including non-bottom updates.
+  // Candidate ord intervals close tied bottom terms by document order.
+  // Exercise both ordinal comparators, including non-bottom updates.
   for (StringSortMode mode : {StringSortMode::SEGMENT, StringSortMode::GLOBAL}) {
     auto saved = SortField::setStringSortModeForTests(mode);
     auto restore = scope_guard([&]() { SortField::setStringSortModeForTests(saved); });
     for (std::string sort : {R"("sort_s asc")", R"("sort_s desc")"}) {
       auto full = run("main", "*:*", {}, -1, 0, 1, true, 2000, sort, false);
-      auto expected = fieldOracle(*full, {"key_s"}, "group", {"sort_s"});
+      auto expected = oracle(*full, {"key_s"}, "group");
       expected.groups.resize(17);
       auto actual = run("main", "*:*", spec({"key_s"}, "group"), 17, 0, 1, false, 13, sort, false);
       EXPECT_EQ(expected.groups, rows(*actual, true));
@@ -569,7 +529,7 @@ TEST_F(CollapseTest, fieldSortCandidatesAndTwoPhase) {
           std::string sort = '"' + field + ' ' + direction + '"';
           SCOPED_TRACE(query + " " + sort + " mode=" + std::to_string((int)mode));
           auto full = run("main", query, {}, -1, 0, 1, true, 2000, sort, false);
-          auto expected = fieldOracle(*full, {"key_s"}, "group", {field});
+          auto expected = oracle(*full, {"key_s"}, "group");
           expected.groups.resize(9);
           for (bool pull : {false, true}) {
             auto savedBulk = disableFieldSortBulk;
@@ -590,6 +550,112 @@ TEST_F(CollapseTest, fieldSortCandidatesAndTwoPhase) {
             }
           }
         }
+      }
+    }
+  }
+}
+
+TEST_F(CollapseTest, tiedGroupsUseDocumentOrder) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z", "key_s", "z", "sort_i", (int64_t)1),
+      flatdoc("id", "a", "key_s", "a", "sort_i", (int64_t)1)}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z-later", "key_s", "z", "sort_i", (int64_t)1),
+      flatdoc("id", "b", "key_s", "b", "sort_i", (int64_t)1)}, UpdateMessage::COMMIT).success);
+  for (std::string sort : {std::string{}, std::string(R"("sort_i asc")")}) {
+    for (int32_t parallel : {1, -1}) {
+      auto result = rows(*run("main", "*:*", R"("key_s")", 2, 1, parallel, false, 1, sort), true);
+      ASSERT_EQ(2, result.size());
+      EXPECT_EQ("a", result[0].id);
+      EXPECT_EQ("b", result[1].id);
+    }
+  }
+}
+
+TEST_F(CollapseTest, tiedExpandSingletonUsesDocumentOrder) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z", "key_s", "z", "sort_i", (int64_t)1),
+      flatdoc("id", "missing", "sort_i", (int64_t)1),
+      flatdoc("id", "a", "key_s", "a", "sort_i", (int64_t)1)}, UpdateMessage::COMMIT).success);
+  for (std::string sort : {std::string{}, std::string(R"("sort_i asc")")}) {
+    auto result = rows(*run("main", "*:*", R"("key_s")", -1, 0, -1, false, 1, sort), true);
+    ASSERT_EQ(3, result.size());
+    EXPECT_EQ("z", result[0].id);
+    EXPECT_EQ("missing", result[1].id);
+    EXPECT_TRUE(result[1].singleton);
+    EXPECT_EQ("a", result[2].id);
+  }
+}
+
+TEST_F(CollapseTest, explicitKeySortOrdersTiedGroupsByKey) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z", "key_s", "z"),
+      flatdoc("id", "a", "key_s", "a"), flatdoc("id", "b", "key_s", "b")},
+      UpdateMessage::COMMIT).success);
+  auto result = rows(*run("main", "*:*", R"("key_s")", -1, 0, -1, false, 1,
+      R"(["score desc","key_s asc"])"), true);
+  ASSERT_EQ(3, result.size());
+  EXPECT_EQ("a", result[0].id);
+  EXPECT_EQ("b", result[1].id);
+  EXPECT_EQ("z", result[2].id);
+}
+
+TEST_F(CollapseTest, retainedOrdRemapAcrossDifferentDictionaries) {
+  CollectionHelper helper;
+  for (int32_t segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < 512; i++) {
+      auto doc = flatdoc("id", std::to_string(segment * 512 + i),
+          "key_i", (int64_t)(i % 3), "sort_i", (int64_t)i);
+      if (i % 5 != 0) doc.emplace_back("key_s", std::string(1, (char)('a' + segment + i % 2)));
+      if (segment != 2 && i % 7 != 0) doc.emplace_back("sort_s", std::string(1, (char)('z' - segment - i % 2)));
+      docs.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds({"1", "514", "1029"}, UpdateMessage::COMMIT).success);
+  for (auto fields : {std::vector<std::string>{"key_s"}, {"key_s", "sort_s", "key_i"}}) {
+    for (std::string missing : {"expand", "group", "drop"}) {
+      for (std::string sort : {std::string{}, std::string(R"("sort_i desc")")}) {
+        auto full = run("main", "*:*", {}, -1, 0, 1, true, 2000, sort);
+        auto expected = oracle(*full, fields, missing).groups;
+        if (expected.size() > 20) expected.resize(20);
+        for (int32_t parallel : {1, -1}) {
+          // Serial counters certify that encoded remaps ran; parallel workers
+          // exercise independent local dictionaries and global merge identities.
+          SkipStatsScope stats;
+          SkipStats::enabled = parallel == 1;
+          auto actual = run("main", "*:*", spec(fields, missing), 20, 0, parallel, false, 2000, sort);
+          EXPECT_EQ(expected, rows(*actual, true));
+          if (parallel == 1) { EXPECT_GT(SkipStats::collapseRemapProbes, 0); }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(CollapseTest, constantPullStopsAtDistinctGroups) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t i = 0; i < 512; i++) {
+    auto doc = flatdoc("id", std::to_string(i));
+    if (i != 200) doc.emplace_back("key_s", i < 200 ? "z" : "a");
+    docs.push_back(std::move(doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  for (auto missing : {"expand", "group", "drop"}) {
+    auto full = run("main", "*:*", {}, -1, 0, 1, true, 2000);
+    auto expected = oracle(*full, {"key_s"}, missing).groups;
+    expected.resize(2);
+    for (bool exhaustive : {false, true}) {
+      auto saved = disableCollapsePruningForTests;
+      auto restore = scope_guard([&]() { disableCollapsePruningForTests = saved; });
+      disableCollapsePruningForTests = exhaustive;
+      SkipStatsScope stats;
+      auto actual = run("main", "*:*", spec({"key_s"}, missing), 2, 0, 1, false);
+      EXPECT_EQ(expected, rows(*actual, true));
+      // The bounded pull stops once two groups are held and passed.
+      if (!exhaustive) {
+        EXPECT_EQ(missing == std::string_view("drop") ? 202 : 201, SkipStats::collapseDocsVisited);
       }
     }
   }

@@ -950,7 +950,7 @@ public:
 
   // Build the copyable sort plan. Schema lookups that may throw are resolved
   // here before the plan is passed to TopDocsReq.
-  SortPlan parseSorts(std::span<const luxir::api::SortSpec> sorts, bool collapsed = false) {
+  SortPlan parseSorts(std::span<const luxir::api::SortSpec> sorts) {
     SortPlan out;
     if (sorts.empty()) return out;
     out.useFieldSort = true;
@@ -1003,9 +1003,8 @@ public:
     bool canonicalScoreDoc = out.clauses.size() == 2 && scoreDesc
       && out.clauses[1].getKind() == SortClause::DOC
       && out.clauses[1].getOrder() == SortField::ASC;
-    // An explicit document clause participates in group rank. The document
-    // top-K shortcut would replace it with the collapse key tie-break.
-    if (canonicalScore || (!collapsed && canonicalScoreDoc)) out.useFieldSort = false;
+    // Explicit doc asc is the implicit tie for both documents and groups.
+    if (canonicalScore || canonicalScoreDoc) out.useFieldSort = false;
     return out;
   }
 
@@ -1585,7 +1584,7 @@ public:
       domainQuery = req.requestPool.make<ForcePrepareQuery>(domainQuery);
     }
 
-    auto parsedSorts = parseSorts(topDocsReq.sort, collapse != nullptr);
+    auto parsedSorts = parseSorts(topDocsReq.sort);
     auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
       req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
       &req.warnings,

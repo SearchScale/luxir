@@ -5,12 +5,14 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/search/Collector.h"
 
 using namespace luxir;
 using namespace luxir::test;
 
-// The uncollapsed cases use only the existing request API, so this file can
-// also be copied into a HEAD checkout for a same-corpus release A/B.
+// Scattered groups across five segments. Same-limit document, group and
+// exhaustive group cases compare ranking and traversal work.
 static void BM_CollapseTopDocs(benchmark::State& state, int32_t mode) {
   int32_t nDocs = unit_tests ? (int32_t)LuxirTest::scaleTestWork(500) : 1'000'000;
   int32_t nGroups = unit_tests ? 23 : 50'000;
@@ -36,6 +38,12 @@ static void BM_CollapseTopDocs(benchmark::State& state, int32_t mode) {
     }
   }
 
+  bool savedPruning = disableCollapsePruningForTests;
+  auto restore = scope_guard([&]() { disableCollapsePruningForTests = savedPruning; });
+  if (mode >= 13) {
+    disableCollapsePruningForTests = true;
+    mode = mode == 13 ? 2 : mode == 14 ? 6 : 7;
+  }
   bool churn = mode == 4 || mode == 5;
   std::string query = churn ? "rescore(*:*, seq_i)" : "body_w:alpha";
   bool unscored = mode == 6 || mode == 7 || mode >= 9;
@@ -58,6 +66,8 @@ static void BM_CollapseTopDocs(benchmark::State& state, int32_t mode) {
     }
     req->execute(false);
     ASSERT_TRUE(req->ok()) << req->errorMsg();
+    state.counters["remap_probes"] = (double)SkipStats::collapseRemapProbes;
+    state.counters["gathered_docs"] = (double)SkipStats::fieldSortDocsGathered;
     state.counters["doc_blocks"] = (double)SkipStats::docBlocksDecoded;
     state.counters["tfreq_blocks"] = (double)SkipStats::tfreqBlocksDecoded;
   }
@@ -88,3 +98,54 @@ LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, exhaustive_field_numeric, 9);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, exhaustive_field_string, 10);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, docs_field_unscored, 11);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, docs_field_string, 12);
+
+// Same limit and group admission as the pruned cases; only traversal is exhaustive.
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_score_no_pruning, 13);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_field_numeric_no_pruning, 14);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseTopDocs, collapse_field_string_no_pruning, 15);
+
+// Isolate retained-group remapping on overlapping, incomplete dictionaries.
+// Cost zero pins the direct-translation baseline via the production cost rule;
+// the other cases supply the segment's actual document count. Both visit the
+// same documents and perform the same heap updates, with no pruning.
+static void BM_CollapseRetainedRemap(benchmark::State& state, bool remap, bool tuple) {
+  int32_t size = unit_tests ? 100 : 200'000;
+  CollectionHelper helper("collapse_remap_bm");
+  if (!helper.indexMatchesShape(std::vector<int32_t>(5, size))) {
+    helper.clear();
+    for (int32_t segment = 0; segment < 5; segment++) {
+      std::vector<Doc> docs;
+      for (int32_t doc = 0; doc < size; doc++) {
+        docs.push_back(flatdoc("id", std::to_string(segment * size + doc),
+            "key_s", "g" + std::to_string(segment + doc % 8), "key_i", (int64_t)(doc % 2)));
+      }
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  CollapsePlan plan(*reader, api::Collapse_::MissingPolicy::GROUP, false);
+  plan.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("key_s"),
+                         reader->field("key_s")});
+  if (tuple) plan.fields.push_back({"key_i", api::GroupComponent_::Type::INT, {}, reader->field("key_i")});
+  auto execute = [&]() {
+    GroupScoreCollector collector(10, &plan);
+    for (int32_t segment = 0; segment < 5; segment++) {
+      collector.setSegment(segment, remap ? size : 0);
+      for (int32_t doc = 0; doc < size; doc++) {
+        collector.collect(segment, doc, (float)(segment * size + doc));
+      }
+    }
+    benchmark::DoNotOptimize(collector.pq.top().score);
+  };
+  {
+    SkipStatsScope stats;
+    execute();
+    state.counters["remap_probes"] = (double)SkipStats::collapseRemapProbes;
+  }
+  for (auto _ : state) execute();
+  state.SetItemsProcessed(state.iterations() * size * 5);
+}
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, direct_score, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, remap_score, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, direct_tuple, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, remap_tuple, true, true);

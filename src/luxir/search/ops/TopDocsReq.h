@@ -806,12 +806,19 @@ public:
           || !op.weight->isConstantScoring()) {
         return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
       }
+      if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+        if (disableCollapsePruningForTests) return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
+      }
       if (!TopDocsReq::disableConstantWindowCaptureForTests
           && !op.requirements.needExactCount && builder == nullptr
           && op.filters.empty()) {
         return ConstantScoreDisposition::LIMIT_ONLY;
       }
-      return ConstantScoreDisposition::COMPLETE;
+      // Document first-K/count drains cannot supply distinct totals or child
+      // domains. Only the limit-only bounded pull is group-aware.
+      if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+        return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
+      } else return ConstantScoreDisposition::COMPLETE;
     }
 
     static Query::Scorer* buildBoundedConstantScorer(
@@ -1772,7 +1779,8 @@ public:
       // be constant for doc order to be the ranking; a rescore over a
       // match-all matches everything but reorders it.)
       // Constant-score first-K and cardinality shortcuts rank documents.
-      // Groups require reading keys, including equal-score groups after K.
+      // Groups require key reads; the bounded pull below stops at L groups,
+      // while this identity arm also supplies document-cardinality totals.
       bool matchEverything = !Collapsed && op.weight != nullptr && op.weight->matchesAllDocs()
         && op.weight->isConstantScoring() && op.filterWeights.empty();
       std::unique_ptr<MergeableCollector> data;
@@ -1798,9 +1806,6 @@ public:
         auto* scoreCollector = data->template scores<Collapsed>();
         auto* fieldCollector = data->template fields<Collapsed>();
         using ActiveFieldCollector = FieldCollector<Collapsed>;
-        if constexpr (Collapsed) {
-          if (!data->useFieldSort) scoreCollector->setSegment(segnum);
-        }
 
         // Field-sorted ranking is the one thing a match-all still has to
         // iterate for: it orders by column values the domain says nothing
@@ -2020,6 +2025,14 @@ public:
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
               : filter;
+          if constexpr (Collapsed) {
+            if (!data->useFieldSort) {
+              int64_t sourceCost = supplier->cost();
+              if (collectorFilter != nullptr) sourceCost = std::min(
+                  sourceCost, (int64_t)collectorFilter->card());
+              scoreCollector->setSegment(segnum, sourceCost);
+            }
+          }
           // A constant-count plan satisfies document totals without an
           // executor. Collapse must enumerate identities instead.
           bool counted = false;
@@ -2056,7 +2069,8 @@ public:
                  && !routedExactDomain)
                 || builderPtr != nullptr;
             bool maySkipNoncompetitiveDocs =
-                !disableFieldSortPruning && !mustStreamForCompleteness;
+                !disableFieldSortPruning && !mustStreamForCompleteness
+                && !(Collapsed && disableCollapsePruningForTests);
             // Candidate pruning must beat what the source would still cost:
             // the query estimate, capped by an external filter's cardinality.
             int64_t sortSourceCost = wholeFieldSortAvailable
@@ -2083,8 +2097,8 @@ public:
             std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
             Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
             // Group proof: gathered leaves admit by exact identity before
-            // truncation. Only strictly worse primary bounds can terminate;
-            // tied leaves remain eligible regardless of document order.
+            // truncation. A leaf loses on a worse bound, or on an equal
+            // sole-clause bound when its first doc loses the floor's doc tie.
             // Bound-order visits reset sparse key readers on backward reads.
             // Exact-domain route: when the whole result set is already
             // materialized (BITSET or ARRAY), no scorer needs to run - the
@@ -2341,12 +2355,12 @@ public:
             // domain. Without pruning, windowed scoring still beats the
             // doc-at-a-time heap disjunction by using per-clause window drives.
             bool allowPruning = op.weight->allowsPruning()
-                && (!Collapsed || !op.requirements.needExactCount);
+                && (!Collapsed || (!op.requirements.needExactCount
+                    && !disableCollapsePruningForTests));
             BulkScorer* bulk = nullptr;
             bool composedExactCountTopK = false;
             ConstantScoreDisposition constantRoute =
-                Collapsed ? ConstantScoreDisposition::NOT_CONSTANT_TOP_K
-                    : constantScoreDisposition(*scoreCollector, builderPtr);
+                constantScoreDisposition(*scoreCollector, builderPtr);
             ExactCountTopKRoute exactCountTopKRoute =
                 constantRoute
                         == ConstantScoreDisposition::NOT_CONSTANT_TOP_K
@@ -2393,7 +2407,8 @@ public:
             auto buildDeclaredBulk = [&]() -> BulkScorer* {
               // Count-only bulk windows omit document identities. Group
               // totals must visit every key, even at limit zero.
-              if (captureSharedRaw || (Collapsed && scoreCollector->topCount == 0)) return nullptr;
+              if (captureSharedRaw || (Collapsed && (scoreCollector->topCount == 0
+                  || constantRoute == ConstantScoreDisposition::LIMIT_ONLY))) return nullptr;
               Query::ScorerSupplier::BulkUse use = Collapsed
                   ? Query::ScorerSupplier::BulkUse::SCORED_WINDOWS :
                   constantRoute
@@ -2480,7 +2495,7 @@ public:
                       == ConstantScoreDisposition::LIMIT_ONLY
                   ? buildBoundedConstantScorer(
                         poolGuard.pool(), *supplier, collectorFilter,
-                        scoreCollector->topCount)
+                        Collapsed ? supplier->cost() : scoreCollector->topCount)
                   : buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
                 if (constantRoute

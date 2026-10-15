@@ -210,10 +210,12 @@ Each returned document has `_group_`: `{"val":"P17"}` for one field,
 `{"val":["shop-A",null]}` for a tuple, or
 `{"val":null,"singleton":true}` for a document grouped separately by
 `expand`. String keys use indexed values; date keys use epoch milliseconds.
-Groups tied on all sort values compare by key: null precedes a value, tuples
-compare component by component, and ordinary keys precede singleton groups.
-Tied members of one group, and tied singleton groups, use reader document
-order.
+Groups tied on all sort values follow their best member's document order,
+including documents grouped separately by `expand`. The best member within a
+group uses the same sort and document tiebreak. A collapsed list is the
+ordinary sorted list with later documents of the same key removed, before
+applying offset and limit. To order tied groups by key, add an explicit sort
+clause on the key field, for example `"sort": ["score desc", "product_s asc"]`.
 
 Streaming batches preserve the association between each document and its
 group. The protobuf `DocList.groups` table contains typed keys aligned with

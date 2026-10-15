@@ -4228,7 +4228,7 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
         EXPECT_TRUE(row.contains("_group_"));
       }
     }
-    EXPECT_EQ((std::vector<std::string>{"b", "z", "missing"}), ids);
+    EXPECT_EQ((std::vector<std::string>{"z", "b", "missing"}), ids);
   }
   auto response = httpRequest(port(), http::verb::post,
       "/collections/main/_search?format=docs&collapse=key_s",
