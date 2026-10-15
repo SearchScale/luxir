@@ -138,25 +138,5 @@ private:
   void propagateBounds(const ValueBounds& scoreBounds);
 };
 
-// A binding owns only segment-MemPool state. It also clears the caller's
-// runtime pointer before destructing/rewinding, including exceptional unwind.
-class BoundValueGuard {
-public:
-  MemPool::ScopeGuard scope;
-  BoundValueProgram*& runtime;
-
-  BoundValueGuard(MemPool& pool, const ValueProgram& program,
-                  IndexReader::Segment& segment, BoundValueProgram*& runtime)
-      : scope(pool), runtime(runtime) {
-    runtime = program.bind(pool, segment);
-  }
-
-  ~BoundValueGuard() {
-    runtime = nullptr;
-  }
-
-  BoundValueGuard(const BoundValueGuard&) = delete;
-  BoundValueGuard& operator=(const BoundValueGuard&) = delete;
-};
 
 } // namespace luxir
