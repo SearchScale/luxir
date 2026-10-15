@@ -124,6 +124,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.grpc.port", server.grpc.port, "gRPC listen port (default: HTTP port + 1)");
   app.add_option("--server.grpc.threads", server.grpc.threads, "Number of server threads (0 = auto)")
       ->default_val(server.grpc.threads);
+  app.add_option("--server.grpc.max-receive-message-size", server.grpc.max_receive_message_size,
+                 "Max received gRPC message; larger -> RESOURCE_EXHAUSTED (e.g. 64MB)")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("--indexing.max-request-body");
 
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);

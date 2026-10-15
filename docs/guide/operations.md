@@ -336,6 +336,18 @@ The HTTP request limits distinguish bounded material from streams:
   reached and resume as batches complete. A larger limit uses more staging
   memory.
 
+gRPC has one request limit, on the size of each received message (a unary
+request or one message of a stream):
+
+```bash
+./luxir --server.grpc.max-receive-message-size=64MB
+```
+
+It defaults to `--indexing.max-request-body`, so the buffered HTTP and gRPC
+ceilings move together. A larger message fails with `RESOURCE_EXHAUSTED`
+before it is decoded; see [gRPC API](grpc.md#message-size). Replies have no
+size limit; search results are streamed in bounded batches.
+
 Search has its own limits:
 
 ```bash
