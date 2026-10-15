@@ -82,7 +82,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct MemoryStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
@@ -301,10 +301,22 @@ struct JemallocStats {
   ArenaStats indexing;
   ArenaStats big_buffer;
 };
+struct FieldMetadataStats {
+  uint64_t bytes = 0;
+  uint64_t directories = 0;
+  uint64_t directory_bytes = 0;
+  uint64_t pages = 0;
+  uint64_t page_bytes = 0;
+  uint64_t entries = 0;
+  uint64_t entry_bytes = 0;
+  uint64_t names = 0;
+  uint64_t name_bytes = 0;
+};
 struct MemoryStats {
   IndexRamStats indexing_budget;
   StorageRamStats storage_ram;
   std::optional<JemallocStats> jemalloc;
+  FieldMetadataStats field_metadata;
 };
 struct StatsTotals {
   uint64_t collections = 0;
@@ -768,7 +780,7 @@ LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(Li
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
-LUXIR_TD(JemallocStats) LUXIR_TD(MemoryStats)
+LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
@@ -813,7 +825,7 @@ LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_EN
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
-LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(MemoryStats)
+LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)

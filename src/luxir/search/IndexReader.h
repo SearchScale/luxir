@@ -210,6 +210,7 @@ private:
     size_t numSegments;
     std::unique_ptr<std::atomic<int32_t>[]> ordinals;
     mutable std::atomic<Similarity::FieldStats*> fieldStats{nullptr};
+    size_t bytes;
 
     FieldRecord(std::string_view name, size_t numSegments, size_t first, int32_t ordinal);
     ~FieldRecord();

@@ -618,6 +618,12 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   EXPECT_TRUE(nodeJson.contains("collections"));
   EXPECT_FALSE(nodeJson.contains("memory"));
 
+  CollectionHelper metadataHelper("metadata");
+  ASSERT_TRUE(metadataHelper.index(flatdoc("id", "one", "n_i", 7), UpdateMessage::COMMIT).success);
+  auto metadataReader = metadataHelper.getIndexWriter()->snapshots.readers.getReader();
+  auto metadataField = metadataReader->field("n_i");
+  ASSERT_NE(nullptr, metadataField.at(0));
+
   // Node memory is a separate request that returns nothing else; the jemalloc
   // block is present only on jemalloc.
   auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
@@ -634,6 +640,24 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
     EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("allocated_bytes"));
     EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("version"));
   }
+  const auto& metadata = memoryJson["memory"]["field_metadata"];
+  EXPECT_GT(metadata["entries"].get<int64_t>(), 0);
+  EXPECT_GT(metadata["pages"].get<int64_t>(), 0);
+  EXPECT_GE(metadata["names"].get<int64_t>(), 1);
+  EXPECT_EQ(metadata["bytes"].get<int64_t>(),
+            metadata["directory_bytes"].get<int64_t>() + metadata["page_bytes"].get<int64_t>()
+                + metadata["entry_bytes"].get<int64_t>() + metadata["name_bytes"].get<int64_t>());
+  for (int i = 0; i < 100; i++) {
+    EXPECT_FALSE(metadataReader->field(std::format("absent_{}_i", i)).exists());
+  }
+  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  ASSERT_EQ(200, afterMissing.result_int()) << afterMissing.body();
+  glz::generic_i64 afterMissingJson;
+  ASSERT_FALSE(glz::read_json(afterMissingJson, afterMissing.body()));
+  EXPECT_EQ(metadata["names"].get<int64_t>(),
+            afterMissingJson["memory"]["field_metadata"]["names"].get<int64_t>());
+  EXPECT_EQ(metadata["name_bytes"].get<int64_t>(),
+            afterMissingJson["memory"]["field_metadata"]["name_bytes"].get<int64_t>());
   auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
   EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
   auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");

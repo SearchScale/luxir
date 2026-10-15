@@ -5,6 +5,7 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
@@ -410,10 +411,17 @@ IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t numSegments,
     ordinals[i].store(i < first ? -1 : UNRESOLVED, std::memory_order_relaxed);
   }
   ordinals[first].store(ordinal, std::memory_order_relaxed);
+  bytes = sizeof(FieldRecord) + numSegments * sizeof(std::atomic<int32_t>)
+      + sizeof(FieldRecords::value_type)
+      + (name.size() > std::string().capacity() ? 2 * (name.size() + 1) : 0);
+  fieldMetadataMemory.names.fetch_add(1, std::memory_order_relaxed);
+  fieldMetadataMemory.nameBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 IndexReader::FieldRecord::~FieldRecord() {
   auto* stats = fieldStats.load(std::memory_order_relaxed);
+  fieldMetadataMemory.names.fetch_sub(1, std::memory_order_relaxed);
+  fieldMetadataMemory.nameBytes.fetch_sub(bytes + (stats ? sizeof(*stats) : 0), std::memory_order_relaxed);
   delete stats;
 }
 
@@ -470,6 +478,7 @@ const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
                                                  std::memory_order_release,
                                                  std::memory_order_acquire)) {
       stats = fresh.release();
+      fieldMetadataMemory.nameBytes.fetch_add(sizeof(*stats), std::memory_order_relaxed);
     }
   }
   return *stats;

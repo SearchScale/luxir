@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <utility>
 #include "FieldReader.h"
+#include "FieldMetadataMemory.h"
 #include "IntColReader.h"
 #include "Postings.h"
 #include "luxir/util/MemPool.h"
@@ -108,6 +109,12 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   fieldPages = std::make_unique<std::atomic<FieldPage*>[]>(
       ((size_t)count + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE);
   nFields = count;
+  if (nFields > 0) {
+    fieldMetadataMemory.directories.fetch_add(1, std::memory_order_relaxed);
+    fieldMetadataMemory.directoryBytes.fetch_add(
+        ((size_t)nFields + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE * sizeof(std::atomic<FieldPage*>),
+        std::memory_order_relaxed);
+  }
   return true;
 }
 
@@ -126,6 +133,14 @@ PostingsReader::PostingsReader(Directory& dir, uint64_t segId) {
 }
 
 PostingsReader::~PostingsReader() {
+  auto stats = fieldCacheStats();
+  auto directoryBytes = ((size_t)nFields + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE * sizeof(std::atomic<FieldPage*>);
+  fieldMetadataMemory.directories.fetch_sub(nFields > 0, std::memory_order_relaxed);
+  fieldMetadataMemory.directoryBytes.fetch_sub(directoryBytes, std::memory_order_relaxed);
+  fieldMetadataMemory.pages.fetch_sub(stats.pages, std::memory_order_relaxed);
+  fieldMetadataMemory.pageBytes.fetch_sub(stats.pages * sizeof(FieldPage), std::memory_order_relaxed);
+  fieldMetadataMemory.entries.fetch_sub(stats.entries, std::memory_order_relaxed);
+  fieldMetadataMemory.entryBytes.fetch_sub(stats.entries * sizeof(Field), std::memory_order_relaxed);
   for (size_t i = 0; i < ((size_t)nFields + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE; ++i) {
     delete fieldPages[i].load(std::memory_order_relaxed);
   }
@@ -155,6 +170,8 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
                                         std::memory_order_release,
                                         std::memory_order_acquire)) {
       page = fresh.release();
+      fieldMetadataMemory.pages.fetch_add(1, std::memory_order_relaxed);
+      fieldMetadataMemory.pageBytes.fetch_add(sizeof(FieldPage), std::memory_order_relaxed);
     }
   }
   auto& slot = page->slots[(size_t)ordinal % FIELDS_PER_PAGE];
@@ -171,6 +188,8 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
                                     std::memory_order_release,
                                     std::memory_order_acquire)) {
       entry = fresh.release();
+      fieldMetadataMemory.entries.fetch_add(1, std::memory_order_relaxed);
+      fieldMetadataMemory.entryBytes.fetch_add(sizeof(Field), std::memory_order_relaxed);
     }
   }
   return entry;
