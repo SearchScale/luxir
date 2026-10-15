@@ -995,6 +995,7 @@ struct from<JSON, luxir::api::Collapse> {
       value.missing = luxir::api::Collapse_::MissingPolicy::EXPAND;
       value.head_sort = {};
       value.get_number = false;
+      value.ops = {};
       readFields(it, end);
       return;
     }
@@ -1006,6 +1007,10 @@ struct from<JSON, luxir::api::Collapse> {
           if (key == "field") readFields(vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "get_number") util::from_json<O>(value.get_number, ctx, vit, vend);
+          else if (key == "ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          }
           else if (key == "head_sort") {
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, value.head_sort);
             readSortList<O>(sort, ctx, vit, vend);

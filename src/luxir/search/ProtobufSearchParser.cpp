@@ -116,6 +116,7 @@ struct SearchParserImpl {
     REQUEST_ROOT,
     TOP_DOCS,
     FACET_BUCKET,
+    GROUP_BUCKET,
     FUSION,
   };
 
@@ -381,7 +382,8 @@ public:
   }
 
   void addSubs(SearchOp& currOp, OpsMap ops, int depth,
-               OpsPlacement placement) {
+               OpsPlacement placement,
+               boost::unordered_flat_map<std::string_view, SearchOp*>* destination = nullptr) {
     if (ops.empty()) return;
     if (depth >= maxOpDepth) {
       throw std::runtime_error("search operation nesting exceeds the maximum depth of "
@@ -391,11 +393,16 @@ public:
       // map values are indirect views over the request bytes; deref to the SearchOp.
       // lastWins() collapses duplicate op names (protobuf map dedup semantics).
       validateName(name, "op");
+      if ((placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET)
+          && (name == "val" || name == "count" || name == "rank"
+              || name == "singleton" || name == "missing")) {
+        throw RequestError("reserved bucket/group op name: " + std::string(name));
+      }
       auto* sub = parseOp(name, **searchOp, depth + 1, placement);
       if (sub == nullptr) {
         continue; // skip this op
       }
-      currOp.subOps[name] = sub;
+      (destination ? *destination : currOp.subOps)[name] = sub;
       sub->parent = &currOp;
     }
   }
@@ -406,7 +413,8 @@ public:
         && placement != OpsPlacement::REQUEST_ROOT
         && placement != OpsPlacement::TOP_DOCS) {
       std::string location = placement == OpsPlacement::FUSION
-          ? "Fusion.ops" : "a facet bucket";
+          ? "Fusion.ops" : placement == OpsPlacement::GROUP_BUCKET
+          ? "a group bucket" : "a facet bucket";
       throw std::runtime_error(
           "op '" + std::string(name) + "' under " + location
           + ": domain is only supported for ops dispatched by the request "
@@ -429,6 +437,15 @@ public:
                                            : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
         addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
+        if (topDocs.collapse) {
+          // A group bucket is a document domain, not another enclosing group
+          // measure or group-kNN scope. Its children establish their own query
+          // scores; an omitted query selects members unscored.
+          enclosingCollapse = nullptr;
+          inheritedFacetMeasure = nullptr;
+          addSubs(*qr, topDocs.collapse->ops, depth, OpsPlacement::GROUP_BUCKET,
+                  &qr->groupOps);
+        }
         return qr;
       },
       [&](const luxir::api::Fusion& fusion) -> SearchOp* {
@@ -605,7 +622,8 @@ public:
       }
     }
     if (facetReq.count_distinct) {
-      if (facetReq.count_distinct->get_number || !facetReq.count_distinct->head_sort.empty()) {
+      if (facetReq.count_distinct->get_number || !facetReq.count_distinct->head_sort.empty()
+          || !facetReq.count_distinct->ops.empty()) {
         throw RequestError("count_distinct accepts only field and missing");
       }
       auto* distinct = resolveCollapse(*facetReq.count_distinct, false);

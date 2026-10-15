@@ -454,16 +454,35 @@ TEST_F(GroupKnnTest, enrichmentReplaysOnlyAdmittedMembers) {
       UpdateMessage::COMMIT).success);
   for (bool groups : {false, true}) for (int parallel : {1, -1}) {
     auto actual = run("main", R"("limit":-1,"fields":["id"],"query":)" + knn(3, groups)
-        + R"(,"collapse":{"field":"key_s","get_number":true,"head_sort":"price_i asc"})", parallel);
+        + R"(,"collapse":{"field":"key_s","get_number":true,"head_sort":"price_i asc","ops":{"members":{"top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}}}})", parallel);
     ASSERT_TRUE(actual->ok()) << actual->errorMsg();
     auto result = rows(*actual);
     ASSERT_EQ(2u, result.size());
     EXPECT_EQ(groups ? "a" : "b", result[0].first);
     const auto& table = *actual->docList()->groups;
     EXPECT_EQ(groups ? 1 : 2, table.counts[0]);
+    auto& members = *std::get<api::ArrVal>(table.ops.at("members")->kind).v[0].docList();
+    ASSERT_EQ(groups ? 1 : 2, members.row_count);
+    EXPECT_EQ(groups ? "a" : "b", members.docs[0].fields.at("id")->asString());
+    for (auto& doc : members.docs) EXPECT_NE("c", doc.fields.at("id")->asString());
     if (!groups) {
       ASSERT_EQ(1u, table.ranks[0].v.size());
       EXPECT_GT(std::get<float>(table.ranks[0].v[0].kind), result[0].second);
     }
   }
+}
+
+TEST_F(GroupKnnTest, groupChildNeedsItsOwnCollapse) {
+  CollectionHelper helper;
+  schema(helper);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_s", "x", "vec_vs",
+      std::vector<std::vector<float>>{{0.0f, 0, 0, 0}})}, UpdateMessage::COMMIT).success);
+  auto bad = run("main", R"("collapse":{"field":"key_s","ops":{"child":{"top_docs":{"query":)"
+      + knn(1, true) + "}}}}", 1, false);
+  EXPECT_NE(std::string::npos, bad->errorMsg().find("enclosing collapse"));
+  auto good = run("main", R"("collapse":{"field":"key_s","ops":{"child":{"top_docs":{"collapse":"key_s","query":)"
+      + knn(1, true) + "}}}}", -1);
+  ASSERT_TRUE(good->ok()) << good->errorMsg();
+  const auto& table = *good->docList()->groups;
+  EXPECT_EQ(1, std::get<api::ArrVal>(table.ops.at("child")->kind).v[0].docList()->row_count);
 }

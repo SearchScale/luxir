@@ -513,6 +513,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.missing"></a>[`missing`](#field-luxir.collapse.missing) | 2 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
 | <a id="field-luxir.collapse.head_sort"></a>[`head_sort`](#field-luxir.collapse.head_sort) | 3 | [`SortSpec`](#message-luxir.sortspec) | repeated | Display member order; defaults to the list sort. |
 | <a id="field-luxir.collapse.get_number"></a>[`get_number`](#field-luxir.collapse.get_number) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
+| <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. |
 
 <a id="message-luxir.collectioncachecontrol"></a>
 
@@ -1015,6 +1016,7 @@ Columns aligned with a collapsed list's returned rows. Absent columns were not r
 | <a id="field-luxir.grouptable.keys"></a>[`keys`](#field-luxir.grouptable.keys) | 1 | [`GroupKey`](#message-luxir.groupkey) | repeated |  |
 | <a id="field-luxir.grouptable.counts"></a>[`counts`](#field-luxir.grouptable.counts) | 2 | `sint64` | repeated |  |
 | <a id="field-luxir.grouptable.ranks"></a>[`ranks`](#field-luxir.grouptable.ranks) | 3 | [`ArrVal`](#message-luxir.arrval) | repeated | One typed array per row; empty when the displayed member is the ranking member. |
+| <a id="field-luxir.grouptable.ops"></a>[`ops`](#field-luxir.grouptable.ops) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Each operation is an array aligned with keys, as in FacetResult.ops. |
 
 <a id="message-luxir.indexramstats"></a>
 

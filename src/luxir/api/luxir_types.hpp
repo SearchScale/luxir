@@ -534,6 +534,7 @@ struct Collapse {
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::span<const SortSpec> head_sort;
   bool get_number = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
 };
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -625,6 +626,7 @@ struct GroupTable {
   std::span<const GroupKey> keys;
   std::span<const int64_t> counts;
   std::span<const ArrVal> ranks;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
 };
 struct DocList {                                                // needs Column (map by value)
   std::optional<std::int64_t> found;

@@ -11,6 +11,7 @@
 #include <functional>
 #include "SearchOp.h"
 #include "luxir/util/Signal.h"
+#include "FacetExecution.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/QueryShape.h"
 #include "luxir/search/SearchOverrides.h"
@@ -563,8 +564,14 @@ public:
 
   CollapsePlan* collapse = nullptr;
   std::optional<SortPlan> headSort;
+  boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
+
+  void init() override {
+    SearchOp::init();
+    for (auto& [name, child] : groupOps) child->init();
+  }
   bool enrichGroups() const {
-    return collapse != nullptr && (topDocsProto.collapse->get_number || headSort.has_value())
+    return collapse != nullptr && (topDocsProto.collapse->get_number || headSort.has_value() || !groupOps.empty())
         && topCount > topDocsProto.offset;
   }
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
@@ -610,6 +617,7 @@ public:
     exactDomainPlan.releaseSegmentState(segment);
     domainVariants.releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
+    for (auto& [name, child] : groupOps) child->releaseSegmentState(segment);
   }
 
   bool facetBucketSharesSegmentState() const override {
@@ -628,7 +636,17 @@ public:
 
   class Calc : public SearchOp::Calculator {
   public:
+    // Page result columns live in the final response arena, pinned through
+    // all streaming batches. They are sliced only after every binding closes.
+    luxir::api::GroupTable* pageGroups = nullptr;
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+      auto& groups = thisOp().groupOps;
+      auto found = groups.find(sub->getOp().name);
+      if (found != groups.end() && found->second == &sub->getOp()) {
+        assert(pageGroups != nullptr);
+        assert(resp == op.req.lastResponse); // bucket children never stream
+        return build::opsSlot(pageGroups->ops, groups.size(), sub->getOp().name, resp->mr);
+      }
       auto* ourVal = parent->getTargetForSub(resp, this);
       assert(ourVal != nullptr);
       // Our DocList lives in our bucket slot when this TopDocs is a facet
@@ -710,6 +728,10 @@ public:
     MaxScoreAccumulator scoreAccumulator;
 
 
+    // Calc pins finalized eligibility and its replayable prepared SegmentSource
+    // from collection through all page-member/bucket execution. It releases the
+    // eligibility afterwards; the prepared Weight lives until Calc destruction.
+    // No query is prepared again, and no ranking floor is applied on replay.
     struct MemberReplay {
       RequestMemTracker& tracker;
       size_t ownedBytes = 0;
@@ -2861,28 +2883,87 @@ public:
             if (page->keys[slot].singleton) page->counts[slot] = 1;
             else ordinary = true;
           }
-          if (ordinary) {
-            CollapseMembers members(*qr.collapse, page->keys, qr.req.memoryTracker);
+          auto produce = [&](size_t segnum, std::span<const CollapseKey> keys,
+                             size_t begin, auto&& accept) {
+            auto& segment = qr.req.reader->segments()[segnum];
+            auto release = scope_guard([&]() noexcept { qr.releaseSegmentState(segment); });
+            MemPool pool;
+            std::optional<FieldSortCollector::ExpressionBindings> expressions;
+            if (headCollector) {
+              headCollector->setSegment(segment, &pool);
+              expressions.emplace(*headCollector, pool, segment);
+            }
+            CollapseMembers members(*qr.collapse, keys, qr.req.memoryTracker);
             Query::SegmentSource& source = calc.preparedWeight
                 ? static_cast<Query::SegmentSource&>(*calc.preparedWeight)
                 : static_cast<Query::SegmentSource&>(*qr.weight);
-            for (auto& segment : qr.req.reader->segments()) {
-              auto release = scope_guard([&]() noexcept { qr.releaseSegmentState(segment); });
-              MemPool pool;
-              std::optional<FieldSortCollector::ExpressionBindings> expressions;
-              if (headCollector) {
-                headCollector->setSegment(segment, &pool);
-                expressions.emplace(*headCollector, pool, segment);
-              }
-              members.forSegment(segment.ord,
-                  calc.memberReplay->domains[(size_t)segment.ord].get(), source,
-                  headCollector && (qr.topDocsProto.get_scores || qr.headSort->rankNeedsScores),
-                  [&](size_t slot, int32_t doc, float score) {
-                    page->counts[slot]++;
-                    if (headCollector) headCollector->fold(
-                        (int32_t)slot, heads[slot], segdoc(segment.ord, doc), score);
-                  });
+            members.forSegment(segment.ord, calc.memberReplay->domains[segnum].get(), source,
+                headCollector && (qr.topDocsProto.get_scores || qr.headSort->rankNeedsScores),
+                [&](size_t slot, int32_t doc, float score) {
+                  size_t pageSlot = begin + slot;
+                  page->counts[pageSlot]++;
+                  if (headCollector) headCollector->fold(
+                      (int32_t)pageSlot, heads[pageSlot], segdoc(segment.ord, doc), score);
+                  accept(slot, doc);
+                });
+          };
+          if (qr.groupOps.empty()) {
+            if (ordinary) for (size_t segnum = 0; segnum < qr.req.reader->segments().size(); segnum++) {
+              produce(segnum, page->keys, 0, [](size_t, int32_t) {});
             }
+          } else {
+            calc.pageGroups = build::allocMessage<luxir::api::GroupTable>(qr.req.lastResponse->mr);
+            std::vector<SearchOp*> children;
+            for (auto& [name, child] : qr.groupOps) children.push_back(child);
+            std::vector<SelectedFacetBucket<size_t>> buckets;
+            for (size_t slot = 0; slot < size; slot++) buckets.push_back({
+                .key = slot, .id = {}, .count = 0,
+                .owner = FacetOwnerSlot{(int32_t)slot},
+                .output = FacetOutputSlot{(int32_t)slot}});
+            // Both strategies share one exact replay scorer per segment/chunk.
+            // Treat them as JOINT: a domain-driven chunk must not be rescanned
+            // once per child/bucket. The executor bounds binding and domain state.
+            FacetBucketBlockExecutor::execute<size_t>(calc, children, buckets,
+                *qr.req.reader, FacetBucketProducer::JOINT,
+                [&](size_t segnum, auto block, FacetBucketFeed feed) {
+                  feedFacetBucketDomainChunks(qr.req.reader->segments()[segnum].maxDoc(), block,
+                      FACET_BUCKET_DOMAIN_BYTES, feed, [&](auto chunk) {
+                        std::pmr::vector<std::pmr::vector<int32_t>> docs(&page->resource);
+                        docs.resize(chunk.size());
+                        size_t begin = chunk.front().key;
+                        auto keys = std::span<const CollapseKey>(page->keys).subspan(begin, chunk.size());
+                        bool hasOrdinary = false;
+                        for (size_t slot = 0; slot < keys.size(); slot++) {
+                          if (!keys[slot].singleton) hasOrdinary = true;
+                          else if (page->heads[begin + slot].segment() == (int32_t)segnum) {
+                            docs[slot].push_back(page->heads[begin + slot].docId());
+                          }
+                        }
+                        if (hasOrdinary) produce(segnum, keys, begin,
+                            [&](size_t slot, int32_t doc) { docs[slot].push_back(doc); });
+                        // Transfer each domain with a charge pinned to its last
+                        // consumer, including children that retain input segments.
+                        struct DomainCharge {
+                          RequestMemTracker& tracker;
+                          size_t bytes;
+                          DomainCharge(RequestMemTracker& tracker, size_t bytes)
+                              : tracker(tracker), bytes(bytes) {
+                            tracker.charge(bytes, "collapse member state", "group bucket domain");
+                          }
+                          ~DomainCharge() { tracker.release(bytes); }
+                        };
+                        std::pmr::vector<DomainHandle> domains(&page->resource);
+                        domains.reserve(chunk.size());
+                        for (auto& members : docs) {
+                          auto charge = std::make_shared<DomainCharge>(qr.req.memoryTracker,
+                              sizeof(ArrDocSet) + members.size() * sizeof(int32_t));
+                          DomainHandle domain(std::make_unique<ArrDocSet>(
+                              std::vector<int32_t>(members.begin(), members.end())));
+                          domains.push_back(std::move(domain).retainedWith(std::move(charge)));
+                        }
+                        return domains;
+                      });
+                }, FacetBucketBlockExecutor::BINDING_BYTES);
           }
           if (headCollector) {
             for (size_t slot = 0; slot < size; slot++) {
@@ -2893,12 +2974,27 @@ public:
           }
         }
         calc.memberReplay.reset();
-        auto metadata = [&collector, scoreDocs, page, offset, &qr](luxir::api::DocList& list,
+        auto metadata = [&collector, scoreDocs, page, offset, &qr, groupResults = calc.pageGroups](luxir::api::DocList& list,
             int64_t begin, int64_t end, std::pmr::memory_resource& mr) {
           if (collector.groups->plan.getNumber) list.found_docs = collector.totalHits();
           auto* groupTable = build::allocMessage<luxir::api::GroupTable>(mr);
           list.groups = groupTable;
           auto& table = *groupTable;
+          if (groupResults) {
+            for (auto& [name, column] : groupResults->ops) {
+              auto* target = build::opsSlot(table.ops, groupResults->ops.size(), name, mr);
+              target->kind = column->kind;
+              std::visit([&](auto& array) {
+                using T = std::decay_t<decltype(array)>;
+                if constexpr (std::is_same_v<T, api::ArrVal> || std::is_same_v<T, api::ArrInt>
+                    || std::is_same_v<T, api::ArrFloat> || std::is_same_v<T, api::ArrDouble>
+                    || std::is_same_v<T, api::ArrStr> || std::is_same_v<T, api::ArrBin>
+                    || std::is_same_v<T, api::ArrVector>) {
+                  array.v = array.v.subspan((size_t)(begin - offset), (size_t)(end - begin));
+                } else { assert(false); }
+              }, target->kind);
+            }
+          }
           auto* keys = build::allocArray(table.keys, (size_t)(end - begin), mr);
           int64_t* counts = page && qr.topDocsProto.collapse->get_number
               ? build::allocArray(table.counts, (size_t)(end - begin), mr) : nullptr;

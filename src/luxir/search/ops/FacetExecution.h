@@ -232,7 +232,7 @@ void feedFacetBucketDomainChunks(
        chunkBegin += chunkBuckets) {
     auto chunk = block.subspan(
         chunkBegin, std::min(chunkBuckets, block.size() - chunkBegin));
-    std::vector<DomainHandle> domains = buildChunk(chunk);
+    auto domains = buildChunk(chunk);
     assert(domains.size() == chunk.size());
     for (size_t i = 0; i < chunk.size(); i++) {
       feed(chunkBegin + i, std::move(domains[i]));

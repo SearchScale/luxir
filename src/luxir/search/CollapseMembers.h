@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <functional>
 #include "luxir/search/Collapse.h"
 #include "luxir/search/SortField.h"
 #include "luxir/query/Query.h"
@@ -20,11 +19,11 @@ class CollapseMembers {
   RequestMemTracker& tracker;
   RequestMemResource resource;
 public:
-  using Visit = std::function<void(size_t, int32_t, float)>;
   CollapseMembers(const CollapsePlan& plan, std::span<const CollapseKey> keys,
                   RequestMemTracker& tracker);
+  template <typename Visit>
   void forSegment(int32_t segment, DocSet* eligibility,
-                  Query::SegmentSource& source, bool scores, const Visit& visit);
+                  Query::SegmentSource& source, bool scores, Visit&& visit);
 };
 
 // Cold response-stage evaluation. Emits the list's actual rank clauses (not
@@ -34,3 +33,5 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
                       std::pmr::memory_resource& mr);
 
 } // namespace luxir
+
+#include "CollapseMembers.inl"

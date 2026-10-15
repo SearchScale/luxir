@@ -250,6 +250,7 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
 }
 
 void appendOpVal(std::string& out, const luxir::api::Val& val);
+void appendFacetSlot(std::string& out, const luxir::api::Val& val, size_t i);
 
 // Document i is the merge of columns row i and docs[i] (see the DocList
 // contract); pure-rows and pure-columns are the degenerate cases.  Column
@@ -329,6 +330,12 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
       luxir::api::Val rank;
       rank.kind = docs.groups->ranks[i];
       appendOpVal(out, rank);
+    }
+    for (const auto& [name, column] : docs.groups->ops) {
+      out += ',';
+      appendJsonString(out, name);
+      out += ':';
+      appendFacetSlot(out, *column, i);
     }
     out += '}';
   }

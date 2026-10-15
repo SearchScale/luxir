@@ -592,14 +592,14 @@ TEST_F(AggregateExprTest, stringFacetInlineEmitsNullAndWarningOnFailure) {
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
   facet.expr("root", "sqrt(sum(x_i))");
-  facet.expr("missing", "sum(absent_i)");
+  facet.expr("absent", "sum(absent_i)");
   req->execute(false);
 
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
   ASSERT_NE(nullptr, result);
   const auto& roots = std::get<api::ArrVal>(result->ops.at("root")->kind).v;
-  const auto& missing = std::get<api::ArrVal>(result->ops.at("missing")->kind).v;
+  const auto& missing = std::get<api::ArrVal>(result->ops.at("absent")->kind).v;
   ASSERT_EQ(2u, roots.size());
   EXPECT_TRUE(roots[0].isNull());
   EXPECT_DOUBLE_EQ(2.0, roots[1].asDouble());

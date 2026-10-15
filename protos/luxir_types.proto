@@ -104,6 +104,8 @@ message Collapse {
   MissingPolicy missing = 2;
   repeated SortSpec head_sort = 3; // Display member order; defaults to the list sort.
   bool get_number = 4; // Count members of each returned group in the finalized match set.
+  // Per-group operations on matching members; facet count units start at docs.
+  map<string, SearchOp> ops = 5;
 }
 
 message TopDocs {
@@ -781,6 +783,8 @@ message GroupTable {
   repeated sint64 counts = 2;
   // One typed array per row; empty when the displayed member is the ranking member.
   repeated ArrVal ranks = 3;
+  // Each operation is an array aligned with keys, as in FacetResult.ops.
+  map<string, Val> ops = 4;
 }
 
 // A batch of returned documents.  Document i is the merge of columns row i

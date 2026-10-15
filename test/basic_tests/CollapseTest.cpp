@@ -938,3 +938,215 @@ TEST_F(CollapseTest, typedGroupRanks) {
     } else EXPECT_EQ(3.25, rank[0].asDouble());
   }
 }
+
+namespace {
+const api::Val& groupOp(const api::GroupTable& groups, std::string_view name, size_t row) {
+  return std::get<api::ArrVal>(groups.ops.at(name)->kind).v[row];
+}
+struct GroupCard {
+  std::string id;
+  int64_t count;
+  std::vector<std::string> variants;
+  std::vector<std::pair<std::string, float>> relevant;
+  double low, high, average;
+  std::map<std::string, int64_t> swatches;
+  bool operator==(const GroupCard&) const = default;
+};
+std::vector<GroupCard> groupCards(LocalReq& request) {
+  std::vector<GroupCard> cards;
+  for (auto* response : request.responses) {
+    const auto& list = *response->proto.ops.at("q")->docList();
+    const auto& groups = *list.groups;
+    for (auto& [name, column] : groups.ops) {
+      EXPECT_EQ((size_t)list.row_count, std::get<api::ArrVal>(column->kind).v.size()) << name;
+    }
+    for (size_t row = 0; row < list.docs.size(); row++) {
+      GroupCard card;
+      card.id = std::string(list.docs[row].fields.at("id")->asString());
+      card.count = groups.counts[row];
+      auto& variants = *groupOp(groups, "variants", row).docList();
+      for (auto& doc : variants.docs) {
+        card.variants.emplace_back(doc.fields.at("id")->asString());
+        EXPECT_EQ(nullptr, doc.fields.find("_score_"));
+      }
+      auto& relevant = *groupOp(groups, "relevant", row).docList();
+      for (auto& doc : relevant.docs) card.relevant.emplace_back(
+          doc.fields.at("id")->asString(), std::get<float>(doc.fields.at("_score_")->kind));
+      card.low = (double)groupOp(groups, "low", row).asInt();
+      card.high = (double)groupOp(groups, "high", row).asInt();
+      card.average = groupOp(groups, "average", row).asDouble();
+      auto& swatches = *groupOp(groups, "swatches", row).facetResult();
+      auto values = std::get<api::ColStr>(swatches.bucket_ids->kind).v;
+      for (size_t i = 0; i < values.size(); i++) card.swatches[std::string(values[i])] = swatches.counts[i];
+      cards.push_back(std::move(card));
+    }
+  }
+  return cards;
+}
+}
+
+TEST_F(CollapseTest, groupOpsMemberOracle) {
+  std::mt19937 random(2219);
+  std::vector<Doc> docs;
+  for (int i = 0; i < 72; i++) {
+    auto doc = flatdoc("id", "d" + std::to_string(i), "sort_i", (int64_t)(random() % 9),
+        "sort_s", "s" + std::to_string(random() % 3), "body_w",
+        i % 3 ? "alpha alpha beta" : "alpha beta beta");
+    if (i % 7) doc.emplace_back("key_s", "g" + std::to_string(random() % 7));
+    if (i % 5) doc.emplace_back("key_i", (int64_t)(random() % 3) - 1);
+    docs.push_back(std::move(doc));
+  }
+  SearchOverridesGuard strategy(collapseMemberStrategy, forcedFacetBucketBlockBuckets);
+  for (int segments : {1, 3}) {
+    std::string collection = "cards" + std::to_string(segments);
+    CollectionHelper helper(collection);
+    for (int s = 0; s < segments; s++) ASSERT_TRUE(helper.indexAll(
+        std::span<const Doc>(docs).subspan(s * docs.size() / segments, docs.size() / segments),
+        UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.deleteByIds({"d3", "d22"}, UpdateMessage::COMMIT).success);
+    for (std::string query : {"body_w:alpha", "body_w:alpha AND sort_i:>=4"}) {
+      auto cheap = run(collection, query, {}, -1, 0, 1, true, 1000, R"(["sort_i asc","id asc"])");
+      auto relevant = run(collection, query, {}, -1, 0, 1, true, 1000, R"("score desc")");
+      for (std::string sort : {R"("score desc")", R"("sort_i desc")"}) {
+        auto ranks = run(collection, query, {}, -1, 0, 1, true, 1000, sort);
+        for (auto fields : {std::vector<std::string>{"key_s"}, {"key_i"}, {"key_s", "key_i"}}) {
+          for (std::string policy : {"expand", "group", "drop"}) {
+            std::map<Key, GroupCard> byKey;
+            for (auto* response : cheap->responses) for (auto& doc : response->proto.ops.at("q")->docList()->docs) {
+              auto key = memberKey(doc, fields, policy);
+              auto& card = byKey[key];
+              double value = (double)doc.fields.at("sort_i")->asInt();
+              if (card.count++ == 0) card.low = card.high = card.average = value;
+              else { card.low = std::min(card.low, value); card.high = std::max(card.high, value); card.average += value; }
+              if (card.variants.size() < 3) card.variants.emplace_back(doc.fields.at("id")->asString());
+              card.swatches[std::string(doc.fields.at("sort_s")->asString())]++;
+            }
+            for (auto& [key, card] : byKey) card.average /= (double)card.count;
+            for (auto* response : relevant->responses) for (auto& doc : response->proto.ops.at("q")->docList()->docs) {
+              auto& card = byKey.at(memberKey(doc, fields, policy));
+              if (card.relevant.size() < 3) card.relevant.emplace_back(
+                  doc.fields.at("id")->asString(), std::get<float>(doc.fields.at("_score_")->kind));
+            }
+            std::vector<GroupCard> expected;
+            std::set<Key> seen;
+            for (auto* response : ranks->responses) for (auto& doc : response->proto.ops.at("q")->docList()->docs) {
+              auto key = memberKey(doc, fields, policy);
+              if (policy == "drop" && std::ranges::any_of(key.parts,
+                  [](const Part& part) { return std::holds_alternative<std::monostate>(part); })) continue;
+              if (!seen.insert(key).second) continue;
+              auto card = byKey.at(key);
+              card.id = card.variants.front();
+              expected.push_back(std::move(card));
+            }
+            auto collapse = spec(fields, policy);
+            collapse.pop_back();
+            collapse += R"JSON(,"get_number":true,"head_sort":["sort_i asc","id asc"],"ops":{"low":"min(sort_i)","high":"max(sort_i)","average":"avg(sort_i)","variants":{"top_docs":{"sort":["sort_i asc","id asc"],"fields":["id"],"document_format":"rows","limit":3}},"relevant":{"top_docs":{"query":")JSON" + query
+                + R"JSON(","get_scores":true,"fields":["id"],"document_format":"rows","limit":3}},"swatches":{"field_facet":{"field":"sort_s","limit":-1}}}})JSON";
+            for (auto forced : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN}) {
+              collapseMemberStrategy = forced;
+              forcedFacetBucketBlockBuckets = forced == CollapseMemberStrategy::DOMAIN ? 2 : 0;
+              for (int parallel : {1, -1}) {
+                SCOPED_TRACE(collection + query + sort + collapse + std::to_string(parallel));
+                auto actual = run(collection, query, collapse, -1, 0, parallel, true, 7, sort);
+                ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+                EXPECT_EQ(expected, groupCards(*actual));
+                if (policy == "group" && fields.size() == 2) {
+                  std::vector<GroupCard> pages;
+                  for (size_t offset = 0; offset < expected.size(); offset += 5) {
+                    auto page = run(collection, query, collapse, 5, (int64_t)offset, parallel, false, 1, sort);
+                    auto cards = groupCards(*page);
+                    pages.insert(pages.end(), cards.begin(), cards.end());
+                  }
+                  EXPECT_EQ(expected, pages);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(CollapseTest, groupOpsNestedAndCompleteStreamingBlocks) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_s", "x", "key_i", (int64_t)1, "sort_i", (int64_t)9, "sort_s", "red"),
+      flatdoc("id", "b", "key_s", "x", "key_i", (int64_t)1, "sort_i", (int64_t)3, "sort_s", "red"),
+      flatdoc("id", "c", "sort_i", (int64_t)8, "sort_s", "blue"),
+      flatdoc("id", "d", "key_s", "y", "sort_i", (int64_t)4, "sort_s", "red")}, UpdateMessage::COMMIT).success);
+  std::string collapse = R"JSON({"field":"key_s","get_number":true,"ops":{
+    "variants":{"top_docs":{"sort":"sort_i asc","fields":["id"],"document_format":"rows","limit":3}},
+    "swatches":{"field_facet":{"field":"sort_s","ops":{"low":"min(sort_i)"}}},
+    "prices":{"range_facet":{"field":"sort_i","start":0,"end":10,"gap":5,"ops":{"low":"min(sort_i)"}}},
+    "offers":{"query_facet":{"buckets":{"all":"*:*"},"ops":{"low":"min(sort_i)"}}},
+    "distinct":{"field_facet":{"field":"sort_s","count_distinct":{"field":"key_i"}}},
+    "grouped":{"top_docs":{"collapse":{"field":"key_i","missing":"group"},"fields":["id"],"limit":3}}
+  }})JSON";
+  auto actual = run("main", "*:*", collapse, -1, 0, -1, true, 1, R"("sort_i desc")");
+  ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+  ASSERT_EQ(3u, actual->responses.size());
+  const auto& groups = *actual->responses[0]->proto.ops.at("q")->docList()->groups;
+  const auto& swatches = *groupOp(groups, "swatches", 0).facetResult();
+  EXPECT_EQ((std::vector<int64_t>{2}), std::vector(swatches.counts.begin(), swatches.counts.end()));
+  EXPECT_EQ(3, std::get<api::ArrVal>(swatches.ops.at("low")->kind).v[0].asInt());
+  const auto& offers = *groupOp(groups, "offers", 0).facetResult();
+  EXPECT_EQ(2, offers.counts[0]);
+  const auto& prices = *groupOp(groups, "prices", 0).facetResult();
+  EXPECT_EQ((std::vector<int64_t>{1, 1}), std::vector(prices.counts.begin(), prices.counts.end()));
+  const auto& distinct = *groupOp(groups, "distinct", 0).facetResult();
+  EXPECT_EQ(1, distinct.counts[0]);
+  EXPECT_EQ(1, groupOp(groups, "grouped", 0).docList()->row_count);
+  auto body = renderSearchResponseBody(actual->responses[0]->proto, true);
+  EXPECT_NE(std::string::npos, body.find(R"("_group_":{"val":"x","count":2,)"));
+  EXPECT_NE(std::string::npos, body.find(R"("variants":{"docs":[{"id":"b"},{"id":"a"}])"));
+  auto runs = renderDocRuns(actual->responses[0]->proto);
+  ASSERT_EQ(1u, runs.size());
+  EXPECT_NE(std::string::npos, runs[0].body.find(R"("swatches":{"buckets":[{"val":"red","count":2,)"));
+  for (auto* response : actual->responses) {
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(response->proto, bytes));
+    size_t size = bytes.size(); bytes.resize(size + 16);
+    api::SearchResponse decoded;
+    std::pmr::monotonic_buffer_resource mr;
+    ASSERT_TRUE(api::decode(decoded, std::span(bytes).first(size), mr));
+    EXPECT_EQ(renderSearchResponseBody(response->proto, true), renderSearchResponseBody(decoded, true));
+  }
+  std::string canonical;
+  ASSERT_TRUE(api::write_json(actual->rawRequest(), canonical));
+  auto copy = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(copy->rawRequest(), canonical, copy->mr));
+  copy->testForcePrepare = true;
+  copy->execute(-1);
+  ASSERT_TRUE(copy->ok()) << copy->errorMsg();
+  ASSERT_EQ(actual->responses.size(), copy->responses.size());
+  for (size_t i = 0; i < actual->responses.size(); i++) {
+    EXPECT_EQ(renderSearchResponseBody(actual->responses[i]->proto, true),
+        renderSearchResponseBody(copy->responses[i]->proto, true));
+  }
+  api::Collapse replaced = *std::get<api::TopDocs>(actual->rawRequest().ops.at("q")->kind).collapse;
+  ASSERT_FALSE(replaced.ops.empty());
+  ASSERT_TRUE(api::read_json(replaced, R"("key_i")", actual->mr));
+  EXPECT_TRUE(replaced.ops.empty());
+}
+
+TEST_F(CollapseTest, bucketAndGroupOpNamesAndScope) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_s", "x", "sort_i", (int64_t)1)}, UpdateMessage::COMMIT).success);
+  auto reject = [&](std::string json, std::string_view message) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->execute();
+    EXPECT_FALSE(req->ok()) << json;
+    EXPECT_NE(std::string::npos, req->errorMsg().find(message)) << req->errorMsg();
+  };
+  for (std::string name : {"val", "count", "rank", "singleton", "missing"}) {
+    for (std::string parent : {R"("collapse":{"field":"key_s","ops":)",
+        R"("ops":{"f":{"field_facet":{"field":"key_s","ops":)"}) {
+      reject(R"JSON({"collection":"main",)JSON" + parent + "{\"" + name
+          + R"JSON(":"min(sort_i)"})JSON" + (parent.starts_with("\"collapse") ? "}}" : "}}}}"), "reserved");
+    }
+  }
+  reject(R"({"collection":"main","collapse":{"field":"key_s","ops":{"f":{"field_facet":{"field":"key_s","count_unit":"groups"}}}}})", "enclosing collapse");
+  reject(R"({"collection":"main","collapse":{"field":"key_s","ops":{"d":{"top_docs":{},"domain":{"query":"*:*"}}}}})", "domain is only supported");
+  reject(R"JSON({"collection":"main","ops":{"f":{"field_facet":{"field":"key_s","count_distinct":{"field":"key_s","ops":{"m":"count()"}}}}}})JSON", "only field and missing");
+}

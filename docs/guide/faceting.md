@@ -74,6 +74,12 @@ price, a publisher breakdown, and the two best documents of every category.
 The whole tree executes as part of the original request rather than as a
 follow-up query per bucket.
 
+Bucket operation names cannot be `val`, `count`, `rank`, `singleton` or
+`missing`; these names identify bucket and group metadata. The same children
+can run per returned group through
+[`collapse.ops`](searching.md#collapsing-results). Facets there count the
+group's matching documents by default.
+
 The operation kinds on this page:
 
 | Operation | Groups by |

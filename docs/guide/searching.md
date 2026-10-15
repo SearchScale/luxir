@@ -218,6 +218,33 @@ is true, `_group_.rank` contains the group's original sort values as a typed
 array in clause order. The row's `_score_` is the displayed member's own score.
 Omitting `head_sort` displays the ranking member and omits `_group_.rank`.
 
+Use `collapse.ops` for operations on each returned group's matching members.
+The results appear by name inside `_group_`, alongside `val`, `count` and
+`rank`. For example:
+
+```json
+"collapse": {
+  "field": "product_id_s",
+  "ops": {
+    "from_price": "min(price_i)",
+    "variants": {"top_docs": {"sort": "price_i asc", "limit": 3}},
+    "swatches": {"field_facet": {"field": "color_s", "limit": -1}}
+  }
+}
+```
+
+Group operations support the same metrics, facets, nested operations and
+`top_docs` as [facet bucket operations](faceting.md). Facets inside a group
+count documents by default, including nested facets; `count_distinct` can
+request another measure explicitly. An omitted child `top_docs.query` selects
+all members without relevance scores. Repeat the query in that child to rank
+members by relevance; the owning list's scores are not inherited. A child
+`knn.unit: "groups"` needs its own `collapse`.
+
+The names `val`, `count`, `rank`, `singleton` and `missing` are reserved in
+both group and facet bucket operations. A `domain` reset beneath a group or
+facet bucket is currently unsupported.
+
 Members come from this list's matching documents, including its filters and
 deletes. For kNN, only documents admitted into that query's candidate window
 are members; enrichment does not run another neighbor search or find the
@@ -228,7 +255,7 @@ Counts and head selection run only for groups on the returned page. Indexed
 keys can look up those groups directly; other keys or selective matches may
 require walking the matching documents. Cost grows with the page and its
 members. A request using only `collapse` performs no enrichment pass. Each
-streaming batch includes all group metadata for its rows.
+streaming batch includes complete group metadata and operation results for its rows.
 
 A key field uses value binding and must be single-valued. Supported types
 are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
@@ -833,7 +860,8 @@ output began aborts the chunked body so a conforming client sees truncation
 rather than a plausible partial success.
 
 Docs format uses row documents and accepts only `top_docs` and fusion
-operations without nested operations.
+operations without list-level operations. Per-group `collapse.ops` results
+stay inside each row's `_group_` object.
 
 ## Warnings and errors
 
@@ -870,7 +898,7 @@ preparation without collecting results. See
 
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Collapse on fusion sources and under fusion or facet buckets is unsupported.
-  Per-group `collapse.ops` is not yet supported.
+  Per-group `collapse.ops` uses the page's matching member domains.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets, metric facet sorts with
   distinct counts, and fusion beneath collapse are unsupported.
