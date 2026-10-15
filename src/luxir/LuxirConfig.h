@@ -144,7 +144,7 @@ struct ReplicationConfig {
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
   int64_t follower_timeout_ms = 90'000;
   std::string source;
-  std::string follower_id;
+  std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant
   // Comma-separated http:// nodes that serve verified file copies, tried in
   // order before the source; they never decide which commit is current.

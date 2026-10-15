@@ -148,12 +148,6 @@ struct PhraseQuery {
 };
 struct AllReplicas {};
 struct ReplicaRequirement { std::variant<std::monostate, uint32_t, AllReplicas> kind; };
-struct WaitForReplicasRequest {
-  std::string_view collection;
-  std::string_view commit;
-  std::optional<ReplicaRequirement> wait_for_replicas;
-  std::optional<uint64_t> wait_for_replicas_timeout_ms;
-};
 struct CommitParams {
   uint64_t commit_within_ms = 0;
   std::span<const std::string_view> build_aux_indexes;
@@ -180,11 +174,6 @@ struct ReplicaResult {
   std::optional<uint32_t> wanted;
   std::optional<uint32_t> serving;
   std::optional<Outcome> outcome;
-};
-
-struct WaitForReplicasResponse {
-  std::string_view commit;
-  std::optional<ReplicaResult> replicas;
 };
 
 struct CollectionCommit {
@@ -479,17 +468,21 @@ struct SchemaDef {
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
 struct SchemaResponse {
-  std::string_view commit; std::optional<SchemaDef> schema; };      // needs SchemaDef
+  std::string_view commit; std::optional<SchemaDef> schema; std::optional<ReplicaResult> replicas; };  // needs SchemaDef
 struct SchemaRequest {                                           // needs SchemaDef
   using Mode = luxir::api::SchemaRequest_::Mode;
   std::string_view collection;
   std::string_view tenant;
   std::optional<SchemaDef> schema;
+  std::optional<ReplicaRequirement> wait_for_replicas;
+  std::optional<uint64_t> wait_for_replicas_timeout_ms;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };
-struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; std::string_view tenant; };
+struct CreateCollectionRequest {
+  std::string_view name; std::optional<SchemaDef> schema; std::string_view tenant;
+  std::optional<ReplicaRequirement> wait_for_replicas; std::optional<uint64_t> wait_for_replicas_timeout_ms; };
 struct CreateCollectionResponse {
-  std::string_view commit; std::string_view name; };
+  std::string_view commit; std::string_view name; std::optional<ReplicaResult> replicas; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
@@ -772,7 +765,7 @@ LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXI
 LUXIR_TD(JemallocStats) LUXIR_TD(MemoryStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
-LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(WaitForReplicasRequest) LUXIR_TD(WaitForReplicasResponse) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
+LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
 #undef LUXIR_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
@@ -817,7 +810,7 @@ LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
 LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(MemoryStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
-LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(WaitForReplicasRequest) LUXIR_ENTRY(WaitForReplicasResponse) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)
+LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

@@ -1035,24 +1035,30 @@ TEST_F(GrpcIndexTest, pipelinedUpdatesEnableReplicaWaitAfterAdmission) {
   }
 }
 
-TEST_F(GrpcIndexTest, standaloneWaitReturnsTokenWithoutCommitting) {
-  CollectionHelper helper("main");
-  auto id = helper.collection().getShard()->getSnapshots().snapshot()->id;
-  auto token = id.token();
-  api::WaitForReplicasRequest request;
-  request.commit = token;
-  request.wait_for_replicas = api::ReplicaRequirement{uint32_t{1}};
-  request.wait_for_replicas_timeout_ms = 0;
-  Reply<api::WaitForReplicasResponse> response;
-  grpc::ClientContext first;
-  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::WaitForReplicas, &first, request, &response).ok());
-  EXPECT_EQ(token, response.msg.commit);
-  EXPECT_EQ(api::ReplicaResult::Outcome::TIMED_OUT, response.msg.replicas->outcome);
-  request.wait_for_replicas = api::ReplicaRequirement{api::AllReplicas{}};
-  grpc::ClientContext second;
-  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::WaitForReplicas, &second, request, &response).ok());
-  EXPECT_EQ(api::ReplicaResult::Outcome::SATISFIED, response.msg.replicas->outcome);
-  EXPECT_EQ(id, helper.collection().getShard()->getSnapshots().snapshot()->id);
+TEST_F(GrpcIndexTest, createAndSchemaWaitForReplicas) {
+  api::CreateCollectionRequest create;
+  create.name = "grpc_waits";
+  create.wait_for_replicas = api::ReplicaRequirement{};
+  Reply<api::CreateCollectionResponse> created;
+  grpc::ClientContext rejected;
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT,
+            hppUnaryCall(channel.get(), rpc::CreateCollection, &rejected, create, &created).error_code());
+  EXPECT_THROW(luxirNode->getCollection("grpc_waits"), CollectionNotFoundError);
+  create.wait_for_replicas = api::ReplicaRequirement{uint32_t{1}};
+  create.wait_for_replicas_timeout_ms = 0;
+  grpc::ClientContext creation;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::CreateCollection, &creation, create, &created).ok());
+  EXPECT_FALSE(created.msg.commit.empty());
+  EXPECT_EQ(api::ReplicaResult::Outcome::TIMED_OUT, created.msg.replicas->outcome);
+  api::SchemaRequest schema;
+  schema.collection = create.name;
+  schema.schema.emplace();
+  schema.wait_for_replicas = api::ReplicaRequirement{api::AllReplicas{}};
+  Reply<api::SchemaResponse> changed;
+  grpc::ClientContext update;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::SetSchema, &update, schema, &changed).ok());
+  EXPECT_GT(CommitId::parse(changed.msg.commit).index_gen, CommitId::parse(created.msg.commit).index_gen);
+  EXPECT_EQ(api::ReplicaResult::Outcome::SATISFIED, changed.msg.replicas->outcome);
 }
 
 TEST_F(GrpcIndexTest, updateBodyReleasedBeforeWaitAndClientCancellationDrains) {

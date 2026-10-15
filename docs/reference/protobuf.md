@@ -25,7 +25,6 @@ defaults and constraints are described in the comments and guides.
 
 | Method | Request | Response | Description |
 |---|---|---|---|
-| <a id="method-luxir.admin.waitforreplicas"></a>[`WaitForReplicas`](#method-luxir.admin.waitforreplicas) | [`WaitForReplicasRequest`](#message-luxir.waitforreplicasrequest) | [`WaitForReplicasResponse`](#message-luxir.waitforreplicasresponse) |  |
 | <a id="method-luxir.admin.setschema"></a>[`SetSchema`](#method-luxir.admin.setschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
@@ -165,8 +164,6 @@ defaults and constraints are described in the comments and guides.
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
 - [`Val`](#message-luxir.val)
 - [`Vector`](#message-luxir.vector)
-- [`WaitForReplicasRequest`](#message-luxir.waitforreplicasrequest)
-- [`WaitForReplicasResponse`](#message-luxir.waitforreplicasresponse)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
@@ -602,6 +599,8 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | <a id="field-luxir.createcollectionrequest.name"></a>[`name`](#field-luxir.createcollectionrequest.name) | 1 | `string` | singular |  |
 | <a id="field-luxir.createcollectionrequest.schema"></a>[`schema`](#field-luxir.createcollectionrequest.schema) | 2 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
 | <a id="field-luxir.createcollectionrequest.tenant"></a>[`tenant`](#field-luxir.createcollectionrequest.tenant) | 3 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant (the default tenant until credentials carry one). |
+| <a id="field-luxir.createcollectionrequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.createcollectionrequest.wait_for_replicas) | 4 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | All counts live followers subscribed to the tenant that serve any collection, since none serves the new one yet. |
+| <a id="field-luxir.createcollectionrequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.createcollectionrequest.wait_for_replicas_timeout_ms) | 5 | `uint64` | optional | absent = 30000 |
 
 <a id="message-luxir.createcollectionresponse"></a>
 
@@ -613,6 +612,7 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.createcollectionresponse.commit"></a>[`commit`](#field-luxir.createcollectionresponse.commit) | 2 | `string` | singular | exact snapshot published by creation |
 | <a id="field-luxir.createcollectionresponse.name"></a>[`name`](#field-luxir.createcollectionresponse.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.createcollectionresponse.replicas"></a>[`replicas`](#field-luxir.createcollectionresponse.replicas) | 3 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 
 <a id="message-luxir.deletecollectionrequest"></a>
 
@@ -1439,6 +1439,8 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 | <a id="field-luxir.schemarequest.tenant"></a>[`tenant`](#field-luxir.schemarequest.tenant) | 4 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant. |
 | <a id="field-luxir.schemarequest.mode"></a>[`mode`](#field-luxir.schemarequest.mode) | 2 | [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode) | singular |  |
 | <a id="field-luxir.schemarequest.schema"></a>[`schema`](#field-luxir.schemarequest.schema) | 3 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
+| <a id="field-luxir.schemarequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.schemarequest.wait_for_replicas) | 5 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | Updates only: as CommitParams.wait\_for\_replicas. |
+| <a id="field-luxir.schemarequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.schemarequest.wait_for_replicas_timeout_ms) | 6 | `uint64` | optional | absent = 30000 |
 
 <a id="message-luxir.schemaresponse"></a>
 
@@ -1450,6 +1452,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 |---|---|---|---|---|
 | <a id="field-luxir.schemaresponse.commit"></a>[`commit`](#field-luxir.schemaresponse.commit) | 2 | `string` | singular | exact snapshot published by a schema update |
 | <a id="field-luxir.schemaresponse.schema"></a>[`schema`](#field-luxir.schemaresponse.schema) | 1 | [`SchemaDef`](#message-luxir.schemadef) | singular | the resulting schema after the operation |
+| <a id="field-luxir.schemaresponse.replicas"></a>[`replicas`](#field-luxir.schemaresponse.replicas) | 3 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 
 <a id="message-luxir.searchop"></a>
 
@@ -1767,30 +1770,6 @@ A dense vector value. Dimensionality is the number of elements in f32.v.
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.vector.f32"></a>[`f32`](#field-luxir.vector.f32) | 1 | [`ArrFloat`](#message-luxir.arrfloat) | oneof [`kind`](#oneof-luxir.vector.kind) |  |
-
-<a id="message-luxir.waitforreplicasrequest"></a>
-
-### luxir.WaitForReplicasRequest
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.waitforreplicasrequest.collection"></a>[`collection`](#field-luxir.waitforreplicasrequest.collection) | 1 | `string` | singular | empty selects main |
-| <a id="field-luxir.waitforreplicasrequest.commit"></a>[`commit`](#field-luxir.waitforreplicasrequest.commit) | 2 | `string` | singular | existing durable commit token |
-| <a id="field-luxir.waitforreplicasrequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.waitforreplicasrequest.wait_for_replicas) | 3 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular |  |
-| <a id="field-luxir.waitforreplicasrequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.waitforreplicasrequest.wait_for_replicas_timeout_ms) | 4 | `uint64` | optional | absent = 30000 |
-
-<a id="message-luxir.waitforreplicasresponse"></a>
-
-### luxir.WaitForReplicasResponse
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.waitforreplicasresponse.commit"></a>[`commit`](#field-luxir.waitforreplicasresponse.commit) | 1 | `string` | singular |  |
-| <a id="field-luxir.waitforreplicasresponse.replicas"></a>[`replicas`](#field-luxir.waitforreplicasresponse.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 
 <a id="message-luxir.warning"></a>
 
