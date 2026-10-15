@@ -10,6 +10,7 @@
 #include "test/CollectionHelper.h"
 #include <barrier>
 #include <thread>
+#include <tuple>
 #include<boost/container/static_vector.hpp>
 
 namespace luxir {
@@ -228,11 +229,36 @@ TEST_F(FieldMetadataTest, firstUseRace) {
     EXPECT_EQ(FieldType::INT, infos[i]->type);
     EXPECT_EQ(1, infos[i]->docsWithField);
     EXPECT_EQ(1, infos[i]->numValues);
+    ASSERT_TRUE(infos[i]->columnBounds);
+    EXPECT_EQ(64, infos[i]->columnBounds->min);
+    EXPECT_EQ(64, infos[i]->columnBounds->max);
   }
   auto stats = reader->fieldCacheStats();
   EXPECT_EQ(1u, stats.pages);
   EXPECT_EQ(1u, stats.entries);
   RecordProperty("field_entry_bytes", (int)sizeof(PostingsReader::Field));
+}
+
+TEST_F(FieldMetadataTest, columnBoundsIncludeSparseAndMultipleValues) {
+  test::CollectionHelper helper;
+  helper.index(test::flatdoc("id", "one", "dense_i", INT64_MIN + 5,
+      "sparse_i", -4, "multi_is", std::vector<int64_t>{-100, 300}), UpdateMessage::NO_COMMIT);
+  helper.index(test::flatdoc("id", "two", "dense_i", 2,
+      "multi_is", std::vector<int64_t>{4, 4}), UpdateMessage::NO_COMMIT);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "three", "dense_i", INT64_MAX - 7,
+      "sparse_i", 9), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto& postings = reader->segments()[0].postingsReader();
+  ASSERT_FALSE(postings.fieldInfo("id")->columnBounds);
+  for (auto [name, low, high] : {std::tuple{"dense_i", INT64_MIN + 5, INT64_MAX - 7},
+                                {"sparse_i", (int64_t)-4, (int64_t)9},
+                                {"multi_is", (int64_t)-100, (int64_t)300}}) {
+    auto* field = postings.fieldInfo(name);
+    ASSERT_NE(nullptr, field);
+    ASSERT_TRUE(field->columnBounds);
+    EXPECT_EQ(low, field->columnBounds->min);
+    EXPECT_EQ(high, field->columnBounds->max);
+  }
 }
 
 TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {

@@ -182,6 +182,7 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     fields.readFieldInfo(*fresh);
     if (FieldType::sortsByIntColumn(fresh->type) && fresh->columnLoc.offset() > 0) {
       IntColReader column(*this, *fresh);
+      fresh->columnBounds = Field::ColumnBounds{column.getMin(), column.getMax()};
       if (column.leafBounded()) fresh->leafMeta = column.leafMeta();
     }
     if (slot.compare_exchange_strong(entry, fresh.get(),

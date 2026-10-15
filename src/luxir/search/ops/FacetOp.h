@@ -568,15 +568,14 @@ public:
   static GlobalRange scanGlobalRange(IndexReader& reader, IndexReader::FieldSegments infos) {
     GlobalRange r;
     for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
-      auto& postingsReader = reader.segments()[segnum].postingsReader();
       auto* info = infos.at(segnum);
       if (!info) continue;
       const auto& segFieldInfo = *info;
       if (segFieldInfo.numValues == 0) continue;
 
-      IntColReader intColReader(postingsReader, segFieldInfo);
-      r.min = std::min(r.min, intColReader.getMin());
-      r.max = std::max(r.max, intColReader.getMax());
+      assert(info->columnBounds);
+      r.min = std::min(r.min, info->columnBounds->min);
+      r.max = std::max(r.max, info->columnBounds->max);
     }
     if (r.min <= r.max) {
       // width = (#distinct values) - 1, computed unsigned: max-min can exceed

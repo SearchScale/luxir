@@ -48,6 +48,10 @@ class PostingsReader {
 
 public:
   struct Field : SegFieldInfo {
+    struct ColumnBounds {
+      int64_t min, max;
+    };
+    std::optional<ColumnBounds> columnBounds;
     // Field-sort planning reads every segment's leaf bounds. Keep the view
     // with the header rather than rebuilding it for each request.
     std::optional<NumColumnFormat::LeafMeta> leafMeta;
