@@ -20,6 +20,7 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/CollapseMembers.h"
 #include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/EmitDocs.h"
 #include "luxir/search/FieldSortCollector.h"
@@ -561,6 +562,11 @@ public:
   }
 
   CollapsePlan* collapse = nullptr;
+  std::optional<SortPlan> headSort;
+  bool enrichGroups() const {
+    return collapse != nullptr && (topDocsProto.collapse->get_number || headSort.has_value())
+        && topCount > topDocsProto.offset;
+  }
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::PlanningContext& planning;
   Query::Context* weightContext;
@@ -669,6 +675,10 @@ public:
           }
         }
       }
+      if (op.enrichGroups()) {
+        memberReplay = std::make_unique<MemberReplay>(op.req.memoryTracker,
+            op.req.reader->segments().size());
+      }
       requiresWholeIndexPrepare =
           op.weight != nullptr && op.weight->needsPrepare();
       for (auto* weight : op.filterWeights) {
@@ -699,6 +709,35 @@ public:
     AtomicMerger<MergeableCollector> collectorMerger;
     MaxScoreAccumulator scoreAccumulator;
 
+
+    struct MemberReplay {
+      RequestMemTracker& tracker;
+      size_t ownedBytes = 0;
+      RequestMemResource resource;
+      std::pmr::vector<DomainHandle> domains;
+      MemberReplay(RequestMemTracker& tracker, size_t segments)
+          : tracker(tracker), resource(tracker, "eligibility replay", "collapse member state"), domains(&resource) {
+        domains.resize(segments);
+      }
+      ~MemberReplay() { if (ownedBytes) tracker.release(ownedBytes); }
+      DomainHandle compose(std::vector<DomainHandle> parts, size_t setBytes) {
+        size_t count = std::ranges::count_if(parts, [](const auto& part) { return part.get() != nullptr; });
+        if (count <= 1) return DomainVariantPlan::compose(std::move(parts));
+        // Reserve intersection scratch before allocation; only its new owned
+        // result remains charged. Borrowed cache/live/parent sets keep their
+        // existing owners and accounting rather than being charged again.
+        size_t bytes = 3 * setBytes;
+        tracker.charge(bytes, "collapse member state", "retained eligibility");
+        auto release = scope_guard([&]() noexcept { tracker.release(bytes); });
+        auto result = DomainVariantPlan::compose(std::move(parts));
+        size_t retained = result.get()->ramBytesUsed();
+        assert(retained <= bytes);
+        bytes -= retained;
+        ownedBytes += retained;
+        return result;
+      }
+    };
+    std::unique_ptr<MemberReplay> memberReplay;
 
     // Produced domains for sub-ops. A result either owns an intersection /
     // collected set or borrows request-pinned cache state.
@@ -1794,6 +1833,25 @@ public:
           domain = domainHandle.get();
         }
 
+        if constexpr (Collapsed) {
+          if (memberReplay) {
+            // Retain precisely the eligibility used by collection. Prepared
+            // sources (notably kNN) outlive this pass and are replayed as-is.
+            if (!requiresWholeIndexPrepare && op.domainVariants.empty()
+                && !op.filterWeights.empty()) {
+              std::vector<DomainHandle> parts{domainHandle};
+              for (size_t i = 0; i < op.filterWeights.size(); i++) {
+                parts.push_back(QueryPrep::materializeEffectiveFilter(
+                    *op.filterWeights[i], op.filterUses[i], *op.req.reader, seg, nullptr));
+              }
+              domainHandle = memberReplay->compose(std::move(parts),
+                  op.domainVariants.estimatedSetBytes(seg.maxDoc()));
+              domain = domainHandle.get();
+            }
+            memberReplay->domains[(size_t)segnum] = domainHandle;
+          }
+        }
+
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         // Keep ownership until release so a scoring error cannot orphan it.
         data.reset(collectorMerger.obtain());
@@ -1993,7 +2051,7 @@ public:
           // may alias one directly, so the handles outlive collection below.
           std::vector<DomainHandle> filters;
           if (!requiresWholeIndexPrepare && op.domainVariants.empty()
-              && !thisOp().filterWeights.empty()) {
+              && !memberReplay && !thisOp().filterWeights.empty()) {
             std::vector<DocSet*> filterPtrs;
             for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
               filters.push_back(QueryPrep::materializeEffectiveFilter(
@@ -2743,20 +2801,130 @@ public:
     if (qr.collapse != nullptr) {
       auto emitGroups = [&](auto& collector) {
         auto scoreDocs = collector.sort();
-        auto metadata = [&collector, scoreDocs](luxir::api::DocList& list,
+        struct Page {
+          RequestMemTracker& tracker;
+          size_t tails = 0;
+          RequestMemResource resource;
+          std::pmr::vector<CollapseKey> keys;
+          std::pmr::vector<segdoc> heads;
+          std::pmr::vector<float> scores;
+          std::pmr::vector<int64_t> counts;
+          explicit Page(RequestMemTracker& tracker)
+              : tracker(tracker), resource(tracker, "page heads", "collapse member state"),
+                keys(&resource), heads(&resource), scores(&resource), counts(&resource) {}
+          ~Page() { if (tails) tracker.release(tails); }
+          void appendKey(const CollapseKey& key) {
+            // Inline tuples allocate nothing. Reserve the out-of-line copy's
+            // growth allowance before copying wider tuples, without changing
+            // the identity representation used by ordinary collection.
+            if (key.components.size() > 2) {
+              if (key.components.size() > std::numeric_limits<size_t>::max()
+                  / (2 * sizeof(CollapseKey::Component))) {
+                tracker.chargeOverflow("collapse member state", "page tuple components");
+              }
+              size_t bytes = 2 * key.components.size() * sizeof(CollapseKey::Component);
+              tracker.charge(bytes, "collapse member state", "page tuple components");
+              tails += bytes;
+            }
+            keys.push_back(key);
+          }
+        };
+        std::shared_ptr<Page> page;
+        int64_t offset = std::min<int64_t>(qr.topDocsProto.offset, (int64_t)scoreDocs.size());
+        if (calc.memberReplay && offset < (int64_t)scoreDocs.size()) {
+          page = std::make_shared<Page>(qr.req.memoryTracker);
+          size_t size = scoreDocs.size() - (size_t)offset;
+          page->keys.reserve(size);
+          page->heads.reserve(size);
+          page->scores.reserve(size);
+          page->counts.resize(size);
+          for (size_t i = (size_t)offset; i < scoreDocs.size(); i++) {
+            const auto& rank = scoreDocs[i];
+            page->appendKey(collector.groups->keys[(size_t)rank.slot]);
+            page->heads.push_back(rank.doc);
+            page->scores.push_back(rank.score);
+          }
+          std::unique_ptr<FieldSortCollector> headCollector;
+          std::pmr::vector<std::optional<FieldSortCollector::SortDoc>> heads(&page->resource);
+          if (qr.headSort) {
+            auto clauses = qr.headSort->clauses;
+            if (clauses.empty()) clauses.emplace_back(SortClause::SCORE, SortField::DESC);
+            headCollector = std::make_unique<FieldSortCollector>(
+                (int64_t)size, clauses, qr.req.reader.get(),
+                qr.topDocsProto.get_scores || qr.headSort->rankNeedsScores);
+            heads.resize(size);
+          }
+          // Expand singletons are already complete, including their score.
+          // They require neither a key lookup nor a member/scorer pass.
+          bool ordinary = false;
+          for (size_t slot = 0; slot < size; slot++) {
+            if (page->keys[slot].singleton) page->counts[slot] = 1;
+            else ordinary = true;
+          }
+          if (ordinary) {
+            CollapseMembers members(*qr.collapse, page->keys, qr.req.memoryTracker);
+            Query::SegmentSource& source = calc.preparedWeight
+                ? static_cast<Query::SegmentSource&>(*calc.preparedWeight)
+                : static_cast<Query::SegmentSource&>(*qr.weight);
+            for (auto& segment : qr.req.reader->segments()) {
+              auto release = scope_guard([&]() noexcept { qr.releaseSegmentState(segment); });
+              MemPool pool;
+              std::optional<FieldSortCollector::ExpressionBindings> expressions;
+              if (headCollector) {
+                headCollector->setSegment(segment, &pool);
+                expressions.emplace(*headCollector, pool, segment);
+              }
+              members.forSegment(segment.ord,
+                  calc.memberReplay->domains[(size_t)segment.ord].get(), source,
+                  headCollector && (qr.topDocsProto.get_scores || qr.headSort->rankNeedsScores),
+                  [&](size_t slot, int32_t doc, float score) {
+                    page->counts[slot]++;
+                    if (headCollector) headCollector->fold(
+                        (int32_t)slot, heads[slot], segdoc(segment.ord, doc), score);
+                  });
+            }
+          }
+          if (headCollector) {
+            for (size_t slot = 0; slot < size; slot++) {
+              if (!heads[slot]) continue; // singleton, already filled
+              page->heads[slot] = heads[slot]->doc;
+              page->scores[slot] = heads[slot]->score;
+            }
+          }
+        }
+        calc.memberReplay.reset();
+        auto metadata = [&collector, scoreDocs, page, offset, &qr](luxir::api::DocList& list,
             int64_t begin, int64_t end, std::pmr::memory_resource& mr) {
           if (collector.groups->plan.getNumber) list.found_docs = collector.totalHits();
-          auto* keys = build::allocArray(list.groups, (size_t)(end - begin), mr);
+          auto* groupTable = build::allocMessage<luxir::api::GroupTable>(mr);
+          list.groups = groupTable;
+          auto& table = *groupTable;
+          auto* keys = build::allocArray(table.keys, (size_t)(end - begin), mr);
+          int64_t* counts = page && qr.topDocsProto.collapse->get_number
+              ? build::allocArray(table.counts, (size_t)(end - begin), mr) : nullptr;
+          luxir::api::ArrVal* ranks = page && qr.headSort && qr.topDocsProto.get_scores
+              ? build::allocArray(table.ranks, (size_t)(end - begin), mr) : nullptr;
           MemPool pool;
           for (int64_t i = begin; i < end; i++) {
+            const auto& rank = scoreDocs[(size_t)i];
             collector.groups->plan.emit(keys[i - begin],
-                collector.groups->keys[(size_t)scoreDocs[(size_t)i].slot], mr, pool);
+                collector.groups->keys[(size_t)rank.slot], mr, pool);
+            size_t slot = (size_t)(i - offset);
+            if (counts) counts[i - begin] = page->counts[slot];
+            if (ranks && page->heads[slot] != rank.doc) {
+              emitCollapseRank(ranks[i - begin], qr.sortPlan,
+                  *qr.req.reader, rank.doc, rank.score, mr);
+            }
           }
         };
         emitDocsResponse(qr.req, getDocList,
           (int64_t)scoreDocs.size(),
-          [scoreDocs](int64_t i) { return scoreDocs[(size_t)i].doc; },
-          [scoreDocs](int64_t i) { return scoreDocs[(size_t)i].score; },
+          [scoreDocs, page, offset](int64_t i) {
+            return page ? page->heads[(size_t)(i - offset)] : scoreDocs[(size_t)i].doc;
+          },
+          [scoreDocs, page, offset](int64_t i) {
+            return page ? page->scores[(size_t)(i - offset)] : scoreDocs[(size_t)i].score;
+          },
           collector.groups->totalGroups(), qr.topDocsProto.fields,
           qr.topDocsProto.batch_size, qr.topDocsProto.offset,
           qr.topDocsProto.get_number, qr.topDocsProto.get_scores,

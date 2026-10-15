@@ -156,8 +156,9 @@ POST /collections/books/_search
 
 Use `collapse` to return one document per distinct key, such as one result
 per product when several matching documents describe the same product.
-Each group returns its best matching document according to `sort`, or by
-score when no sort is specified. For example:
+Groups rank by their best matching document according to `sort`, or by
+score when no sort is specified. That member is displayed unless `head_sort`
+selects another member. For example:
 
 ```json
 {
@@ -191,6 +192,44 @@ keys. Returning all groups or paging deeply also requires keeping more group
 heads in memory. Without totals, Luxir can skip documents whose ranking
 cannot reach the requested page.
 
+To display a different member while keeping the group's rank, set
+`collapse.head_sort`. It accepts the same clauses and expressions as `sort`,
+with document order resolving ties. For example, rank products by relevance
+and show their cheapest matching variant:
+
+```json
+{
+  "query": "title_t:jacket",
+  "get_scores": true,
+  "collapse": {
+    "field": "product_id_s",
+    "head_sort": ["price_i asc", "id asc"],
+    "get_number": true
+  },
+  "fields": ["id", "price_i"],
+  "limit": 10
+}
+```
+
+`collapse.get_number` adds `_group_.count`, the number of members in each
+returned group. This differs from the list's `get_number`, which returns
+totals before paging. When `head_sort` picks another member and `get_scores`
+is true, `_group_.rank` contains the group's original sort values as a typed
+array in clause order. The row's `_score_` is the displayed member's own score.
+Omitting `head_sort` displays the ranking member and omits `_group_.rank`.
+
+Members come from this list's matching documents, including its filters and
+deletes. For kNN, only documents admitted into that query's candidate window
+are members; enrichment does not run another neighbor search or find the
+other indexed documents with the same key. In group-unit kNN the window
+contains one witness per group, so every returned member count is one.
+
+Counts and head selection run only for groups on the returned page. Indexed
+keys can look up those groups directly; other keys or selective matches may
+require walking the matching documents. Cost grows with the page and its
+members. A request using only `collapse` performs no enrichment pass. Each
+streaming batch includes all group metadata for its rows.
+
 A key field uses value binding and must be single-valued. Supported types
 are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
 a column. Use an object to group by a tuple of fields:
@@ -212,8 +251,9 @@ Each returned document has `_group_`: `{"val":"P17"}` for one field,
 `expand`. String keys use indexed values; date keys use epoch milliseconds.
 Groups tied on all sort values follow their best member's document order,
 including documents grouped separately by `expand`. The best member within a
-group uses the same sort and document tiebreak. A collapsed list is the
-ordinary sorted list with later documents of the same key removed, before
+group uses the same sort and document tiebreak. With the default
+`head_sort`, a collapsed list is the ordinary sorted list with later
+documents of the same key removed, before
 applying offset and limit. To order tied groups by key, add an explicit sort
 clause on the key field, for example `"sort": ["score desc", "product_s asc"]`.
 
@@ -830,6 +870,7 @@ preparation without collecting results. See
 
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Collapse on fusion sources and under fusion or facet buckets is unsupported.
+  Per-group `collapse.ops` is not yet supported.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets, metric facet sorts with
   distinct counts, and fusion beneath collapse are unsupported.

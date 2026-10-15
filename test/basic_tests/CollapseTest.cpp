@@ -52,14 +52,14 @@ std::vector<Row> rows(LocalReq& request, bool collapsed) {
   std::vector<Row> result;
   for (auto* response : request.responses) {
     const auto& list = *response->proto.ops.at("q")->docList();
-    if (collapsed) { EXPECT_EQ(list.groups.size(), (size_t)list.row_count); }
+    if (collapsed) { EXPECT_EQ(list.groups->keys.size(), (size_t)list.row_count); }
     for (size_t i = 0; i < list.docs.size(); i++) {
       const auto& fields = list.docs[i].fields;
       Row row{std::string(fields.at("id")->asString()),
               fields.find("_score_") ? std::get<float>(fields.at("_score_")->kind) : 0.0f, {}, false};
       if (collapsed) {
-        row.singleton = list.groups[i].singleton.has_value();
-        for (const auto& component : list.groups[i].component) {
+        row.singleton = list.groups->keys[i].singleton.has_value();
+        for (const auto& component : list.groups->keys[i].component) {
           if (auto* s = std::get_if<std::string_view>(&component.value)) row.parts.emplace_back(std::string(*s));
           else if (auto* n = std::get_if<int64_t>(&component.value)) row.parts.emplace_back(*n);
           else row.parts.emplace_back();
@@ -223,15 +223,15 @@ TEST_F(CollapseTest, wireAndEmptyPages) {
   luxir::api::SearchResponse decoded;
   std::pmr::monotonic_buffer_resource arena;
   ASSERT_TRUE(luxir::api::decode(decoded, std::span(binary).first(size), arena));
-  EXPECT_EQ(2, decoded.ops.at("q")->docList()->groups.size());
-  EXPECT_EQ(INT64_MIN, std::get<int64_t>(decoded.ops.at("q")->docList()->groups[0].component[1].value));
+  EXPECT_EQ(2, decoded.ops.at("q")->docList()->groups->keys.size());
+  EXPECT_EQ(INT64_MIN, std::get<int64_t>(decoded.ops.at("q")->docList()->groups->keys[0].component[1].value));
   std::string listJson;
   ASSERT_TRUE(luxir::api::write_json(*req->docList(), listJson));
   luxir::api::DocList jsonList;
   ASSERT_TRUE(luxir::api::read_json(jsonList, listJson, arena)) << listJson;
-  EXPECT_EQ(2, jsonList.groups.size());
+  EXPECT_EQ(2, jsonList.groups->keys.size());
   EXPECT_EQ(3, jsonList.found_docs);
-  EXPECT_EQ(INT64_MIN, std::get<int64_t>(jsonList.groups[0].component[1].value));
+  EXPECT_EQ(INT64_MIN, std::get<int64_t>(jsonList.groups->keys[0].component[1].value));
   auto empty = run("main", "*:*", R"("key_s")", 10, 500);
   EXPECT_EQ(0, empty->docList()->row_count);
   EXPECT_EQ(500, empty->docList()->offset);
@@ -276,7 +276,7 @@ TEST_F(CollapseTest, fieldSortWire) {
       std::pmr::monotonic_buffer_resource arena;
       ASSERT_TRUE(luxir::api::decode(decoded, std::span(binary).first(size), arena));
       auto& list = *decoded.ops.at("q")->docList();
-      EXPECT_EQ((size_t)list.row_count, list.groups.size());
+      EXPECT_EQ((size_t)list.row_count, list.groups->keys.size());
       EXPECT_EQ(2, list.found);
       EXPECT_EQ(3, list.found_docs);
     }
@@ -338,8 +338,8 @@ TEST_F(CollapseTest, valueBindingAndCapabilities) {
   ASSERT_TRUE(helper.index(flatdoc("id", "b", "product", "abc"), UpdateMessage::COMMIT).success);
   auto req = run("main", "*:*", R"("product")");
   EXPECT_EQ(1, req->docList()->found);
-  ASSERT_EQ(1, req->docList()->groups.size());
-  EXPECT_EQ("abc", std::get<std::string_view>(req->docList()->groups[0].component[0].value));
+  ASSERT_EQ(1, req->docList()->groups->keys.size());
+  EXPECT_EQ("abc", std::get<std::string_view>(req->docList()->groups->keys[0].component[0].value));
   for (std::string collapse : {R"("unindexed")", R"("uncolumned")",
       R"({"field":["product","product__key"]})"}) {
     auto bad = localReq(luxirNode->getSearchEngine());
@@ -658,5 +658,283 @@ TEST_F(CollapseTest, constantPullStopsAtDistinctGroups) {
         EXPECT_EQ(missing == std::string_view("drop") ? 202 : 201, SkipStats::collapseDocsVisited);
       }
     }
+  }
+}
+
+namespace {
+using RankPart = std::variant<std::monostate, int64_t, double, float, std::string>;
+RankPart rankPart(const api::Val& value) {
+  return std::visit([](const auto& v) -> RankPart {
+    using T = std::decay_t<decltype(v)>;
+    if constexpr (std::is_same_v<T, std::string_view>) return std::string(v);
+    else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, double>
+                       || std::is_same_v<T, float>) return v;
+    else return {};
+  }, value.kind);
+}
+struct EnrichedRow {
+  std::string id;
+  float score;
+  int64_t count;
+  std::vector<RankPart> rank;
+  bool operator==(const EnrichedRow&) const = default;
+};
+Key memberKey(const api::Map& doc, const std::vector<std::string>& fields,
+              std::string_view policy) {
+  Key key;
+  bool missing = false;
+  for (const auto& field : fields) {
+    auto* value = doc.fields.find(field);
+    key.parts.push_back(part(value ? &**value : nullptr));
+    missing |= std::holds_alternative<std::monostate>(key.parts.back());
+  }
+  if (missing && policy == "expand") {
+    key.singleton = true;
+    key.parts = {std::string(doc.fields.at("id")->asString())};
+  }
+  return key;
+}
+std::vector<EnrichedRow> enrichedRows(LocalReq& request) {
+  std::vector<EnrichedRow> result;
+  for (auto* response : request.responses) {
+    const auto& list = *response->proto.ops.at("q")->docList();
+    EXPECT_EQ((size_t)list.row_count, list.groups->keys.size());
+    EXPECT_EQ((size_t)list.row_count, list.groups->counts.size());
+    for (size_t i = 0; i < list.docs.size(); i++) {
+      const auto& doc = list.docs[i];
+      EnrichedRow row{std::string(doc.fields.at("id")->asString()),
+          std::get<float>(doc.fields.at("_score_")->kind), list.groups->counts[i], {}};
+      if (!list.groups->ranks.empty()) {
+        for (const auto& value : list.groups->ranks[i].v) row.rank.push_back(rankPart(value));
+      }
+      result.push_back(std::move(row));
+    }
+  }
+  return result;
+}
+std::vector<EnrichedRow> memberOracle(LocalReq& rankDocs, LocalReq& headDocs,
+    const std::vector<std::string>& fields, std::string_view policy, bool fieldSort) {
+  std::map<Key, int64_t> counts;
+  std::map<Key, const api::Map*> heads;
+  for (auto* response : headDocs.responses) for (const auto& doc : response->proto.ops.at("q")->docList()->docs) {
+    auto key = memberKey(doc, fields, policy);
+    heads.try_emplace(key, &doc);
+    counts[key]++;
+  }
+  std::set<Key> seen;
+  std::vector<EnrichedRow> result;
+  for (auto* response : rankDocs.responses) for (const auto& doc : response->proto.ops.at("q")->docList()->docs) {
+    auto key = memberKey(doc, fields, policy);
+    if (policy == "drop" && std::ranges::any_of(key.parts,
+        [](const Part& p) { return std::holds_alternative<std::monostate>(p); })) continue;
+    if (!seen.insert(key).second) continue;
+    const auto& head = *heads.at(key);
+    std::string id(head.fields.at("id")->asString());
+    EnrichedRow row{id, std::get<float>(head.fields.at("_score_")->kind), counts.at(key), {}};
+    if (id != doc.fields.at("id")->asString()) {
+      auto* value = doc.fields.find(fieldSort ? "sort_i" : "_score_");
+      row.rank.push_back(value ? rankPart(**value) : RankPart{});
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+}
+
+TEST_F(CollapseTest, pageMemberOracle) {
+  std::mt19937 random(7319);
+  std::vector<Doc> docs;
+  for (int32_t i = 0; i < 90; i++) {
+    auto doc = flatdoc("id", "d" + std::to_string(i), "sort_i", (int64_t)(random() % 9),
+        "sort_s", "s" + std::to_string(random() % 5), "body_w",
+        i % 3 ? "alpha alpha beta" : "alpha beta beta");
+    if (i % 7) doc.emplace_back("key_s", "g" + std::to_string(random() % 11));
+    if (i % 5) doc.emplace_back("key_i", (int64_t)(random() % 4) - 2);
+    docs.push_back(std::move(doc));
+  }
+  SearchOverridesGuard strategy(collapseMemberStrategy);
+  for (int32_t segments : {1, 3}) {
+    std::string collection = "members" + std::to_string(segments);
+    CollectionHelper helper(collection);
+    for (int32_t s = 0; s < segments; s++) {
+      ASSERT_TRUE(helper.indexAll(std::span<const Doc>(docs).subspan(
+          (size_t)s * docs.size() / segments, docs.size() / segments), UpdateMessage::COMMIT).success);
+    }
+    ASSERT_TRUE(helper.deleteByIds({"d3", "d22"}, UpdateMessage::COMMIT).success);
+    for (std::string query : {"body_w:alpha", "body_w:alpha AND sort_i:>=4"}) {
+      for (bool fieldSort : {false, true}) {
+        std::string sort = fieldSort ? R"("sort_i desc")" : R"("score desc")";
+        auto rankDocs = run(collection, query, {}, -1, 0, 1, true, 1000, sort);
+        for (std::string head : {R"("sort_i asc")", R"(["sort_s desc","sort_i asc"])",
+                                 R"("add(sort_i,1) asc")", R"("score desc")"}) {
+          auto headDocs = run(collection, query, {}, -1, 0, 1, true, 1000, head);
+          for (const std::vector<std::string>& fields : {
+              std::vector<std::string>{"key_s"}, {"key_i"}, {"key_s", "key_i"}, {"key_s", "key_i", "sort_s"}}) {
+            for (auto policy : {"expand", "group", "drop"}) {
+              auto expected = memberOracle(*rankDocs, *headDocs, fields, policy, fieldSort);
+              auto collapse = spec(fields, policy);
+              collapse.pop_back(); collapse += R"(,"get_number":true,"head_sort":)" + head + '}';
+              for (auto strategy : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN}) {
+                collapseMemberStrategy = strategy;
+                for (int parallel : {1, -1}) {
+                  SCOPED_TRACE(collection + query + sort + head + collapse + std::to_string(parallel));
+                  auto actual = run(collection, query, collapse, -1, 0, parallel, true, 7, sort);
+                  EXPECT_EQ(expected, enrichedRows(*actual));
+                  if (!fieldSort && fields == std::vector<std::string>{"key_s"}
+                      && policy == std::string_view("group") && strategy == CollapseMemberStrategy::KEYS) {
+                    // List totals are off: ranking can prune, but enrichment
+                    // must replay later / lower-scoring members of page groups.
+                    auto page = run(collection, query, collapse, 2, 1, parallel, false, 1, sort);
+                    auto begin = expected.begin() + std::min<size_t>(1, expected.size());
+                    auto end = expected.begin() + std::min<size_t>(3, expected.size());
+                    EXPECT_EQ(std::vector<EnrichedRow>(begin, end), enrichedRows(*page));
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(CollapseTest, memberPagingWireAndRendering) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_s", "x", "sort_i", (int64_t)9),
+      flatdoc("id", "b", "key_s", "x", "sort_i", (int64_t)3),
+      flatdoc("id", "c", "sort_i", (int64_t)8),
+      flatdoc("id", "d", "key_s", "y", "sort_i", (int64_t)4)}, UpdateMessage::COMMIT).success);
+  std::string collapse = R"({"field":"key_s","get_number":true,"head_sort":"sort_i asc"})";
+  auto full = run("main", "*:*", collapse, -1, 0, -1, true, 1, R"("sort_i desc")");
+  api::Collapse replacement;
+  ASSERT_TRUE(api::read_json(replacement, collapse, full->mr));
+  ASSERT_TRUE(replacement.get_number);
+  ASSERT_TRUE(api::read_json(replacement, R"("key_i")", full->mr));
+  EXPECT_EQ("key_i", replacement.field[0]);
+  EXPECT_FALSE(replacement.get_number);
+  EXPECT_TRUE(replacement.head_sort.empty());
+  auto expected = enrichedRows(*full);
+  auto jsonRows = renderSearchResponseBody(full->responses[0]->proto, true);
+  EXPECT_NE(std::string::npos, jsonRows.find(R"("_group_":{"val":"x","count":2,"rank":[9]})"));
+  auto runs = renderDocRuns(full->responses[0]->proto);
+  ASSERT_EQ(1u, runs.size());
+  EXPECT_NE(std::string::npos, runs[0].body.find(R"("_group_":{"val":"x","count":2,"rank":[9]})"));
+  ASSERT_EQ(3u, expected.size());
+  EXPECT_EQ("b", expected[0].id);
+  EXPECT_EQ(2, expected[0].count);
+  EXPECT_EQ((std::vector<RankPart>{(int64_t)9}), expected[0].rank);
+  EXPECT_EQ(1, expected[1].count);
+  EXPECT_TRUE(expected[1].rank.empty());
+  std::vector<EnrichedRow> pages;
+  for (size_t offset = 0; offset < expected.size(); offset++) {
+    auto page = run("main", "*:*", collapse, 1, (int64_t)offset, -1, true, 1, R"("sort_i desc")");
+    auto values = enrichedRows(*page);
+    pages.insert(pages.end(), values.begin(), values.end());
+  }
+  EXPECT_EQ(expected, pages);
+  for (bool binary : {false, true}) {
+    auto copy = localReq(luxirNode->getSearchEngine());
+    std::string json;
+    std::vector<std::byte> data;
+    if (binary) {
+      ASSERT_TRUE(api::encode(full->rawRequest(), data));
+      size_t size = data.size(); data.resize(size + 16);
+      ASSERT_TRUE(api::decode(copy->rawRequest(), std::span(data).first(size), copy->mr));
+    } else {
+      ASSERT_TRUE(api::write_json(full->rawRequest(), json));
+      EXPECT_NE(std::string::npos, json.find("head_sort"));
+      ASSERT_TRUE(api::read_json(copy->rawRequest(), json, copy->mr));
+    }
+    copy->execute(-1);
+    ASSERT_TRUE(copy->ok()) << copy->errorMsg();
+    EXPECT_EQ(expected, enrichedRows(*copy));
+    for (auto* response : copy->responses) {
+      std::vector<std::byte> data;
+      ASSERT_TRUE(api::encode(response->proto, data));
+      size_t size = data.size(); data.resize(size + 16);
+      api::SearchResponse decoded;
+      std::pmr::monotonic_buffer_resource arena;
+      ASSERT_TRUE(api::decode(decoded, std::span(data).first(size), arena));
+      const auto& table = *decoded.ops.at("q")->docList()->groups;
+      EXPECT_EQ(table.keys.size(), table.counts.size());
+      EXPECT_EQ(table.keys.size(), table.ranks.size());
+    }
+  }
+}
+
+TEST_F(CollapseTest, countOnlyAndAlternateHeadsUseFinalizedFilters) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "key_s", "x", "sort_i", (int64_t)10, "eligible_s", "yes"),
+      flatdoc("id", "b", "key_s", "x", "sort_i", (int64_t)0, "eligible_s", "no"),
+      flatdoc("id", "c", "key_s", "x", "sort_i", (int64_t)7, "eligible_s", "yes")},
+      UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(disableTopDocsFilterFold, collapseMemberStats);
+  CollapseMemberStats stats;
+  collapseMemberStats = &stats;
+  for (bool passive : {false, true}) for (bool prepared : {false, true}) for (bool routed : {false, true}) {
+    disableTopDocsFilterFold = passive;
+    auto req = localReq(helper.getSearchEngine());
+    std::string json = R"({"collection":"main","sort":"sort_i desc","fields":["id"],"filter":[)";
+    json += routed ? R"({"query":"eligible_s:yes","except_ops":["keys"]})" : R"("eligible_s:yes")";
+    json += R"(],"collapse":{"field":"key_s","get_number":true,"head_sort":"sort_i asc"})";
+    if (routed) json += R"(,"ops":{"keys":{"field_facet":{"field":"key_s","count_unit":"docs"}}})";
+    json += '}';
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->testForcePrepare = prepared;
+    req->execute(-1);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& list = *req->docList();
+    EXPECT_EQ(2, list.groups->counts[0]);
+    EXPECT_EQ("c", std::get<api::ColStr>(list.columns.at("id").kind).v[0]);
+    EXPECT_TRUE(list.groups->ranks.empty()); // get_scores is off
+  }
+  stats.keySegments = 0; stats.domainSegments = 0;
+  auto plain = run("main", "*:*", R"("key_s")");
+  auto zero = run("main", "*:*", R"({"field":"key_s","get_number":true,"head_sort":"sort_i asc"})", 0);
+  EXPECT_EQ(0, stats.keySegments);
+  EXPECT_EQ(0, stats.domainSegments);
+  auto counts = run("main", "*:*", R"({"field":"key_s","get_number":true})");
+  EXPECT_EQ(3, counts->docList()->groups->counts[0]);
+  EXPECT_TRUE(counts->docList()->groups->ranks.empty());
+  auto scoreHead = run("main", "rescore(*:*, sub(0,sort_i))",
+      R"({"field":"key_s","head_sort":"score desc"})", -1, 0, -1, true, 13,
+      R"("sort_i desc")", false);
+  EXPECT_EQ("b", rows(*scoreHead, true)[0].id);
+  EXPECT_TRUE(scoreHead->docList()->groups->ranks.empty());
+  CollectionHelper singletons("singleton_members");
+  ASSERT_TRUE(singletons.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  stats.candidates = 0;
+  auto single = run("singleton_members", "*:*",
+      R"({"field":"key_s","get_number":true,"head_sort":"sort_i asc"})");
+  EXPECT_EQ(0, stats.candidates);
+  for (auto count : single->docList()->groups->counts) EXPECT_EQ(1, count);
+  SearchOverridesGuard budget(forcedRequestMemoryMaxBytes);
+  forcedRequestMemoryMaxBytes = 128;
+  auto limited = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(limited->rawRequest(),
+      R"({"collection":"main","collapse":{"field":"key_s","get_number":true}})", limited->mr));
+  limited->execute();
+  EXPECT_FALSE(limited->ok());
+  EXPECT_NE(std::string::npos, std::string(limited->errorMsg()).find("collapse member state"));
+}
+
+TEST_F(CollapseTest, typedGroupRanks) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "key_s", "x", "sort_i", INT64_MAX, "sort_s", "z", "sort_d", 3.25),
+      flatdoc("id", "b", "key_s", "x", "sort_i", INT64_MIN, "sort_s", "a", "sort_d", 0.5)},
+      UpdateMessage::COMMIT).success);
+  auto key = R"({"field":"key_s","head_sort":"sort_i asc","get_number":true})";
+  for (std::string sort : {R"(["sort_s desc","sort_i desc"])", R"("add(sort_d,0) desc")", R"("sort_d desc")"}) {
+    auto req = run("main", "*:*", key, -1, 0, -1, true, 10, sort);
+    ASSERT_TRUE(req->ok());
+    const auto& rank = req->docList()->groups->ranks[0].v;
+    ASSERT_FALSE(rank.empty());
+    if (rank.size() == 2) {
+      EXPECT_EQ("z", rank[0].asString());
+      EXPECT_EQ(INT64_MAX, rank[1].asInt());
+    } else EXPECT_EQ(3.25, rank[0].asDouble());
   }
 }

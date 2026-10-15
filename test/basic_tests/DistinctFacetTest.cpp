@@ -236,7 +236,7 @@ TEST_F(DistinctFacetTest, inheritedOverridesNearestCollapseAndChildLists) {
     const auto& child = *request->docList()->ops.at("child")->docList();
     EXPECT_EQ(1, child.row_count);
     EXPECT_EQ(3, child.found.value_or(-1));
-    EXPECT_TRUE(child.groups.empty());
+    EXPECT_TRUE(!child.groups);
     EXPECT_EQ(2, child.ops.at("c")->facetResult()->counts[0]);
     const auto& nearest = *request->docList()->ops.at("nearest")->docList();
     EXPECT_EQ(3, nearest.ops.at("c")->facetResult()->counts[0]);
@@ -255,7 +255,7 @@ TEST_F(DistinctFacetTest, inheritedOverridesNearestCollapseAndChildLists) {
     const auto& members = *std::get<api::ArrVal>(facet.ops.at("members")->kind).v[0].docList();
     EXPECT_EQ(1, members.row_count);
     EXPECT_EQ(3, members.found.value_or(-1));
-    EXPECT_TRUE(members.groups.empty());
+    EXPECT_TRUE(!members.groups);
     EXPECT_EQ(2, members.ops.at("c")->facetResult()->counts[0]);
   }
 }

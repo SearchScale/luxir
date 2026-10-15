@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstddef>
 #include <string_view>
+#include <string>
+#include <memory_resource>
 
 namespace luxir {
 
@@ -45,6 +47,30 @@ public:
 
   size_t ceiling() const { return maxBytes; }
   size_t peak() const { return peakBytes.load(std::memory_order_relaxed); }
+};
+
+// Actual allocation accounting, including container growth overlap.
+class RequestMemResource : public std::pmr::memory_resource {
+  RequestMemTracker& tracker;
+  std::string detail;
+  std::string breaker;
+
+  void* do_allocate(size_t bytes, size_t alignment) override {
+    tracker.charge(bytes, breaker, detail);
+    try { return std::pmr::new_delete_resource()->allocate(bytes, alignment); }
+    catch (...) { tracker.release(bytes); throw; }
+  }
+  void do_deallocate(void* p, size_t bytes, size_t alignment) override {
+    std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+    tracker.release(bytes);
+  }
+  bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+    return this == &other;
+  }
+public:
+  RequestMemResource(RequestMemTracker& tracker, std::string_view detail,
+                     std::string_view breaker = "facet distinct state")
+      : tracker(tracker), detail(detail), breaker(breaker) {}
 };
 
 } // namespace luxir

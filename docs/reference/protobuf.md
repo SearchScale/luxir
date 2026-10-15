@@ -116,6 +116,7 @@ defaults and constraints are described in the comments and guides.
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
+- [`GroupTable`](#message-luxir.grouptable)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
 - [`JemallocStats`](#message-luxir.jemallocstats)
@@ -510,6 +511,8 @@ Partition matching documents by an exact, single-valued key.
 |---|---|---|---|---|
 | <a id="field-luxir.collapse.field"></a>[`field`](#field-luxir.collapse.field) | 1 | `string` | repeated | One field, or an exact tuple. Uses value binding. |
 | <a id="field-luxir.collapse.missing"></a>[`missing`](#field-luxir.collapse.missing) | 2 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
+| <a id="field-luxir.collapse.head_sort"></a>[`head_sort`](#field-luxir.collapse.head_sort) | 3 | [`SortSpec`](#message-luxir.sortspec) | repeated | Display member order; defaults to the list sort. |
+| <a id="field-luxir.collapse.get_number"></a>[`get_number`](#field-luxir.collapse.get_number) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
 
 <a id="message-luxir.collectioncachecontrol"></a>
 
@@ -664,7 +667,7 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 |---|---|---|---|---|
 | <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Exact match count when get\_number was requested. For Fusion, counts distinct documents in the union of source ranked lists, before paging. |
 | <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when get\_number was requested, after missing=drop. |
-| <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupKey`](#message-luxir.groupkey) | repeated | Collapse only: exactly row\_count identities aligned with head rows. |
+| <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupTable`](#message-luxir.grouptable) | singular | Collapse only: complete metadata aligned with this batch's rows. |
 | <a id="field-luxir.doclist.columns"></a>[`columns`](#field-luxir.doclist.columns) | 3 | map&lt;`string`, [`Column`](#message-luxir.column)&gt; | map | Dense columns; each has exactly row\_count slots. |
 | <a id="field-luxir.doclist.docs"></a>[`docs`](#field-luxir.doclist.docs) | 5 | [`Map`](#message-luxir.map) | repeated | Per-document field maps. When present: exactly row\_count entries; docs\[i\] holds the fields of document i not represented as a dense column. A field name never appears in both columns and docs\[i\]. |
 | <a id="field-luxir.doclist.row_count"></a>[`row_count`](#field-luxir.doclist.row_count) | 6 | `int32` | singular | Number of documents in this batch, including rows with no returned fields. A count-only response has row\_count=0. |
@@ -998,6 +1001,20 @@ Typed collapse identity. Component types follow the resolved schema fields.
 |---|---|---|---|---|
 | <a id="field-luxir.groupkey.component"></a>[`component`](#field-luxir.groupkey.component) | 1 | [`GroupComponent`](#message-luxir.groupcomponent) | repeated |  |
 | <a id="field-luxir.groupkey.singleton"></a>[`singleton`](#field-luxir.groupkey.singleton) | 2 | `uint64` | optional | Present for missing=expand: reader-local document identity, not a key value. |
+
+<a id="message-luxir.grouptable"></a>
+
+### luxir.GroupTable
+
+Columns aligned with a collapsed list's returned rows. Absent columns were not requested.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.grouptable.keys"></a>[`keys`](#field-luxir.grouptable.keys) | 1 | [`GroupKey`](#message-luxir.groupkey) | repeated |  |
+| <a id="field-luxir.grouptable.counts"></a>[`counts`](#field-luxir.grouptable.counts) | 2 | `sint64` | repeated |  |
+| <a id="field-luxir.grouptable.ranks"></a>[`ranks`](#field-luxir.grouptable.ranks) | 3 | [`ArrVal`](#message-luxir.arrval) | repeated | One typed array per row; empty when the displayed member is the ranking member. |
 
 <a id="message-luxir.indexramstats"></a>
 

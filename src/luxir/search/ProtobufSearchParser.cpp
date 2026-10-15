@@ -605,6 +605,9 @@ public:
       }
     }
     if (facetReq.count_distinct) {
+      if (facetReq.count_distinct->get_number || !facetReq.count_distinct->head_sort.empty()) {
+        throw RequestError("count_distinct accepts only field and missing");
+      }
       auto* distinct = resolveCollapse(*facetReq.count_distinct, false);
       if (facetReq.count_unit) {
         bool same = measure != nullptr && measure->missing == distinct->missing
@@ -1587,6 +1590,10 @@ public:
     }
 
     auto parsedSorts = parseSorts(topDocsReq.sort);
+    std::optional<SortPlan> headSort;
+    if (topDocsReq.collapse && !topDocsReq.collapse->head_sort.empty()) {
+      headSort = parseSorts(topDocsReq.collapse->head_sort);
+    }
     auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
       req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
       &req.warnings,
@@ -1633,7 +1640,8 @@ public:
     // plan consumes score (default ranking, SCORE, or a score-dependent EXPR).
     int32_t requestFlags = 0;
     if (limit > 0
-        && (topDocsReq.get_scores || parsedSorts.rankNeedsScores)) {
+        && (topDocsReq.get_scores || parsedSorts.rankNeedsScores
+            || (headSort && headSort->rankNeedsScores))) {
       requestFlags |= Query::NEED_SCORES;
     }
     // Competitive-score pruning requires a score-ranked heap. Sub-ops permit
@@ -2000,6 +2008,7 @@ public:
       domainFilterWeights, residentExactDomainUses);
 
     qr->collapse = collapse;
+    qr->headSort = std::move(headSort);
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }

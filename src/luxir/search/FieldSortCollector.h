@@ -519,6 +519,7 @@ public:
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
   // SCORE, DOC, and EXPR apply direction in this clause walk.
+  template <bool Member = false>
   int compareRank(const SortDoc& docA, const SortDoc& docB,
               CompareSource source = CompareSource::LOCAL,
               const FieldCollector* other = nullptr) const {
@@ -528,7 +529,9 @@ public:
       switch (clause.descriptor.getKind()) {
         case SortClause::COLUMN:
           if (source == CompareSource::CURRENT_DOC) {
-            if constexpr (Collapsed) {
+            if constexpr (Member) {
+              cmp = clause.comparator->compareCurrent(docA.slot, docA.doc, docB.doc);
+            } else if constexpr (Collapsed) {
               // Segment ord comparators cache only the heap bottom. A
               // retained group's member can occupy any other slot.
               cmp = heapFull() && docA.slot == pq.top().slot
@@ -569,10 +572,11 @@ public:
   }
 
   // Groups and their members share the same rank, then document order.
+  template <bool Member = false>
   int compare(const SortDoc& docA, const SortDoc& docB,
               CompareSource source = CompareSource::LOCAL,
               const FieldCollector* other = nullptr) const {
-    int cmp = compareRank(docA, docB, source, other);
+    int cmp = compareRank<Member>(docA, docB, source, other);
     if (cmp != 0) return cmp;
     return (docA.doc > docB.doc) - (docA.doc < docB.doc);
   }
@@ -634,6 +638,16 @@ public:
         admit(bottom, doc, score);
       }
     }
+  }
+
+  // Independent bucket folds share precisely the list's sort semantics and
+  // slot storage, without constructing a heap or collector for every bucket.
+  void fold(int32_t slot, std::optional<SortDoc>& head, segdoc doc, float score) {
+    SortDoc candidate(doc, score, slot);
+    if (head && compare<true>(*head, candidate, CompareSource::CURRENT_DOC) <= 0) return;
+    ensureSlotCapacity((int64_t)slot + 1);
+    copy(slot, doc, score);
+    head = candidate;
   }
 
   struct CompetitiveRange {

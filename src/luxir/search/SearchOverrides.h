@@ -21,6 +21,14 @@
 
 namespace luxir {
 
+// Page-member traversal overrides affect work, never membership.
+enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN };
+inline CollapseMemberStrategy collapseMemberStrategy = CollapseMemberStrategy::AUTO;
+struct CollapseMemberStats {
+  std::atomic<int64_t> keySegments{0}, domainSegments{0}, candidates{0}, members{0};
+};
+inline CollapseMemberStats* collapseMemberStats = nullptr;
+
 // A/B baseline for measuring folded Boolean filters against the former passive
 // TopDocs domain path. Default false means folding is enabled.
 inline bool disableTopDocsFilterFold = false;

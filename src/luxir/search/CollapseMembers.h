@@ -1,0 +1,36 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <functional>
+#include "luxir/search/Collapse.h"
+#include "luxir/search/SortField.h"
+#include "luxir/query/Query.h"
+#include "luxir/search/RequestMemTracker.h"
+
+namespace luxir {
+
+// Page buckets, in rank order. The caller keeps the keys and the finalized
+// eligibility domains alive. The source is the SAME prepared source used by
+// collection, including the admitted kNN window; it is never prepared again.
+class CollapseMembers {
+  const CollapsePlan& plan;
+  std::span<const CollapseKey> keys;
+  RequestMemTracker& tracker;
+  RequestMemResource resource;
+public:
+  using Visit = std::function<void(size_t, int32_t, float)>;
+  CollapseMembers(const CollapsePlan& plan, std::span<const CollapseKey> keys,
+                  RequestMemTracker& tracker);
+  void forSegment(int32_t segment, DocSet* eligibility,
+                  Query::SegmentSource& source, bool scores, const Visit& visit);
+};
+
+// Cold response-stage evaluation. Emits the list's actual rank clauses (not
+// the head_sort clauses), with their native types and exact missing values.
+void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
+                      IndexReader& reader, segdoc doc, float score,
+                      std::pmr::memory_resource& mr);
+
+} // namespace luxir

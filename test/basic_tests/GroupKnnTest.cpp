@@ -442,3 +442,28 @@ TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
     EXPECT_EQ(truth, recovered);
   }
 }
+
+TEST_F(GroupKnnTest, enrichmentReplaysOnlyAdmittedMembers) {
+  CollectionHelper helper;
+  schema(helper);
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "key_s", "x", "price_i", (int64_t)4, "vec_vs", std::vector<std::vector<float>>{{0.0f, 0, 0, 0}}),
+      flatdoc("id", "b", "key_s", "x", "price_i", (int64_t)2, "vec_vs", std::vector<std::vector<float>>{{1.0f, 0, 0, 0}}),
+      flatdoc("id", "c", "key_s", "x", "price_i", (int64_t)0, "vec_vs", std::vector<std::vector<float>>{{50.0f, 0, 0, 0}}),
+      flatdoc("id", "d", "key_s", "y", "price_i", (int64_t)1, "vec_vs", std::vector<std::vector<float>>{{2.0f, 0, 0, 0}})},
+      UpdateMessage::COMMIT).success);
+  for (bool groups : {false, true}) for (int parallel : {1, -1}) {
+    auto actual = run("main", R"("limit":-1,"fields":["id"],"query":)" + knn(3, groups)
+        + R"(,"collapse":{"field":"key_s","get_number":true,"head_sort":"price_i asc"})", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    auto result = rows(*actual);
+    ASSERT_EQ(2u, result.size());
+    EXPECT_EQ(groups ? "a" : "b", result[0].first);
+    const auto& table = *actual->docList()->groups;
+    EXPECT_EQ(groups ? 1 : 2, table.counts[0]);
+    if (!groups) {
+      ASSERT_EQ(1u, table.ranks[0].v.size());
+      EXPECT_GT(std::get<float>(table.ranks[0].v[0].kind), result[0].second);
+    }
+  }
+}

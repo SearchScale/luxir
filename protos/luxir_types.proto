@@ -102,6 +102,8 @@ message Collapse {
     DROP = 2;   // Exclude documents missing any component.
   }
   MissingPolicy missing = 2;
+  repeated SortSpec head_sort = 3; // Display member order; defaults to the list sort.
+  bool get_number = 4; // Count members of each returned group in the finalized match set.
 }
 
 message TopDocs {
@@ -773,6 +775,14 @@ message GroupKey {
   optional uint64 singleton = 2;
 }
 
+// Columns aligned with a collapsed list's returned rows. Absent columns were not requested.
+message GroupTable {
+  repeated GroupKey keys = 1;
+  repeated sint64 counts = 2;
+  // One typed array per row; empty when the displayed member is the ranking member.
+  repeated ArrVal ranks = 3;
+}
+
 // A batch of returned documents.  Document i is the merge of columns row i
 // and docs[i]; all-columns (docs absent) and all-docs (columns empty) are
 // just the degenerate cases.  Which fields land where is a function of the
@@ -782,7 +792,7 @@ message DocList {
   // distinct documents in the union of source ranked lists, before paging.
   optional sint64 found = 1;
   optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
-  repeated GroupKey groups = 7; // Collapse only: exactly row_count identities aligned with head rows.
+  GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
 
   // Dense columns; each has exactly row_count slots.
   map<string, Column> columns = 3;

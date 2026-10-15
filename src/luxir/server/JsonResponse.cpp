@@ -302,9 +302,9 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
     }
   }
   if constexpr (Collapsed) {
-    assert(i < docs.groups.size());
+    assert(i < docs.groups->keys.size());
     if (!first) out += ',';
-    const auto& group = docs.groups[i];
+    const auto& group = docs.groups->keys[i];
     out += R"("_group_":{"val":)";
     if (group.singleton) {
       out += R"(null,"singleton":true)";
@@ -319,6 +319,16 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
         else out += "null";
       }
       if (tuple) out += ']';
+    }
+    if (!docs.groups->counts.empty()) {
+      out += R"(,"count":)";
+      appendInt(out, docs.groups->counts[i]);
+    }
+    if (!docs.groups->ranks.empty() && !docs.groups->ranks[i].v.empty()) {
+      out += R"(,"rank":)";
+      luxir::api::Val rank;
+      rank.kind = docs.groups->ranks[i];
+      appendOpVal(out, rank);
     }
     out += '}';
   }
@@ -339,7 +349,7 @@ void appendDocs(std::string& out, const luxir::api::DocList& docs) {
       appendDocObject<Collapsed>(out, plan, docs, i);
     }
   };
-  if (docs.groups.empty()) appendRows.template operator()<false>();
+  if (!docs.groups) appendRows.template operator()<false>();
   else appendRows.template operator()<true>();
   out += ']';
 }
@@ -612,7 +622,7 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp) {
             run.body += '\n';
           }
         };
-        if (dl->groups.empty()) appendRows.template operator()<false>();
+        if (!dl->groups) appendRows.template operator()<false>();
         else appendRows.template operator()<true>();
       }
     }

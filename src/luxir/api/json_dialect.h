@@ -993,6 +993,8 @@ struct from<JSON, luxir::api::Collapse> {
     };
     if ((char)*it == '"') {
       value.missing = luxir::api::Collapse_::MissingPolicy::EXPAND;
+      value.head_sort = {};
+      value.get_number = false;
       readFields(it, end);
       return;
     }
@@ -1003,6 +1005,11 @@ struct from<JSON, luxir::api::Collapse> {
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
+          else if (key == "get_number") util::from_json<O>(value.get_number, ctx, vit, vend);
+          else if (key == "head_sort") {
+            decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, value.head_sort);
+            readSortList<O>(sort, ctx, vit, vend);
+          }
           else { ctx.error = error_code::unknown_key; return true; }
           return bool(ctx.error);
         }, [](auto &, auto &) {});
