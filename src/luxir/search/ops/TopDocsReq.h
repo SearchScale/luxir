@@ -1166,8 +1166,7 @@ public:
             *op.req.reader,
             std::span<DocSet* const>(
                 domainViews.data(), domainViews.size()),
-            tg != nullptr
-          };
+            tg != nullptr, &op.req};
           ownedWeight = op.weight->prepare(context);
           variantWeight = ownedWeight.get();
         }
@@ -1219,8 +1218,7 @@ public:
         }
       }
       Query::Weight::PrepareContext liveContext{
-        *op.req.reader, liveDomains, tg != nullptr
-      };
+        *op.req.reader, liveDomains, tg != nullptr, &op.req};
       auto preparedExtras = QueryPrep::prepareFilterSources(
           extraWeights, extraUses, liveContext);
       for (size_t i = 0; i < extraSources.size(); i++) {
@@ -1285,7 +1283,7 @@ public:
 
       preparedDomainVariants = op.domainVariants.prepareResetVariants(
           preparedDomainSources, eligibility, liveDomains,
-          *op.req.reader, tg != nullptr,
+          *op.req.reader, tg != nullptr, &op.req,
           [&](size_t variant, size_t segnum) {
             auto& segment = op.req.reader->segments()[segnum];
             return op.domainVariants.reserveVariantPreparation(
@@ -1315,8 +1313,7 @@ public:
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
         baseDomains,
-        tg != nullptr
-      };
+        tg != nullptr, &op.req};
       bool routed = !op.domainVariants.empty();
       bool mainNeedsPrepare = op.weight != nullptr
           && (op.wholeMembershipPlan.preparesMainWeight(*op.weight)
@@ -1355,8 +1352,7 @@ public:
           *op.req.reader,
           std::span<DocSet* const>(
               liveDomains.data(), liveDomains.size()),
-          tg != nullptr
-        };
+          tg != nullptr, &op.req};
         if (op.domainVariants.needsResetParentFilters()) {
           preparedResetFilterSources = QueryPrep::prepareFilterSources(
               op.filterWeights, op.filterUses, liveCtx);
@@ -1381,8 +1377,7 @@ public:
             *op.req.reader,
             std::span<DocSet* const>(
                 effectiveDomainViews.data(), effectiveDomainViews.size()),
-            tg != nullptr
-          };
+            tg != nullptr, &op.req};
           if (op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
             preparedWeight =
                 op.wholeMembershipPlan.prepareMainWeight(queryCtx);
@@ -1410,8 +1405,7 @@ public:
       Query::Weight::PrepareContext queryCtx{
         *op.req.reader,
         std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &op.req};
       if (op.weight != nullptr
           && op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
         preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);

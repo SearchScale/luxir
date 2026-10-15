@@ -7,6 +7,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 #include "luxir/api/build.h"
@@ -15,6 +16,7 @@
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/OrdMapStr.h"
 #include "luxir/search/ops/DomainIter.h"
+#include "luxir/util/luxir_util.h"
 
 namespace luxir {
 
@@ -128,7 +130,9 @@ class CollapseKeyReader {
 public:
   explicit CollapseKeyReader(const CollapsePlan& plan) : plan(plan) {}
 
-  void setSegment(int32_t segment) {
+  // Kept out of line, like the collectors' group admission below: inlined
+  // into their document loops, these cost the loops registers.
+  LUXIR_NOINLINE void setSegment(int32_t segment) {
     lastDoc = -1;
     columns.clear();
     columns.resize(plan.fields.size());
@@ -148,7 +152,7 @@ public:
     }
   }
 
-  const CollapseKey* read(int32_t segment, int32_t doc, bool localOrds = false) {
+  LUXIR_NOINLINE const CollapseKey* read(int32_t segment, int32_t doc, bool localOrds = false) {
     // Bound-order and seeded field drivers may rewind within a segment.
     // Reset presence cursors only on an actual backward read; looking ahead
     // over a missing value must retain the future position.
@@ -370,11 +374,33 @@ public:
     });
   }
 
+  // The same forward walk, exposing structural keys to bounded admission.
+  // Scalar values keep their full width; missing handling stays in finishKey.
+  template <typename Visit>
+  void withKeyWalk(int32_t segment, DocSet* domain, Visit&& visit) {
+    withWalk(segment, domain, [&](auto read) {
+      using Identity = std::invoke_result_t<decltype(read), int32_t>;
+      if constexpr (std::is_same_v<Identity, const CollapseKey*>) visit(read);
+      else {
+        CollapseKey key;
+        visit([&](int32_t doc) -> const CollapseKey* {
+          auto identity = read(doc);
+          key.components.resize(1);
+          if constexpr (std::is_same_v<Identity, int64_t>) key.components[0] = {true, identity};
+          else key.components[0] = {identity.kind == GroupIdentity::VALUE,
+              identity.kind == GroupIdentity::VALUE ? identity.value : 0};
+          return plan.finishKey(key, !key.components[0].present, segment, doc);
+        });
+      }
+    });
+  }
+
 };
 
 // Only retained identities are interned for ranking: state is O(topCount).
 // Exhaustive totals have a separate bitmap (one ordinal key) or exact set.
-class CollapseAdmission {
+template <bool Single = true>
+class GroupAdmission {
   // The lookup table owns only slot indexes. Hash/equality read the one key
   // owned by each stable slot, including after the vector's storage grows.
   struct SlotHash {
@@ -390,6 +416,14 @@ class CollapseAdmission {
     bool operator()(size_t slot, const CollapseKey& key) const { return (*keys)[slot] == key; }
     bool operator()(const CollapseKey& key, size_t slot) const { return (*this)(slot, key); }
   };
+  struct CappedState {
+    size_t perKey = 1;
+    std::vector<boost::container::small_vector<size_t, 4>> members;
+    std::vector<size_t> entryKeys;
+    std::vector<size_t> freeKeys;
+  };
+  struct SingleState {};
+  [[no_unique_address]] std::conditional_t<Single, SingleState, CappedState> caps;
   bool segmentLocal = false;
   std::vector<CollapseKey> localKeys;
   std::vector<uint8_t> localAvailable;
@@ -398,23 +432,26 @@ public:
   CollapseKeyReader reader;
   std::vector<CollapseKey> keys;
   boost::unordered_flat_set<size_t, SlotHash, SlotEqual> retained;
-  std::vector<uint64_t> seenOrds;
-  boost::unordered_flat_set<CollapseKey, CollapseKeyHash> seenKeys;
-  int64_t singletons = 0;
-
-  explicit CollapseAdmission(const CollapsePlan& plan)
+  explicit GroupAdmission(const CollapsePlan& plan, size_t perKey = 1)
       : plan(plan), reader(plan), retained(0, SlotHash{&keys}, SlotEqual{&keys}) {
-    if (plan.getNumber && plan.fields.size() == 1 && plan.fields[0].ordinal()) {
-      seenOrds.resize((size_t)(((plan.fields[0].ords ? plan.fields[0].ords->numOrds() : 0) + 1 + 63) / 64));
-    }
+    if constexpr (Single) assert(perKey == 1);
+    else { assert(perKey > 0); caps.perKey = perKey; }
+  }
+
+  const CollapseKey& keyAt(size_t slot) const {
+    if constexpr (Single) return keys[slot];
+    else return keys[caps.entryKeys[slot]];
   }
 
   // Hash/equality callbacks point to the key vectors, whose addresses are stable.
-  CollapseAdmission(const CollapseAdmission&) = delete;
-  CollapseAdmission& operator=(const CollapseAdmission&) = delete;
+  GroupAdmission(const GroupAdmission&) = delete;
+  GroupAdmission& operator=(const GroupAdmission&) = delete;
 
   void setSegment(int32_t segment, int64_t depth, int64_t sourceCost = -1) {
     reader.setSegment(segment);
+    // Runtime caps use one global key per retained key record. The existing
+    // cap-one collector alone uses retained-key segment remapping.
+    if constexpr (!Single) return;
     if (sourceCost < 0) sourceCost = plan.reader.segments()[(size_t)segment].maxDoc();
     // Exact totals need every global identity; remapping just retained groups
     // cannot replace that work. Facet walks also keep their global key space.
@@ -446,6 +483,147 @@ public:
     for (size_t slot = 0; slot < keys.size(); slot++) retained.insert(slot);
   }
 
+  // Capped top-N is mergeable, including perKey=1 collapse. Fix a document d:
+  // for each key, the number of locally admissible documents better than d is
+  // at most the global number. A partition's capped top-N therefore contains
+  // every document of the global capped top-N lying in it. Union then recut
+  // is exact and associative. Rank ties must use the same document order.
+  // Callers reject against the global floor BEFORE decoding the key: a hit
+  // that cannot beat that floor cannot improve a retained key either.
+  template <typename Queue, typename Item, typename Better, typename Write,
+            typename SameEntry = decltype([](const auto&) { return false; })>
+  bool admit(const CollapseKey& key, Queue& heap, Item candidate,
+             Better&& better, Write&& write, SameEntry sameEntry = {}) {
+    if constexpr (Single) {
+      // The collapse collectors' original shape: improve in place, fill, or
+      // replace the floor through top()/updateTop().
+      auto found = retained.find(key);
+      if (found != retained.end()) {
+        size_t slot = *found;
+        auto& member = heap.atSlot(slot);
+        if (!better(member)) return false;
+        write(slot, true);
+        candidate.slot = slot;
+        member = candidate;
+        heap.updateSlot(slot);
+      } else if (heap.size() < heap.capacity()) {
+        size_t slot = heap.size();
+        retain(key, slot);
+        write(slot, false);
+        candidate.slot = slot;
+        heap.insert(candidate);
+      } else {
+        if (heap.capacity() == 0) return false;
+        auto& bottom = heap.top();
+        if (!better(bottom)) return false;
+        size_t slot = (size_t)bottom.slot;
+        retain(key, slot);
+        write(slot, false);
+        candidate.slot = slot;
+        bottom = candidate;
+        heap.updateTop();
+      }
+      return true;
+    } else {
+      if (heap.capacity() == 0 ||
+          (heap.size() == heap.capacity() && !better(heap.top()))) return false;
+      auto found = retained.find(key);
+      size_t keyIndex = found == retained.end() ? SIZE_MAX : *found;
+      size_t slot = SIZE_MAX;
+      if (keyIndex != SIZE_MAX) {
+        auto& members = caps.members[keyIndex];
+        // Repeated vector candidates/merge rounds may name the same document.
+        // Updating it must not consume another place under the key's cap.
+        for (size_t member : members) {
+          if (sameEntry(heap.atSlot(member))) { slot = member; break; }
+        }
+        if (slot == SIZE_MAX && members.size() == caps.perKey) {
+          slot = members.front();
+          for (size_t member : members) {
+            if (heap.precedes(heap.atSlot(slot), heap.atSlot(member))) slot = member;
+          }
+        }
+        if (slot != SIZE_MAX) {
+          if (!better(heap.atSlot(slot))) return false;
+          write(slot, true);
+          candidate.slot = slot;
+          heap.atSlot(slot) = candidate;
+          heap.updateSlot(slot);
+          return true;
+        }
+      }
+      slot = heap.size() < heap.capacity() ? heap.size() : (size_t)heap.top().slot;
+      if (slot < caps.entryKeys.size()) {
+        size_t oldKey = caps.entryKeys[slot];
+        auto& members = caps.members[oldKey];
+        auto member = std::find(members.begin(), members.end(), slot);
+        assert(member != members.end());
+        *member = members.back();
+        members.pop_back();
+        if (members.empty()) {
+          retained.erase(oldKey);
+          caps.freeKeys.push_back(oldKey);
+          if (oldKey == keyIndex) keyIndex = SIZE_MAX;
+        }
+      } else caps.entryKeys.push_back(SIZE_MAX);
+      if (keyIndex == SIZE_MAX) {
+        if (caps.freeKeys.empty()) {
+          keyIndex = keys.size();
+          keys.push_back(key);
+          caps.members.emplace_back();
+        } else {
+          keyIndex = caps.freeKeys.back();
+          caps.freeKeys.pop_back();
+          keys[keyIndex] = key;
+        }
+        retained.insert(keyIndex);
+      }
+      caps.entryKeys[slot] = keyIndex;
+      caps.members[keyIndex].push_back(slot);
+      write(slot, false);
+      candidate.slot = slot;
+      if (slot == heap.size()) heap.insert(candidate);
+      else { heap.atSlot(slot) = candidate; heap.updateSlot(slot); }
+      return true;
+    }
+  }
+
+  size_t retain(const CollapseKey& key, size_t slot) requires Single {
+    if (slot < keys.size() && (!segmentLocal || localAvailable[slot])) retained.erase(slot);
+    if (slot == keys.size()) keys.push_back(key);
+    else keys[slot] = key;
+    if (segmentLocal) {
+      if (slot == localKeys.size()) {
+        localKeys.push_back(key);
+        localAvailable.push_back(true);
+      } else {
+        localKeys[slot] = key;
+        localAvailable[slot] = true;
+      }
+      // Local hits of retained groups never translate. Only admission of a
+      // new group needs a global identity for output and cross-worker merge.
+      reader.globalize(keys[slot]);
+    }
+    retained.insert(slot);
+    return slot;
+  }
+};
+
+// Exact totals belong to document collapse collection, not to bounded group
+// admission itself. Vector search uses GroupAdmission without allocating an
+// unused ordinal-count bitmap just because its enclosing list requests totals.
+class CollapseAdmission : public GroupAdmission<> {
+public:
+  std::vector<uint64_t> seenOrds;
+  boost::unordered_flat_set<CollapseKey, CollapseKeyHash> seenKeys;
+  int64_t singletons = 0;
+
+  explicit CollapseAdmission(const CollapsePlan& plan) : GroupAdmission<>(plan) {
+    if (plan.getNumber && plan.fields.size() == 1 && plan.fields[0].ordinal()) {
+      seenOrds.resize((size_t)(((plan.fields[0].ords ? plan.fields[0].ords->numOrds() : 0) + 1 + 63) / 64));
+    }
+  }
+
   void count(const CollapseKey& key) {
     if (!plan.getNumber) return;
     if (key.singleton) { singletons++; return; }
@@ -468,25 +646,6 @@ public:
     seenKeys.insert(other.seenKeys.begin(), other.seenKeys.end());
   }
 
-  size_t retain(const CollapseKey& key, size_t slot) {
-    if (slot < keys.size() && (!segmentLocal || localAvailable[slot])) retained.erase(slot);
-    if (slot == keys.size()) keys.push_back(key);
-    else keys[slot] = key;
-    if (segmentLocal) {
-      if (slot == localKeys.size()) {
-        localKeys.push_back(key);
-        localAvailable.push_back(true);
-      } else {
-        localKeys[slot] = key;
-        localAvailable[slot] = true;
-      }
-      // Local hits of retained groups never translate. Only admission of a
-      // new group needs a global identity for output and cross-worker merge.
-      reader.globalize(keys[slot]);
-    }
-    retained.insert(slot);
-    return slot;
-  }
 };
 
 } // namespace luxir

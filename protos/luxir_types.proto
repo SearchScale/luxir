@@ -290,18 +290,24 @@ message RescoreQuery {
 message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
   Vector query = 2;        // query vector - must match the field's dims
-  int32 k = 3;             // number of nearest-neighbor documents to return; must be positive
+  int32 k = 3;             // nearest documents (default) or groups to return; must be positive
 
   // Require exact top-k results by scanning stored vectors. Cost is linear
   // in the number of stored vectors; refine_candidates and ivf are ignored.
   bool exact = 4;
 
-  // Candidate-pool size for full-precision rescoring of ANN results, before
-  // collapsing multiple vectors to one hit per document. Clamped up to k;
+  // Candidate-document pool size for full-precision rescoring of ANN results,
+  // in both units. Group search caps the number of candidates per group so
+  // repeated keys cannot consume the whole pool. Clamped up to k;
   // 0 selects an adaptive default. Larger pools can improve recall at a cost
   // in memory and latency. Fewer candidates may be available.
   int32 refine_candidates = 5;
   Ivf ivf = 6; // ignored for exact search and segments without an IVF index
+
+  // docs (default): k counts documents. groups: k counts nearest groups under
+  // the enclosing top_docs collapse key and missing policy; requires collapse.
+  // The match set contains one best scored witness per selected group.
+  string unit = 7;
 
   // Search effort for IVF indexes.
   message Ivf {

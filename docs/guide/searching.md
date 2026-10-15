@@ -217,6 +217,16 @@ ordinary sorted list with later documents of the same key removed, before
 applying offset and limit. To order tied groups by key, add an explicit sort
 clause on the key field, for example `"sort": ["score desc", "product_s asc"]`.
 
+For vector retrieval, set `knn.unit: "groups"` to select `k` nearest groups
+before list paging. The default `docs` unit selects `k` documents and can
+underfill after collapse. `refine_candidates` counts candidate documents in
+both units; group search limits each group's share before rescoring several
+members and selecting its best. Each selected group contributes one scored witness
+to the query's match set; child operations see those witnesses. See
+[Nearest groups](vector-search.md#nearest-groups) for exact/ANN behavior and
+underfill diagnostics. Wrapping the kNN node in boolean or rescore queries
+does not change its unit, and list offset/limit do not enlarge its window.
+
 Streaming batches preserve the association between each document and its
 group. The protobuf `DocList.groups` table contains typed keys aligned with
 the returned rows. With `format=docs`, every document includes `_group_` and
@@ -823,8 +833,9 @@ preparation without collecting results. See
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets, metric facet sorts with
   distinct counts, and fusion beneath collapse are unsupported.
-- kNN selects `k` documents before collapse, so repeated keys can produce
-  fewer than `k` groups.
+- Document-unit kNN selects `k` documents before collapse, so repeated keys
+  can produce fewer than `k` groups. Group-unit kNN selects groups, with ANN
+  recall and underfill subject to candidate and IVF effort limits.
 - Ordered page-after pagination is not implemented. `offset` skips the first
   matching documents (or collapsed groups) in ranked order, and collection
   retains up to `offset + limit` documents or group heads, so deep pages cost more. An offset past the

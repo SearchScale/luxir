@@ -1068,10 +1068,11 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 |---|---|---|---|---|
 | <a id="field-luxir.knnquery.field"></a>[`field`](#field-luxir.knnquery.field) | 1 | `string` | singular | vector field name (e.g. "embedding\_v") |
 | <a id="field-luxir.knnquery.query"></a>[`query`](#field-luxir.knnquery.query) | 2 | [`Vector`](#message-luxir.vector) | singular | query vector - must match the field's dims |
-| <a id="field-luxir.knnquery.k"></a>[`k`](#field-luxir.knnquery.k) | 3 | `int32` | singular | number of nearest-neighbor documents to return; must be positive |
+| <a id="field-luxir.knnquery.k"></a>[`k`](#field-luxir.knnquery.k) | 3 | `int32` | singular | nearest documents (default) or groups to return; must be positive |
 | <a id="field-luxir.knnquery.exact"></a>[`exact`](#field-luxir.knnquery.exact) | 4 | `bool` | singular | Require exact top-k results by scanning stored vectors. Cost is linear in the number of stored vectors; refine\_candidates and ivf are ignored. |
-| <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-pool size for full-precision rescoring of ANN results, before collapsing multiple vectors to one hit per document. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
+| <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
+| <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
 
 <a id="message-luxir.knnquery.ivf"></a>
 

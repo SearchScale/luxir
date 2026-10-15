@@ -21,6 +21,7 @@
 #include <luxir/util/heap.h>
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
+#include "ExecutionWarnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
@@ -1523,10 +1524,11 @@ public:
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
       bool parallel;
+      ExecutionWarnings* warnings;
 
       PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-                     bool parallel) noexcept
-        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel) {}
+                     bool parallel, ExecutionWarnings* warnings) noexcept
+        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings) {}
     };
 
     /// Immutable result of prepare() for segment-scorer creation after

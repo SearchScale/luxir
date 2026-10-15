@@ -5337,7 +5337,7 @@ public:
       Query::Weight::PrepareContext childCtx{
         ctx.reader,
         std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size()),
-        ctx.parallel};
+        ctx.parallel, ctx.warnings};
       auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
       auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
       auto prohibitedSources = QueryPrep::prepareFilterSources(

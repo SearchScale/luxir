@@ -157,25 +157,10 @@ class ScoreCollector {
 
   void offer(const CollapseKey& key, segdoc doc, float score) requires Collapsed {
     if (topCount == 0 || score < minCompetitiveVal) return;
-    auto found = groups->retained.find(key);
-    if (found != groups->retained.end()) {
-      size_t slot = *found;
-      auto& member = pq.atSlot((size_t)slot);
-      // Group and member rank ties both use document order.
-      if (score < member.score || (score == member.score && doc >= member.doc)) return;
-      member = {score, doc, slot};
-      pq.updateSlot((size_t)slot);
-    } else if (pq.size() < (size_t)topCount) {
-      size_t slot = groups->retain(key, pq.size());
-      pq.insert({score, doc, slot});
-    } else {
-      const auto& bottom = pq.top();
-      if (score < bottom.score || (score == bottom.score
-          && doc >= bottom.doc)) return;
-      size_t slot = groups->retain(key, bottom.slot);
-      pq.top() = {score, doc, slot};
-      pq.updateTop();
-    }
+    ScoreDoc candidate{score, doc, 0};
+    groups->admit(key, pq, candidate,
+        [&](const ScoreDoc& head) { return scoreAndDocComp(candidate, head); },
+        [](size_t, bool) {});
     if (pq.size() == (size_t)topCount) minCompetitiveVal = pq.top().score;
   }
 

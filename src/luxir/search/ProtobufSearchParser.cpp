@@ -482,6 +482,7 @@ public:
             req.requestPool, *req.schema, req.arena,
             CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
             name, &req.warnings, &fields};
+          parseContext.collapse = enclosingCollapse;
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -1478,16 +1479,6 @@ public:
 
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
-    ProtobufQueryParser parser(parseContext);
-    // An absent query selects all documents: the domain is then whatever the
-    // filters carve out (browse / filter-only search). Boolean normalization
-    // eliminates the match-all when filters fold in beside it.
-    Query* query = topDocsReq.query.has_value()
-      ? parser.parse(*topDocsReq.query)
-      : req.requestPool.make<AllQuery>();
     CollapsePlan* collapse = nullptr;
     if (topDocsReq.collapse) {
       if (placement == TopDocsPlacement::FUSION_SOURCE) {
@@ -1498,6 +1489,17 @@ public:
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
     }
+    ParseContext parseContext{
+      req.requestPool, *req.schema, req.arena,
+      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
+    parseContext.collapse = enclosingCollapse;
+    ProtobufQueryParser parser(parseContext);
+    // An absent query selects all documents: the domain is then whatever the
+    // filters carve out (browse / filter-only search). Boolean normalization
+    // eliminates the match-all when filters fold in beside it.
+    Query* query = topDocsReq.query.has_value()
+      ? parser.parse(*topDocsReq.query)
+      : req.requestPool.make<AllQuery>();
     Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
     if (offset < 0) {

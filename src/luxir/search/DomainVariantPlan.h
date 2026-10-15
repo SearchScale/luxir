@@ -670,7 +670,7 @@ public:
       std::vector<QueryPrep::PreparedSource>& preparedSources,
       const std::vector<std::vector<DomainHandle>>& eligibility,
       std::span<DocSet* const> canonicalDomains,
-      IndexReader& reader, bool parallel, Reserve&& reserve) const {
+      IndexReader& reader, bool parallel, ExecutionWarnings* warnings, Reserve&& reserve) const {
     auto segments = reader.segments();
     assert(preparedSources.size() == sourceCount());
     assert(eligibility.size() == segments.size());
@@ -745,8 +745,7 @@ public:
         Query::Weight::PrepareContext context{
           reader,
           std::span<DocSet* const>(views.data(), views.size()),
-          parallel
-        };
+          parallel, warnings};
         std::array<Query::Weight*, 1> weights{sourceWeight(source)};
         std::array<FilterCache::Use*, 1> uses{sourceUse(source)};
         auto prepared = QueryPrep::prepareFilterSources(
@@ -789,8 +788,7 @@ public:
           Query::Weight::PrepareContext context{
             reader,
             std::span<DocSet* const>(views.data(), views.size()),
-            parallel
-          };
+            parallel, warnings};
           ownedWeight = sourceWeight(source)->prepare(context);
           variantWeight = ownedWeight.get();
         }

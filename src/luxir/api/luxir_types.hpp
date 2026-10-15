@@ -481,6 +481,7 @@ struct KnnQuery {                                                // needs Vector
   int32_t k = 0;
   int32_t refine_candidates = 0;
   bool exact = false;
+  std::string_view unit;
 };
 struct SchemaDef {
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;

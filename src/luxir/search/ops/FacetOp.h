@@ -1874,8 +1874,7 @@ public:
       Query::Weight::PrepareContext context{
         *queryOp().req.reader,
         std::span<DocSet* const>(domains.data(), domains.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &queryOp().req};
       preparedSources = QueryPrep::prepareSources(
           queryOp().bucketWeights, context);
       assert(preparedSources.size() == queryOp().bucketCount());

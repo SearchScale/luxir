@@ -3033,7 +3033,7 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
                          0, segments * 16, 0, !approximate);
           auto* weight = query.createWeight(context, Query::NEED_SCORES);
           std::vector<DocSet*> domains(segments, nullptr);
-          Query::Weight::PrepareContext prepare(*reader, domains, parallel);
+          Query::Weight::PrepareContext prepare(*reader, domains, parallel, nullptr);
           std::unique_ptr<Query::Weight::PreparedWeight> prepared;
           int64_t spawns;
           {
@@ -3081,7 +3081,7 @@ TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
       KnnQuery query("embedding_v", fieldType, queryVec, 10, 4, 160, 1, false);
       auto* weight = query.createWeight(context, Query::NEED_SCORES);
       std::array<DocSet*, 1> domains{nullptr};
-      Query::Weight::PrepareContext prepare(*reader, domains, parallel);
+      Query::Weight::PrepareContext prepare(*reader, domains, parallel, nullptr);
       std::unique_ptr<Query::Weight::PreparedWeight> prepared;
       int64_t spawns;
       {

@@ -378,6 +378,8 @@ public:
     return out;
   }
 
+  bool precedes(const T& a, const T& b) const { return comp(a, b); }
+
   /// Call this to re-heapify after top() was modified
   void updateTop() {
     if constexpr (Indexed) siftDown(0);

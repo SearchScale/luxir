@@ -1281,38 +1281,22 @@ private:
     setBottom();
   }
 
+  // Out of line, as the uncollapsed admit() above: collect() must stay
+  // small enough to inline into the document loops.
   template <typename Rank, typename Write>
-  bool admitGroup(const CollapseKey& key, SortDoc candidate, Rank&& rank,
+  LUXIR_NOINLINE bool admitGroup(const CollapseKey& key, SortDoc candidate, Rank&& rank,
                   Write&& write) requires Collapsed {
-    auto found = groups->retained.find(key);
-    int32_t slot;
-    bool update = found != groups->retained.end();
-    if (update) {
-      slot = (int32_t)*found;
-      const auto& head = pq.atSlot((size_t)slot);
-      int cmp = rank(head);
-      if (cmp < 0 || (cmp == 0 && head.doc <= candidate.doc)) return false;
-    } else if (!heapFull()) {
-      slot = (int32_t)pq.size();
-      ensureSlotCapacity(slot + 1);
-      groups->retain(key, (size_t)slot);
-    } else {
-      const auto& bottom = pq.top();
-      int cmp = rank(bottom);
-      if (cmp < 0 || (cmp == 0 && bottom.doc <= candidate.doc)) return false;
-      slot = bottom.slot;
-      groups->retain(key, (size_t)slot);
-    }
-    // Improving a non-bottom member cannot change the heap root or its
-    // cached ordinal. Avoid re-seeking a foreign bottom term on that path.
-    bool bottomChanged = !update || (heapFull() && slot == pq.top().slot);
-    write(slot);
-    candidate.slot = slot;
-    if ((size_t)slot == pq.size()) pq.insert(candidate);
-    else {
-      pq.atSlot((size_t)slot) = candidate;
-      pq.updateSlot((size_t)slot);
-    }
+    bool bottomChanged = false;
+    bool admitted = groups->admit(key, pq, candidate,
+        [&](const SortDoc& head) {
+          int cmp = rank(head);
+          return cmp > 0 || (cmp == 0 && candidate.doc < head.doc);
+        }, [&](size_t slot, bool update) {
+          bottomChanged = !update || (heapFull() && slot == (size_t)pq.top().slot);
+          ensureSlotCapacity((int32_t)slot + 1);
+          write((int32_t)slot);
+        });
+    if (!admitted) return false;
     if (heapFull() && bottomChanged) setBottom();
     needsSort = true;
     return true;

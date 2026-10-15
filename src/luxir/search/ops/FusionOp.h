@@ -302,8 +302,7 @@ public:
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
         std::span<DocSet* const>(baseDomainViews.data(), baseDomainViews.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &op.req};
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
 

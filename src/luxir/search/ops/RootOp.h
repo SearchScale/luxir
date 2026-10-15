@@ -108,8 +108,7 @@ public:
       Query::Weight::PrepareContext prepareContext{
         *op.req.reader,
         std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &op.req};
       std::vector<QueryPrep::PreparedSource> prepared(weights.size());
       auto release = scope_guard([&]() noexcept {
         for (auto& segment : op.req.reader->segments()) {
@@ -183,7 +182,7 @@ public:
       auto preparedVariants = root.domainVariants.prepareResetVariants(
           prepared, eligibility,
           std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-          *op.req.reader, tg != nullptr,
+          *op.req.reader, tg != nullptr, &op.req,
           [&](size_t variant, size_t segnum) {
             auto& segment = op.req.reader->segments()[segnum];
             return root.domainVariants.reserveVariantPreparation(
