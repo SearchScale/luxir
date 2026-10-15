@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "luxir/util/Signal.h"
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
@@ -1438,7 +1439,11 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   helper.index(flatdoc("id_s", "b", "name_s", "a"), UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
-  size_t cacheSize = reader->getOrdMapCacheSize();
+  std::atomic<int> builds{0};
+  Signal::listen("ordMapBuild", [&](void*, void*, void*) -> void* {
+    builds++;
+    return nullptr;
+  });
 
   StrFieldType fieldType("name_s");
   StringSortModeGuard segmentGuard(StringSortMode::SEGMENT);
@@ -1456,7 +1461,7 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   req->execute(true);
   ASSERT_OK(req);
   EXPECT_EQ((std::vector<std::string>{"b", "a"}), resultIds(*req));
-  EXPECT_EQ(cacheSize, reader->getOrdMapCacheSize());
+  EXPECT_EQ(0, builds.load());
 }
 
 TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {

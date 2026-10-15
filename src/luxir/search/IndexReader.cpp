@@ -382,12 +382,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
   // Base-segment metadata is unchanged by deletes and overlays.
   if (previous && previous->coreGeneration == core->coreGeneration) {
-    IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", core->coreGeneration);
-    core->ordMaps = previous->ordMaps;
     core->fields = previous->fields;
   } else {
-    IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", core->coreGeneration);
-    core->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
     core->fields = std::make_shared<FieldRecords>();
   }
 
@@ -439,6 +435,16 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
     }
   }
   return record ? FieldSegments(record, core->segs.data()) : FieldSegments{};
+}
+
+std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {
+  auto fields = field(name);
+  if (!fields.exists()) return {};
+  return fields.record->ordMap.getOrCreate([&] { return OrdMap::build(fields, *this); });
+}
+
+std::string_view IndexReader::FieldSegments::name() const noexcept {
+  return record ? std::string_view(record->name) : std::string_view{};
 }
 
 const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {

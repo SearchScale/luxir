@@ -13,6 +13,7 @@
 #include <oneapi/tbb/task_arena.h>
 #include "test/LuxirTest.h"
 #include "test/TaskSpawnCounter.h"
+#include "luxir/util/SharedLazyCell.h"
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/log.h"
@@ -282,7 +283,7 @@ namespace {
 enum class LazyBuildOutcome { VALUE, NULL_VALUE, THROW, NON_STD_THROW };
 
 template <typename GetOrCreate>
-void checkLazyWaiters(GetOrCreate&& getOrCreate, LazyBuildOutcome outcome) {
+void checkLazyWaiters(GetOrCreate&& getOrCreate, LazyBuildOutcome outcome, bool cacheNull = false) {
   constexpr int numWaiters = 8;
   std::latch started(1), attached(numWaiters);
   std::atomic<int> builds{0}, failures{0};
@@ -339,7 +340,7 @@ void checkLazyWaiters(GetOrCreate&& getOrCreate, LazyBuildOutcome outcome) {
     builds.fetch_add(1);
     return std::make_shared<int>(43);
   });
-  bool retry = fail || outcome == LazyBuildOutcome::NULL_VALUE;
+  bool retry = fail || (outcome == LazyBuildOutcome::NULL_VALUE && !cacheNull);
   EXPECT_EQ(retry ? 2 : 1, builds.load());
   if (retry || outcome == LazyBuildOutcome::VALUE) {
     ASSERT_NE(nullptr, value);
@@ -368,12 +369,27 @@ void checkCanceledBuilder(GetOrCreate&& getOrCreate) {
 
 } // namespace
 
+TEST_F(UtilTest, lazyCellConcurrentOutcomesAndRetry) {
+  for (auto outcome : {LazyBuildOutcome::VALUE, LazyBuildOutcome::NULL_VALUE,
+                       LazyBuildOutcome::THROW, LazyBuildOutcome::NON_STD_THROW}) {
+    SharedLazyCell<int, true> cached;
+    checkLazyWaiters([&](auto&& create) { return cached.getOrCreate(create); }, outcome, true);
+    SharedLazyCell<int, false> retried;
+    checkLazyWaiters([&](auto&& create) { return retried.getOrCreate(create); }, outcome);
+  }
+}
+
 TEST_F(UtilTest, lazyMapConcurrentOutcomesAndRetry) {
   for (auto outcome : {LazyBuildOutcome::VALUE, LazyBuildOutcome::NULL_VALUE,
                        LazyBuildOutcome::THROW, LazyBuildOutcome::NON_STD_THROW}) {
     SharedLazyMap<int, int> map;
     checkLazyWaiters([&](auto&& create) { return map.getOrCreate(7, create); }, outcome);
   }
+}
+
+TEST_F(UtilTest, lazyCellDoesNotInheritCancellation) {
+  SharedLazyCell<int> cell;
+  checkCanceledBuilder([&](auto&& create) { return cell.getOrCreate(create); });
 }
 
 TEST_F(UtilTest, lazyMapDoesNotInheritCancellation) {

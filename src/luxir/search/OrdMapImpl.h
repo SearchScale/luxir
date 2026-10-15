@@ -52,7 +52,7 @@ namespace luxir {
 //
 
 class OrdMapBuilder {
-  std::string_view field;
+  IndexReader::FieldSegments fields;
   IndexReader& reader;
   OrdMap::DeltaEncoding deltaEncoding;
   TopTermsBuilder topTermsBuilder;
@@ -75,7 +75,7 @@ class OrdMapBuilder {
       segments.push_back('b');
     }
     LOG_INFO("OrdMap field={} bytes={} topTerms={} unlistedBound={} segments=[{}]",
-             field, size, topTerms.entries.size(), topTerms.unlistedBound,
+             fields.name(), size, topTerms.entries.size(), topTerms.unlistedBound,
              segments);
   }
 
@@ -334,8 +334,8 @@ class OrdMapBuilder {
   };
 
 public:
-  OrdMapBuilder(std::string_view field, IndexReader& reader)
-      : field(field), reader(reader),
+  OrdMapBuilder(IndexReader::FieldSegments fields, IndexReader& reader)
+      : fields(fields), reader(reader),
         deltaEncoding(OrdMap::configuredDeltaEncoding()),
         topTermsBuilder(TopTermsBuilder::thresholdFor(reader.maxDoc())) {}
 
@@ -351,6 +351,7 @@ public:
   int64_t numTerms = 0;
 
   void build() {
+    Signal::emit("ordMapBuild", this);
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
@@ -363,7 +364,6 @@ public:
     std::vector<u_ptr<TermsEnumIdx>> allTermsEnums;
     allTermsEnums.reserve(nsegs);
 
-    auto fields = reader.field(field);
     int segsWithValue = 0;
     for (auto i=0u; i<nsegs; i++) {
       auto& seg = segs[i];
@@ -641,8 +641,8 @@ OrdMap::DeltaEncoding OrdMap::configuredDeltaEncoding() {
 // In the future, we prob want to be able to accept a span of postings readers as well
 // so that IndexWriter could pre-create a OrdMap for a field without constructing an IndexReader.
 // Or we could just make IndexReader easier to construct w/o taking a Directory, etc.
-std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reader) {
-  OrdMapBuilder builder(field, reader);
+std::shared_ptr<OrdMap> OrdMap::build(IndexReader::FieldSegments fields, IndexReader& reader) {
+  OrdMapBuilder builder(fields, reader);
   builder.build();
   
   // Handle single segment with values case

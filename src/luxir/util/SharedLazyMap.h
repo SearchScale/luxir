@@ -40,8 +40,6 @@ private:
 public:
   SharedLazyMap() = default;
 
-  size_t size() const { return dataMap.size(); }
-
   /**
    * Retrieves the value associated with the given key if it is already fully
    * created. Returns nullptr if the key is absent or creation is in flight.

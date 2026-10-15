@@ -8,6 +8,7 @@
 #include <tbb/task_group.h>
 
 #include "bench/luxir_bench.h"
+#include "luxir/search/OrdMap.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
