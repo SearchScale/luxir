@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <future>
+#include <latch>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -275,6 +276,120 @@ TEST_F(UtilTest, lazyMap) {
     EXPECT_EQ(totalCreations.load(), numKeys);
   }
 }
+
+namespace {
+
+enum class LazyBuildOutcome { VALUE, NULL_VALUE, THROW, NON_STD_THROW };
+
+template <typename GetOrCreate>
+void checkLazyWaiters(GetOrCreate&& getOrCreate, LazyBuildOutcome outcome) {
+  constexpr int numWaiters = 8;
+  std::latch started(1), attached(numWaiters);
+  std::atomic<int> builds{0}, failures{0};
+  std::array<std::shared_ptr<int>, numWaiters + 1> values;
+  bool fail = outcome == LazyBuildOutcome::THROW || outcome == LazyBuildOutcome::NON_STD_THROW;
+  auto error = outcome == LazyBuildOutcome::NON_STD_THROW
+      ? std::make_exception_ptr(42)
+      : std::make_exception_ptr(std::runtime_error("original build error"));
+  Signal::listen("sharedLazyBuildWait", [&](void*, void*, void*) -> void* {
+    attached.count_down();
+    return nullptr;
+  });
+  auto create = [&]() -> std::shared_ptr<int> {
+    builds.fetch_add(1);
+    started.count_down();
+    attached.wait();
+    if (fail) std::rethrow_exception(error);
+    if (outcome == LazyBuildOutcome::NULL_VALUE) return nullptr;
+    return std::make_shared<int>(42);
+  };
+  auto request = [&](int i) {
+    try {
+      values[i] = getOrCreate(create);
+    } catch (...) {
+      EXPECT_EQ(error, std::current_exception());
+      failures.fetch_add(1);
+    }
+  };
+  {
+    std::jthread builder([&] { request(0); });
+    started.wait();
+    std::vector<std::jthread> waiters;
+    for (int i = 1; i <= numWaiters; i++) {
+      waiters.emplace_back([&, i] {
+        if (i == 1) {
+          tbb::task_arena arena(2);
+          arena.execute([&] {
+            tbb::this_task_arena::isolate([&] {
+              tbb::task_group group;
+              group.run([&] { request(i); });
+              group.wait();
+            });
+          });
+        } else {
+          request(i);
+        }
+      });
+    }
+  }
+  Signal::unlisten("sharedLazyBuildWait");
+  EXPECT_EQ(1, builds.load());
+  EXPECT_EQ(fail ? numWaiters + 1 : 0, failures.load());
+  auto value = getOrCreate([&] {
+    builds.fetch_add(1);
+    return std::make_shared<int>(43);
+  });
+  bool retry = fail || outcome == LazyBuildOutcome::NULL_VALUE;
+  EXPECT_EQ(retry ? 2 : 1, builds.load());
+  if (retry || outcome == LazyBuildOutcome::VALUE) {
+    ASSERT_NE(nullptr, value);
+    EXPECT_EQ(retry ? 43 : 42, *value);
+  } else {
+    EXPECT_EQ(nullptr, value);
+  }
+  for (const auto& returned : values) {
+    if (outcome == LazyBuildOutcome::VALUE) EXPECT_EQ(value, returned);
+    else EXPECT_EQ(nullptr, returned);
+  }
+}
+
+template <typename GetOrCreate>
+void checkCanceledBuilder(GetOrCreate&& getOrCreate) {
+  tbb::task_group request;
+  std::shared_ptr<int> result;
+  request.run([&] {
+    request.cancel();
+    result = getOrCreate([] { return std::make_shared<int>(42); });
+  });
+  request.wait();
+  ASSERT_NE(nullptr, result);
+  EXPECT_EQ(42, *result);
+}
+
+} // namespace
+
+TEST_F(UtilTest, lazyMapConcurrentOutcomesAndRetry) {
+  for (auto outcome : {LazyBuildOutcome::VALUE, LazyBuildOutcome::NULL_VALUE,
+                       LazyBuildOutcome::THROW, LazyBuildOutcome::NON_STD_THROW}) {
+    SharedLazyMap<int, int> map;
+    checkLazyWaiters([&](auto&& create) { return map.getOrCreate(7, create); }, outcome);
+  }
+}
+
+TEST_F(UtilTest, lazyMapDoesNotInheritCancellation) {
+  SharedLazyMap<int, int> map;
+  checkCanceledBuilder([&](auto&& create) { return map.getOrCreate(7, create); });
+}
+
+#ifndef NDEBUG
+TEST_F(UtilTest, lazyMapRejectsRecursiveBuild) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH({
+    SharedLazyMap<int, int> map;
+    map.getOrCreate(7, [&] { return map.getOrCreate(7, [] { return std::make_shared<int>(42); }); });
+  }, "recursive shared build");
+}
+#endif
 
 TEST_F(UtilTest, lazyMapConditionalReplaceAndErase) {
   SharedLazyMap<int, int> map;

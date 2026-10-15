@@ -351,7 +351,7 @@ public:
 
   // Get the number of cached OrdMaps (for testing)
   size_t getOrdMapCacheSize() const {
-    return core->ordMaps->dataMap.size();
+    return core->ordMaps->size();
   }
 
   FilterCache* filterCache() const noexcept {
