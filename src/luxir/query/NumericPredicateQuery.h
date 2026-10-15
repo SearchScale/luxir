@@ -1128,6 +1128,13 @@ public:
         if (points != nullptr && !reader.multiValued()) {
           return (int64_t)pointValueCount;
         }
+        if (plans.empty()) {
+          auto stored = planPool.make_span<BlockPlan>((size_t)reader.numBlocks());
+          for (int64_t i = 0; i < reader.numBlocks(); i++) {
+            stored[(size_t)i] = weight.query.classifyBlock(reader.blockInfo(i), reader.blockZone(i));
+          }
+          plans = stored;
+        }
         CrossingValues crossing(reader);
         if (!reader.multiValued()) {
           int64_t count = 0;
@@ -1191,6 +1198,8 @@ public:
             plans(plans), pointRanges(pointRanges),
             pointValueCount(pointValueCount), estimatedCost(estimatedCost),
             matchState(matchState), allMatch(allMatch) {
+        useZoneMap = false;
+        if (points != nullptr) return;
         int64_t prunableValues = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
           if (plans[(size_t)blockNum].relation != BlockRelation::CROSSES) {
@@ -1356,13 +1365,9 @@ public:
       int64_t colMax = reader->getMax();
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
 
-      auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
-      for (int64_t i = 0; i < reader->numBlocks(); i++) {
-        plans[(size_t)i] = query.classifyBlock(
-            reader->blockInfo(i), reader->blockZone(i));
-      }
+      std::span<BlockPlan> plans;
       bool allMatch = query.covers(colMin, colMax);
-      int64_t cost = estimateCost(*reader, plans, query.isExactSet());
+      int64_t cost = 0;
       PointsReader* points = nullptr;
       std::span<const PointsReader::OrdinalRange> pointRanges;
       uint64_t pointValueCount = 0;
@@ -1387,6 +1392,11 @@ public:
         matchState = pointValueCount == 0
             ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
+        plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
+        for (int64_t i = 0; i < reader->numBlocks(); i++) {
+          plans[(size_t)i] = query.classifyBlock(reader->blockInfo(i), reader->blockZone(i));
+        }
+        cost = estimateCost(*reader, plans, query.isExactSet());
         bool hasInside = false;
         bool hasCrosses = false;
         for (const BlockPlan& plan : plans) {
