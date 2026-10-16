@@ -438,7 +438,7 @@ public:
         if (mc == nullptr) continue;
         double weight = op.sourceWeights[s];
         if constexpr (Diverse) {
-          if (op.sources[s]->collapse != nullptr) {
+          if (op.sources[s]->collapse != nullptr || op.sources[s]->diversify != nullptr) {
             heads.clear();
             appendCollapsedSource(*mc, heads);
             if (op.method == Method::RRF) addRanks(heads, (float)weight);

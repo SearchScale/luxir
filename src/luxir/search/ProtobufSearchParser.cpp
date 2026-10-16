@@ -1551,6 +1551,14 @@ public:
 
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
+    DiversifyPlan* diversify = nullptr;
+    if (topDocsReq.diversify) {
+      auto keys = diversifyKeySpec(topDocsReq);
+      auto* resolved = resolveCollapse(keys,
+          placement != TopDocsPlacement::FUSION_SOURCE && topDocsReq.get_number);
+      diversify = luxir::arenaCreate<DiversifyPlan>(req.arena,
+          *resolved, (size_t)*topDocsReq.diversify->max_per_key, req.memoryTracker);
+    }
     CollapsePlan* collapse = nullptr;
     if (topDocsReq.collapse) {
       if (placement == TopDocsPlacement::FUSION_SOURCE) {
@@ -1726,17 +1734,19 @@ public:
     bool allowPruning = requirements.needRankedDocs
         && !parsedSorts.useFieldSort
         && (!requirements.needExactCount || requirements.needExactDomain);
-    if (allowPruning && !(collapse && !topDocsReq.collapse->sort.empty())) {
+    if (allowPruning && !(diversify && topDocsReq.get_number)
+        && !(collapse && !topDocsReq.collapse->sort.empty())) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
     // Document cardinality is not a distinct-group count; collapse totals
     // read every eligible key through the normal exhaustive driver.
-    bool exactCountTopK = collapse == nullptr && requirements.needRankedDocs
+    bool exactCountTopK = collapse == nullptr && diversify == nullptr && requirements.needRankedDocs
         && requirements.needExactCount && !requirements.needExactDomain
         && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
-    bool pureCountShape = collapse == nullptr && !QueryPrep::disableWholeMembershipPlanForTests
+    bool pureCountShape = collapse == nullptr && diversify == nullptr
+        && !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
         && (foldFilters || filters.empty());
@@ -1782,7 +1792,7 @@ public:
     bool cacheFirstExactDomain = false;
     bool constantExactDomainRanking = requirements.needRankedDocs
         && scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE;
-    bool canOmitForExactDomain = collapse == nullptr && !routedFilters
+    bool canOmitForExactDomain = collapse == nullptr && diversify == nullptr && !routedFilters
         && placement == TopDocsPlacement::ROOT_OP
         && requirements.needExactDomain && !parsedSorts.useFieldSort
         && (!requirements.needRankedDocs || constantExactDomainRanking)
@@ -1821,7 +1831,7 @@ public:
     bool cacheFirstFieldSort = false;
     bool fieldSortBuildVetoed = false;
     bool cacheFirstFieldSortShape =
-        collapse == nullptr && placement == TopDocsPlacement::ROOT_OP
+        collapse == nullptr && diversify == nullptr && placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
         && limit > 0 && parsedSorts.useFieldSort
         && (requestFlags & Query::NEED_SCORES) == 0
@@ -2083,6 +2093,7 @@ public:
       domainFilterWeights, residentExactDomainUses);
 
     qr->collapse = collapse;
+    qr->diversify = diversify;
     qr->headSort = std::move(headSort);
     if (firstQuery == nullptr) {
       firstQuery = qr;
@@ -2259,7 +2270,7 @@ public:
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }
     fusion->diverseSources = std::ranges::any_of(fusion->sources,
-        [](const TopDocsReq* source) { return source->collapse != nullptr; });
+        [](const TopDocsReq* source) { return source->collapse != nullptr || source->diversify != nullptr; });
 
     // Sources are children of this FusionOp in the SearchOp tree but not
     // in `subOps` (different lifecycle - they deliver via rankingSink

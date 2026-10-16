@@ -149,3 +149,36 @@ LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, direct_score, false, false);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, remap_score, true, false);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, direct_tuple, false, true);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, remap_tuple, true, true);
+
+// Isolate per-key worst-member maintenance from key decoding and scorer work.
+// Improving candidates exercise a full cap repeatedly, including large caps.
+template <bool Ordered>
+static void BM_CappedAdmission(benchmark::State& state) {
+  CollectionHelper helper("cap_admission");
+  if (!helper.indexMatchesShape({1})) {
+    helper.clear();
+    ASSERT_TRUE(helper.indexAll({flatdoc("id", "one")}, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  CollapsePlan plan(*reader, api::Collapse_::MissingPolicy::GROUP, false);
+  struct Item { int rank; size_t slot = 0; };
+  auto better = [](const Item& a, const Item& b) { return a.rank > b.rank; };
+  int cap = (int)state.range(0);
+  std::array<CollapseKey, 20> keys;
+  for (size_t i = 0; i < keys.size(); i++) keys[i].components.push_back({true, (int64_t)i});
+  for (auto _ : state) {
+    GroupAdmission<false, Ordered> admission(plan, (size_t)cap);
+    ExpandingPQ<Item, decltype(better), true> heap((size_t)cap * keys.size(), better);
+    for (int i = 0; i < 20'000; i++) {
+      Item candidate{i};
+      admission.admit(keys[(size_t)i % keys.size()], heap, candidate,
+          [&](const Item& old) { return better(candidate, old); }, [](size_t, bool) {});
+    }
+    benchmark::DoNotOptimize(heap.size());
+  }
+  state.SetItemsProcessed(state.iterations() * 20'000);
+}
+BENCHMARK_TEMPLATE(BM_CappedAdmission, false)->Name("Tuning/BM_CappedAdmission/linear")
+    ->Arg(1)->Arg(2)->Arg(10)->Arg(100);
+BENCHMARK_TEMPLATE(BM_CappedAdmission, true)->Name("Tuning/BM_CappedAdmission/ordered")
+    ->Arg(1)->Arg(2)->Arg(10)->Arg(100);

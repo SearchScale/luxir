@@ -564,6 +564,7 @@ public:
   }
 
   CollapsePlan* collapse = nullptr;
+  DiversifyPlan* diversify = nullptr;
   MetricGroupPlan* metricOrder = nullptr;
   std::optional<SortPlan> headSort;
   boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
@@ -1173,6 +1174,8 @@ public:
       return DomainHandle(DocSet::intersect(filterPtrs));
     }
 
+    void configureDiversify();
+
     template <bool MetricGroups = false>
     void completeEmpty(oneapi::tbb::task_group* tg) {
       std::span<const DomainHandle> noDomains;
@@ -1190,13 +1193,13 @@ public:
         std::span<DocSet* const> liveDomains,
         oneapi::tbb::task_group* tg);
 
-    template <bool Structural, bool MetricGroups = false>
+    template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void prepareAndDispatch(oneapi::tbb::task_group* tg);
 
     template <bool Structural>
     void prepareDomains(oneapi::tbb::task_group* tg);
 
-    template <bool Structural, bool MetricGroups = false>
+    template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void dispatch(
         oneapi::tbb::task_group* tg,
         std::span<const DomainHandle> domains) {
@@ -1222,7 +1225,7 @@ public:
         int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
         return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
           assert(domain.isDeliverable());
-          doCollect<Structural, MetricGroups>(tg, segnum, domain);
+          doCollect<Structural, MetricGroups, Admission>(tg, segnum, domain);
         };
       });
     }
@@ -1620,10 +1623,12 @@ public:
       op.releaseSegmentState(segment);
     }
 
-    template <bool Structural, bool MetricGroups = false>
+    template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void doCollect(oneapi::tbb::task_group* tg, int32_t segnum,
                    DomainHandle domainHandle) {
-      if constexpr (MetricGroups) {
+      if constexpr (Admission::isDiversified) {
+        doCollectPolicy<Structural, true, false, Admission>(tg, segnum, std::move(domainHandle));
+      } else if constexpr (MetricGroups) {
         doCollectPolicy<Structural, true, true>(tg, segnum, std::move(domainHandle));
       } else if (thisOp().collapse != nullptr) {
         doCollectPolicy<Structural, true>(tg, segnum, std::move(domainHandle));
@@ -1633,7 +1638,8 @@ public:
 
     // One collection ladder, specialized once per segment. Document requests
     // instantiate their original admission loop without per-hit group checks.
-    template <bool Structural, bool Collapsed, bool MetricGroups = false>
+    template <bool Structural, bool Collapsed, bool MetricGroups = false,
+              typename Admission = CollapseAdmission>
     void doCollectPolicy(
         oneapi::tbb::task_group* tg, int32_t segnum,
         DomainHandle domainHandle) {
@@ -1713,9 +1719,9 @@ public:
           // Wait until last moment to obtain collector in hopes of reusing an existing one.
           // Keep ownership until release so a scoring error cannot orphan it.
           data.reset(collectorMerger.obtain());
-          auto* scoreCollector = data->template scores<Collapsed>();
-          auto* fieldCollector = data->template fields<Collapsed>();
-          using ActiveFieldCollector = FieldCollector<Collapsed>;
+          auto* scoreCollector = data->template scores<Collapsed, Admission>();
+          auto* fieldCollector = data->template fields<Collapsed, Admission>();
+          using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
           // Field-sorted ranking is the one thing a match-all still has to
           // iterate for: it orders by column values the domain says nothing
@@ -2600,12 +2606,13 @@ public:
     }
   }
 
-  template <bool Structural, bool MetricGroups = false>
+  template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
   class Calc final : public CalcBase {
   public:
     Calc(TopDocsReq& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : CalcBase(op, parent, slot, numSlots, structural) {
+      if constexpr (Admission::isDiversified) configureDiversify();
       if constexpr (MetricGroups) metricGroups = std::make_unique<MetricGroupState>(op, this);
       if constexpr (Structural) {
         assert(this->structural && op.domainVariants.hasResetVariants());
@@ -2631,7 +2638,7 @@ public:
         return;
       }
       if (!requiresWholeIndexPrepare) {
-        doCollect<Structural, MetricGroups>(tg, segnum, std::move(domain));
+        doCollect<Structural, MetricGroups, Admission>(tg, segnum, std::move(domain));
         return;
       }
 
@@ -2641,7 +2648,7 @@ public:
       auto count =
           gatheredDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
       if (count != (int32_t)thisOp().req.reader->segments().size()) return;
-      prepareAndDispatch<Structural, MetricGroups>(tg);
+      prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
     }
 
     void calcAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains) override {
@@ -2652,7 +2659,7 @@ public:
         return;
       }
       if (!requiresWholeIndexPrepare) {
-        dispatch<Structural, MetricGroups>(tg, domains);
+        dispatch<Structural, MetricGroups, Admission>(tg, domains);
         return;
       }
       std::copy(domains.begin(), domains.end(), inputDomains.begin());
@@ -2660,7 +2667,7 @@ public:
         assert(inputDomains[i].isDeliverable());
         inputDomainViews[i] = inputDomains[i].get();
       }
-      prepareAndDispatch<Structural, MetricGroups>(tg);
+      prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
     }
   };
 
@@ -2703,6 +2710,9 @@ public:
   // DocEmission).  The empty-index case (no segments -> no collector ever
   // obtained) writes an empty DocList (with found=0 only when the count was
   // requested); submitBody then sends it.
+  Calculator* createDiversifyCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
+                                       const StructuralConstraint* structural);
+  void fillDiversifyResponse(CalcBase& calc, MergeableCollector& collector);
   void fillQueryTopNResponse(CalcBase& calc);
   void fillMetricGroupResponse(CalcBase& calc);
 

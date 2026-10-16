@@ -402,7 +402,7 @@ public:
 
 // Only retained identities are interned for ranking: state is O(topCount).
 // Exhaustive totals have a separate bitmap (one ordinal key) or exact set.
-template <bool Single = true>
+template <bool Single = true, bool Ordered = false>
 class GroupAdmission {
   // The lookup table owns only slot indexes. Hash/equality read the one key
   // owned by each stable slot, including after the vector's storage grows.
@@ -427,6 +427,21 @@ class GroupAdmission {
   };
   struct SingleState {};
   [[no_unique_address]] std::conditional_t<Single, SingleState, CappedState> caps;
+
+  template <typename Queue>
+  void repairMembers(size_t key, size_t pos, Queue& heap) requires Ordered {
+    auto& members = caps.members[key];
+    auto slot = members[pos];
+    size_t child;
+    while ((child = pos * 2 + 1) < members.size()) {
+      if (child + 1 < members.size()
+          && heap.precedes(heap.atSlot(members[child]), heap.atSlot(members[child + 1]))) child++;
+      if (!heap.precedes(heap.atSlot(slot), heap.atSlot(members[child]))) break;
+      members[pos] = members[child];
+      pos = child;
+    }
+    members[pos] = slot;
+  }
   bool segmentLocal = false;
   std::vector<CollapseKey> localKeys;
   std::vector<uint8_t> localAvailable;
@@ -492,7 +507,9 @@ public:
   // every document of the global capped top-N lying in it. Union then recut
   // is exact and associative. Rank ties must use the same document order.
   // Callers reject against the global floor BEFORE decoding the key: a hit
-  // that cannot beat that floor cannot improve a retained key either.
+  // that cannot beat that floor cannot improve a retained key either. Every
+  // retained member ranks at or above the floor. A capped key may reject a hit
+  // above it; that only leaves a conservative floor, never an unsafe skip.
   template <typename Queue, typename Item, typename Better, typename Write,
             typename SameEntry = decltype([](const auto&) { return false; })>
   bool admit(const CollapseKey& key, Queue& heap, Item candidate,
@@ -533,18 +550,20 @@ public:
       auto found = retained.find(key);
       size_t keyIndex = found == retained.end() ? SIZE_MAX : *found;
       size_t slot = SIZE_MAX;
+      size_t memberPosition = 0;
       if (keyIndex != SIZE_MAX) {
         auto& members = caps.members[keyIndex];
         // Repeated vector candidates/merge rounds may name the same document.
         // Updating it must not consume another place under the key's cap.
-        for (size_t member : members) {
-          if (sameEntry(heap.atSlot(member))) { slot = member; break; }
+        for (size_t i = 0; i < members.size(); i++) {
+          if (sameEntry(heap.atSlot(members[i]))) { slot = members[i]; memberPosition = i; break; }
         }
         if (slot == SIZE_MAX && members.size() == caps.perKey) {
           slot = members.front();
-          for (size_t member : members) {
+          if constexpr (!Ordered) for (size_t member : members) {
             if (heap.precedes(heap.atSlot(slot), heap.atSlot(member))) slot = member;
           }
+          memberPosition = 0;
         }
         if (slot != SIZE_MAX) {
           if (!better(heap.atSlot(slot))) return false;
@@ -552,6 +571,7 @@ public:
           candidate.slot = slot;
           heap.atSlot(slot) = candidate;
           heap.updateSlot(slot);
+          if constexpr (Ordered) repairMembers(keyIndex, memberPosition, heap);
           return true;
         }
       }
@@ -559,10 +579,23 @@ public:
       if (slot < caps.entryKeys.size()) {
         size_t oldKey = caps.entryKeys[slot];
         auto& members = caps.members[oldKey];
-        auto member = std::find(members.begin(), members.end(), slot);
-        assert(member != members.end());
-        *member = members.back();
-        members.pop_back();
+        if constexpr (Ordered) {
+          // The global floor is also its own key's worst member.
+          assert(members.front() == slot);
+          std::pop_heap(members.begin(), members.end(), [&](size_t a, size_t b) {
+            return heap.precedes(heap.atSlot(a), heap.atSlot(b));
+          });
+          members.pop_back();
+          // Key records are recycled. Bound historical vector capacity too,
+          // so many formerly large keys cannot retain O(topCount * perKey).
+          if (members.capacity() > members.internal_capacity()
+              && members.size() < members.capacity() / 2) members.shrink_to_fit();
+        } else {
+          auto member = std::find(members.begin(), members.end(), slot);
+          assert(member != members.end());
+          *member = members.back();
+          members.pop_back();
+        }
         if (members.empty()) {
           retained.erase(oldKey);
           caps.freeKeys.push_back(oldKey);
@@ -587,6 +620,12 @@ public:
       candidate.slot = slot;
       if (slot == heap.size()) heap.insert(candidate);
       else { heap.atSlot(slot) = candidate; heap.updateSlot(slot); }
+      if constexpr (Ordered) {
+        auto& members = caps.members[keyIndex];
+        std::push_heap(members.begin(), members.end(), [&](size_t a, size_t b) {
+          return heap.precedes(heap.atSlot(a), heap.atSlot(b));
+        });
+      }
       return true;
     }
   }
@@ -617,6 +656,8 @@ public:
 // unused ordinal-count bitmap just because its enclosing list requests totals.
 class CollapseAdmission : public GroupAdmission<> {
 public:
+  using Plan = CollapsePlan;
+  static constexpr bool isDiversified = false;
   std::vector<uint64_t> seenOrds;
   boost::unordered_flat_set<CollapseKey, CollapseKeyHash> seenKeys;
   int64_t singletons = 0;

@@ -63,7 +63,7 @@ namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
-struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
+struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
@@ -537,6 +537,11 @@ struct Collapse {
   bool get_number = false;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
 };
+struct Diversify {
+  std::span<const std::string_view> field;
+  Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
+  std::optional<int64_t> max_per_key;
+};
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Filter> filter;
@@ -547,6 +552,7 @@ struct TopDocs {                                                 // all indirect
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   int32_t batch_size = 0;
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
+  ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
@@ -633,6 +639,7 @@ struct GroupTable {
 struct DocList {                                                // needs Column (map by value)
   std::optional<std::int64_t> found;
   std::optional<std::int64_t> found_docs;
+  std::optional<std::int64_t> found_groups;
   ::hpp_proto::optional_indirect_view<GroupTable> groups;
   map_view<std::string_view, Column> columns;
   // Per-document field maps: docs[i] holds document i's fields not in
@@ -793,7 +800,7 @@ struct UpdateRequest {                                         // needs CommitPa
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
-LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
+LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
@@ -836,7 +843,8 @@ LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) 
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
 LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
-LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent) LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
+LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
+LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)

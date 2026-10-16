@@ -94,6 +94,7 @@ defaults and constraints are described in the comments and guides.
 - [`CreateCollectionResponse`](#message-luxir.createcollectionresponse)
 - [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest)
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
+- [`Diversify`](#message-luxir.diversify)
 - [`DocList`](#message-luxir.doclist)
 - [`Domain`](#message-luxir.domain)
 - [`Error`](#message-luxir.error)
@@ -657,6 +658,24 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionresponse.name"></a>[`name`](#field-luxir.deletecollectionresponse.name) | 1 | `string` | singular |  |
 
+<a id="message-luxir.diversify"></a>
+
+### luxir.Diversify
+
+A document cap, applied before paging in the list's ordinary rank order.
+
+[Source](../../protos/luxir_types.proto)
+
+<a id="oneof-luxir.diversify.kind"></a>
+
+**oneof `kind`:** at most one member can be set.
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.diversify.field"></a>[`field`](#field-luxir.diversify.field) | 1 | `string` | repeated | One field or an exact tuple, as in Collapse. |
+| <a id="field-luxir.diversify.missing"></a>[`missing`](#field-luxir.diversify.missing) | 3 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
+| <a id="field-luxir.diversify.max_per_key"></a>[`max_per_key`](#field-luxir.diversify.max_per_key) | 2 | `int64` | oneof [`kind`](#oneof-luxir.diversify.kind) | Positive cap; keeps each key's best documents. |
+
 <a id="message-luxir.doclist"></a>
 
 ### luxir.DocList
@@ -669,6 +688,7 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 |---|---|---|---|---|
 | <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Exact match count when get\_number was requested. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
 | <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when get\_number was requested, after missing=drop. |
+| <a id="field-luxir.doclist.found_groups"></a>[`found_groups`](#field-luxir.doclist.found_groups) | 8 | `sint64` | optional | Diversify only, with get\_number: distinct eligible keys. |
 | <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupTable`](#message-luxir.grouptable) | singular | Collapse only: complete metadata aligned with this batch's rows. |
 | <a id="field-luxir.doclist.columns"></a>[`columns`](#field-luxir.doclist.columns) | 3 | map&lt;`string`, [`Column`](#message-luxir.column)&gt; | map | Dense columns; each has exactly row\_count slots. |
 | <a id="field-luxir.doclist.docs"></a>[`docs`](#field-luxir.doclist.docs) | 5 | [`Map`](#message-luxir.map) | repeated | Per-document field maps. When present: exactly row\_count entries; docs\[i\] holds the fields of document i not represented as a dense column. A field name never appears in both columns and docs\[i\]. |
@@ -1759,6 +1779,7 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
+| <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
 

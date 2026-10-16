@@ -152,6 +152,54 @@ POST /collections/books/_search
 }
 ```
 
+## Diversifying a document list
+
+Use `diversify` to keep at most a fixed number of documents per key:
+
+```json
+{
+  "query": "title_t:jacket",
+  "sort": "price_i asc",
+  "diversify": {"field": "product_id_s", "max_per_key": 2, "missing": "expand"},
+  "limit": 10,
+  "get_number": true,
+  "fields": ["id", "price_i"]
+}
+```
+
+This returns documents in the ordinary list order (sort values, then document
+order), keeping each key's best `max_per_key` documents. The cap applies before
+`offset`, so concatenating pages gives the same result as one large page.
+`limit: -1` returns the entire capped list; `limit: 0` returns only requested
+counts and operations. With `get_number`, `found` counts capped documents and
+`found_groups` counts distinct eligible keys. Exact totals read every matching
+key and retain per-key counts in request memory. Without totals, competitive
+pruning remains available.
+
+`field` accepts a field name or an exact tuple, for example
+`["product_id_s", "shop_s"]`. It uses the same single-valued key types and
+`missing` policies as collapse: `expand` gives each keyless document its own key,
+`group` preserves each missing tuple component as null, and `drop` excludes that
+row from the capped list and its counts. `max_per_key` must be positive.
+
+Diversify produces ordinary document rows, without `_group_` metadata. It works
+in facet buckets, in streaming responses and with `format=docs`. Ordinary `ops`
+see the full query/filter match set, including rows excluded by the cap or by
+`missing: drop`. Diversify does not change inherited facet count units; without
+an enclosing collapse they default to documents. A child domain reset keeps
+its enclosing bucket identities, as usual.
+
+A fusion source can diversify its own ranked document window. Its capped heads
+enter document fusion normally, and source windows never refill implicitly. With
+document-unit kNN the cap applies to its selected document window, without
+increasing `k`. Diversify does not establish a collapse scope for group-unit kNN;
+that unit still requires an enclosing collapse. Where one exists, it selects its
+group witnesses first and diversify independently caps those documents.
+
+`collapse` and `diversify` cannot appear on the same list. Use collapse for one
+row per group with group metadata and operations; use diversify for a capped
+document list. MMR, windowed caps and soft caps are not implemented.
+
 ## Collapsing results
 
 Use `collapse` to return one document per distinct key, such as one result

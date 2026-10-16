@@ -55,6 +55,11 @@ full-precision vector column, so a collection is searchable as soon as its
 vectors are indexed and the results are exact. [Approximate search](#approximate-search)
 is a commit-time option for large collections; the query does not change.
 
+A list's [diversify cap](searching.md#diversifying-a-document-list) applies
+after the kNN window is selected. It does not enlarge `k` or refill the window:
+several neighbors with the same key can therefore leave fewer returned rows.
+A fusion source can use the same cap before its documents enter fusion.
+
 The `books` collection behind every response on this page is defined in
 [Define a vector field](#define-a-vector-field) and loaded in
 [Index vectors](#index-vectors) below.

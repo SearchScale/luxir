@@ -15,7 +15,7 @@ void retainPreparedWindow(RequestMemTracker& tracker,
 }
 }  // namespace
 
-template <bool Structural, bool MetricGroups>
+template <bool Structural, bool MetricGroups, typename Admission>
 void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
   {
     auto release = scope_guard([&]() noexcept {
@@ -23,7 +23,7 @@ void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
     });
     prepareDomains<Structural>(tg);
   }
-  dispatch<Structural, MetricGroups>(tg, thisOp().domainVariants.empty()
+  dispatch<Structural, MetricGroups, Admission>(tg, thisOp().domainVariants.empty()
       ? std::span<const DomainHandle>(effectiveDomains) : std::span<const DomainHandle>(inputDomains));
 }
 
@@ -333,6 +333,10 @@ template void TopDocsReq::CalcBase::prepareAndDispatch<false, false>(oneapi::tbb
 template void TopDocsReq::CalcBase::prepareAndDispatch<true, false>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareAndDispatch<false, true>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareAndDispatch<true, true>(oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<false, false, DiversifyAdmission>(
+    oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<true, false, DiversifyAdmission>(
+    oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareDomains<false>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareDomains<true>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareMainVariants<false>(oneapi::tbb::task_group*);

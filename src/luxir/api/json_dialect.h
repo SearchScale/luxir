@@ -1024,6 +1024,37 @@ struct from<JSON, luxir::api::Collapse> {
 };
 
 template <>
+struct from<JSON, luxir::api::Diversify> {
+  template <auto Opts>
+  static void op(luxir::api::Diversify &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    auto readFields = [&](auto &vit, auto &vend) {
+      value.field = {};
+      decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.field);
+      if (skip_ws<O>(ctx, vit, vend)) return;
+      if ((char)*vit == '[') glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+      else {
+        fields.resize(1);
+        util::from_json<O>(fields[0], ctx, vit, vend);
+      }
+    };
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "field") readFields(vit, vend);
+          else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
+          else if (key == "max_per_key") util::from_json<O>(value.max_per_key, ctx, vit, vend);
+          else { ctx.error = error_code::unknown_key; return true; }
+          return bool(ctx.error);
+        }, [](auto &, auto &) {});
+  }
+};
+
+template <>
 struct from<JSON, luxir::api::TopDocs> {
   template <auto Opts>
   static void op(luxir::api::TopDocs &value,
@@ -1055,6 +1086,8 @@ struct from<JSON, luxir::api::TopDocs> {
           } else if (key == "sort") {
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, value.sort);
             readSortList<O>(sort, ctx, vit, vend);
+          } else if (key == "diversify") {
+            util::from_json<O>(value.diversify, ctx, vit, vend);
           } else if (key == "collapse") {
             util::from_json<O>(value.collapse, ctx, vit, vend);
           } else if (key == "batch_size") {
@@ -1356,6 +1389,10 @@ struct from<JSON, luxir::api::SearchRequest> {
             if (reusedShorthand) topDocs.sort = {};
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, topDocs.sort);
             readSortList<O>(sort, ctx, vit, vend);
+          } else if (key == "diversify") {
+            auto &topDocs = shorthand();
+            topDocs.diversify.reset();
+            util::from_json<O>(topDocs.diversify, ctx, vit, vend);
           } else if (key == "collapse") {
             auto &topDocs = shorthand();
             topDocs.collapse.reset();

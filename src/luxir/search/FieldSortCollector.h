@@ -30,14 +30,14 @@ struct FieldSortKeyBlockPlan {
   int64_t leafCount = 0;
 };
 
-template <bool Collapsed = false>
+template <bool Collapsed = false, typename Admission = CollapseAdmission>
 class FieldCollector : public FieldSortControls {
   static constexpr size_t KEY_BUFFER_SIZE = 1024;
   int64_t keys[KEY_BUFFER_SIZE];
 
 public:
   [[no_unique_address]] std::conditional_t<Collapsed,
-      std::unique_ptr<CollapseAdmission>, NoCollapseAdmission> groups;
+      std::unique_ptr<Admission>, NoCollapseAdmission> groups;
 
   struct SortDoc {
     segdoc doc;
@@ -287,10 +287,10 @@ public:
 public:
   FieldCollector(int64_t topCount, const std::vector<SortClause>& clauses,
                      IndexReader* reader, bool needsScores = true,
-                     const CollapsePlan* collapse = nullptr)
+                     const typename Admission::Plan* collapse = nullptr)
     : topCount(topCount), needsScores(needsScores),
       pq((size_t)std::max(topCount, (int64_t)0), FieldSortComparatorFunctor(this)) {
-    if constexpr (Collapsed) groups = std::make_unique<CollapseAdmission>(*collapse);
+    if constexpr (Collapsed) groups = std::make_unique<Admission>(*collapse);
     else unused(collapse);
     assert(topCount >= 0);
     // Slot indexes are int32 (SortDoc::slot, FieldComparator::growSlots), so
@@ -1348,7 +1348,7 @@ public:
       // compares rank then document, deduplicating by global identity.
       if (topCount == 0) return;
       for (const SortDoc& member : other.pq.span()) {
-        admitGroup(other.groups->keys[(size_t)member.slot], member,
+        admitGroup(other.groups->keyAt((size_t)member.slot), member,
             [&](const SortDoc& head) { return compareRank(head, member, CompareSource::OTHER, &other); },
             [&](int32_t slot) { copy(slot, other, member.slot, member.doc); });
       }
@@ -1372,6 +1372,7 @@ public:
   }
 
   int64_t totalHits() const {
+    if constexpr (Admission::isDiversified) return groups->totalDocuments();
     return hitCount;
   }
 

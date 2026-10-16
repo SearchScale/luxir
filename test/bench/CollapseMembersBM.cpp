@@ -426,3 +426,55 @@ static void BM_FusionCollapse(benchmark::State& state, bool collapsed) {
 }
 LUXIR_BENCHMARK_CAPTURE(BM_FusionCollapse, docs, false)->Arg(8)->Arg(100);
 LUXIR_BENCHMARK_CAPTURE(BM_FusionCollapse, groups, true)->Arg(8)->Arg(100);
+
+// Document caps on the same scattered catalog. Args: page, cap (0 = plain),
+// exact totals. The diagnostic run records work outside the timed loop.
+static void BM_Diversify(benchmark::State& state) {
+  int32_t page = (int32_t)state.range(0), cap = (int32_t)state.range(1);
+  bool totals = state.range(2);
+  int32_t variants = 100, segments = 7;
+  int32_t products = unit_tests ? 120 : (int32_t)LuxirTest::scaleTestWork(20'000);
+  std::string name = "members_reset_bm_" + std::to_string(products) + "_100_7";
+  CollectionHelper helper(name);
+  int32_t total = products * variants;
+  std::vector<int32_t> sizes;
+  for (int32_t s = 0; s < segments; s++)
+    sizes.push_back((s + 1) * total / segments - s * total / segments);
+  if (!helper.indexMatchesShape(sizes)) {
+    helper.clear();
+    for (int32_t s = 0; s < segments; s++) {
+      std::vector<Doc> docs;
+      for (int32_t id = s * total / segments; id < (s + 1) * total / segments; id++)
+        docs.push_back(collapseCatalogDoc(id, products, variants));
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+  }
+  std::string body = R"({"collection":")" + name
+      + R"(","sort":"rank_i desc","fields":["id"],"limit":)" + std::to_string(page)
+      + R"(,"get_number":)" + (totals ? "true" : "false");
+  if (cap) body += R"(,"diversify":{"field":"key_s","max_per_key":)" + std::to_string(cap) + '}';
+  body += '}';
+  auto execute = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    if (!api::read_json(req->rawRequest(), body, req->mr)) throw std::runtime_error(body);
+    req->execute(false);
+    if (!req->ok()) throw std::runtime_error(req->errorMsg());
+    return req;
+  };
+  {
+    SearchOverridesGuard guard(SkipStats::enabled);
+    SkipStats::enabled = true;
+    SkipStats::reset();
+    auto req = execute();
+    state.counters["peak_tracked"] = (double)req->memoryTracker.peak();
+    state.counters["visited"] = (double)SkipStats::fieldSortDocsGathered;
+    state.counters["decoded"] = (double)SkipStats::docBlocksDecoded;
+    state.counters["found"] = (double)req->docList()->found.value_or(-1);
+  }
+  for (auto _ : state) {
+    auto req = execute();
+    benchmark::DoNotOptimize(req->responses.size());
+  }
+  state.SetItemsProcessed(state.iterations() * total);
+}
+LUXIR_BENCHMARK(BM_Diversify)->ArgsProduct({{10, 100}, {0, 1, 2, 10, 100}, {0, 1}});

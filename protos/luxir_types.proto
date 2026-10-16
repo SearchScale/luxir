@@ -112,6 +112,15 @@ message Collapse {
   repeated SortSpec sort = 6;
 }
 
+// A document cap, applied before paging in the list's ordinary rank order.
+message Diversify {
+  repeated string field = 1; // One field or an exact tuple, as in Collapse.
+  Collapse.MissingPolicy missing = 3;
+  oneof kind {
+    int64 max_per_key = 2; // Positive cap; keeps each key's best documents.
+  }
+}
+
 message TopDocs {
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
@@ -143,6 +152,7 @@ message TopDocs {
   int32 batch_size = 9;
   DocFormat document_format = 10;  // rows vs columns placement of returned fields (see DocFormat)
 
+  Diversify diversify = 12; // Incompatible with collapse; found counts capped documents.
   Collapse collapse = 11; // limit, offset and found count groups; found_docs counts eligible documents.
 
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
@@ -810,6 +820,7 @@ message DocList {
   // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
   optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
+  optional sint64 found_groups = 8; // Diversify only, with get_number: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
 
   // Dense columns; each has exactly row_count slots.

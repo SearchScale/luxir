@@ -282,6 +282,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       if (qr.topDocsProto.get_number) {
         docListProto.found = 0;
         if (qr.collapse != nullptr) docListProto.found_docs = 0;
+        if (qr.diversify != nullptr) docListProto.found_groups = 0;
       }
       return;
     }
@@ -294,7 +295,9 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     DocEmission emission = calc.underBucketSlot()
         ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
-    if (qr.collapse != nullptr) {
+    if (qr.diversify != nullptr) {
+      fillDiversifyResponse(calc, *mergeableCollector);
+    } else if (qr.collapse != nullptr) {
       if (mergeableCollector->useFieldSort) {
         emitPage(pageSettings(qr, calc), calc, *mergeableCollector->groupFieldCollector);
       }

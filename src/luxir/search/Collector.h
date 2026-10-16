@@ -12,6 +12,7 @@
 #include "luxir/query/Query.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
+#include "luxir/search/Diversify.h"
 
 namespace luxir {
 
@@ -52,7 +53,7 @@ public:
 
 struct NoCollapseAdmission {};
 
-template <bool Collapsed = false>
+template <bool Collapsed = false, typename Admission = CollapseAdmission>
 class ScoreCollector {
   public:
   static constexpr bool isCollapsed = Collapsed;
@@ -71,7 +72,7 @@ class ScoreCollector {
   using ScoreDoc = std::conditional_t<Collapsed, GroupScore, DocScore>;
 
   [[no_unique_address]] std::conditional_t<Collapsed,
-      std::unique_ptr<CollapseAdmission>, NoCollapseAdmission> groups;
+      std::unique_ptr<Admission>, NoCollapseAdmission> groups;
 
   int64_t hitCount = 0;
 
@@ -95,9 +96,9 @@ class ScoreCollector {
   using Comparator = decltype(scoreAndDocComp);
   ExpandingPQ<ScoreDoc, Comparator, Collapsed> pq;
 
-  ScoreCollector(int64_t topCount, const CollapsePlan* collapse = nullptr)
+  ScoreCollector(int64_t topCount, const typename Admission::Plan* collapse = nullptr)
       : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0), scoreAndDocComp) {
-    if constexpr (Collapsed) groups = std::make_unique<CollapseAdmission>(*collapse);
+    if constexpr (Collapsed) groups = std::make_unique<Admission>(*collapse);
     else unused(collapse);
     // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
     // empty and collect() only counts.  Negative counts are a bug in the caller.
@@ -178,6 +179,7 @@ class ScoreCollector {
   }
 
   int64_t totalHits() const {
+    if constexpr (Admission::isDiversified) return groups->totalDocuments();
     return hitCount;
   }
 
@@ -199,7 +201,7 @@ class ScoreCollector {
       // Local top-L groups suffice globally: an omitted group has L local
       // groups ahead of its best local witness, hence L global groups ahead.
       for (const auto& member : other.pq.span()) {
-        offer(other.groups->keys[(size_t)member.slot], member.doc, member.score);
+        offer(other.groups->keyAt((size_t)member.slot), member.doc, member.score);
       }
     } else {
       auto newHitCount = hitCount + other.hitCount;

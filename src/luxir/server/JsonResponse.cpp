@@ -465,6 +465,11 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     appendInt(out, *docs.found_docs);
     out += ',';
   }
+  if (docs.found_groups.has_value()) {
+    out += R"("found_groups":)";
+    appendInt(out, *docs.found_groups);
+    out += ',';
+  }
   out += R"("docs":)";
   appendDocs(out, docs);
   if (!docs.ops.empty()) {
@@ -649,11 +654,12 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   // get_number.
   bool haveFound = firstForOp && docs.found.has_value();
   bool haveFoundDocs = firstForOp && docs.found_docs.has_value();
+  bool haveFoundGroups = firstForOp && docs.found_groups.has_value();
   bool haveWarnings = !state.anyHeaderEmitted && !warnings.empty();
   bool haveRequestId = !state.anyHeaderEmitted && !state.requestId.empty();
   // Multi-op framing: any change of op needs a marker for attribution.
   bool needMarker = state.multiOp && (firstForOp || run.op != state.currentOp);
-  bool haveContent = haveFound || haveFoundDocs || haveWarnings || haveRequestId;
+  bool haveContent = haveFound || haveFoundDocs || haveFoundGroups || haveWarnings || haveRequestId;
   if (run.body.empty() && !haveContent) return false;  // nothing to say
 
   if (haveContent || needMarker) {
@@ -679,6 +685,12 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       if (!first) marker += ',';
       marker += R"("found_docs":)";
       appendInt(marker, *docs.found_docs);
+      first = false;
+    }
+    if (haveFoundGroups) {
+      if (!first) marker += ',';
+      marker += R"("found_groups":)";
+      appendInt(marker, *docs.found_groups);
       first = false;
     }
     if (haveWarnings) {

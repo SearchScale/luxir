@@ -4,12 +4,10 @@
 #pragma once
 
 #include "SearchOp.h"
-#include "luxir/search/Collapse.h"
+#include "luxir/search/Collector.h"
 #include "luxir/search/SortField.h"
 
 namespace luxir {
-
-template <bool Collapsed> class ScoreCollector;
 
 // A ranked list supplies its finalized membership and original scores. The
 // source and eligibility handles live through synchronous page execution;

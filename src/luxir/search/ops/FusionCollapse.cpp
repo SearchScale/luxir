@@ -138,7 +138,9 @@ void FusionOp::Calc::appendCollapsedSource(MergeableCollector& collector, std::v
     heads.reserve(rows.size());
     for (const auto& row : rows) heads.push_back({row.doc, row.score});
   };
-  if (collector.useFieldSort) append(*collector.groupFieldCollector);
+  if (collector.diverseFieldCollector) append(*collector.diverseFieldCollector);
+  else if (collector.diverseScoreCollector) append(*collector.diverseScoreCollector);
+  else if (collector.useFieldSort) append(*collector.groupFieldCollector);
   else append(*collector.groupScoreCollector);
 }
 
