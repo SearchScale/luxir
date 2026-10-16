@@ -784,7 +784,7 @@ protected:
     termsIS.skip(sizeof(pulsedMask));
     suffixBytesTotal = termsIS.readVint();
 
-    memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
+    copyShortBytes((char*) currTerm.ptr(), (const char*) startingTerm.ptr(), startingTerm.memorySize());
     // The block's first term is not delta-coded against anything, so nothing is
     // known to be shared with whatever term preceded it.
     sharedLen = 0;
@@ -851,10 +851,7 @@ protected:
     const char* data = currTerm.data();
     uint32_t len = currTerm.size();
     assert(len == currTerm.size());
-    // TODO: things to try:
-    // - an explicit loop vs memcpy
-    // - an explict loop of 8 bytes at a time... requires making sure there are extra bytes at the end of termIS file.
-    //   - try it as a do-while loop... easier branch prediction?
+    // Suffixes are short: an inline copy, not a memcpy call (copyShortBytes).
 
     assert(blockPrefixLen <= len);
     uint32_t factoredLen = len - blockPrefixLen;
@@ -865,7 +862,7 @@ protected:
     // compares at that factored boundary.
     assert(prefixLen == factoredLen || data[blockPrefixLen + prefixLen] != *suffix);
 
-    memcpy(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
+    copyShortBytes(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
     currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
     // Never an over-estimate whatever the build: these bytes were not written
     // just now, they are inherited from the previous term's reconstruction, so

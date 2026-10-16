@@ -17,6 +17,7 @@
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/log.h"
+#include "luxir/util/luxir_util.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/thread.h"
 
@@ -44,6 +45,23 @@ TEST_F(UtilTest, packedTermTruncate) {
   EXPECT_FALSE(PackedTerm::mayBeFitted(std::string(PackedTerm::MIN_FITTED_LEN - 1, 'a')));
   EXPECT_TRUE(PackedTerm::mayBeFitted(PackedTerm::truncate(cont)));
   EXPECT_TRUE(PackedTerm::mayBeFitted(PackedTerm::truncate(acc)));
+}
+
+TEST_F(UtilTest, copyShortBytesMatchesMemcpyAndStaysInBounds) {
+  std::array<char, 300> src{};
+  for (size_t i = 0; i < src.size(); i++) src[i] = (char)(i * 37 + 11);
+  for (size_t offset = 0; offset < 9; offset++) {
+    for (size_t n = 0; n <= PackedTerm::MAX_LEN; n++) {
+      std::array<char, 300> dst;
+      dst.fill('\x5a');
+      copyShortBytes(dst.data() + 16 + offset, src.data() + offset, n);
+      for (size_t i = 0; i < dst.size(); i++) {
+        bool inside = i >= 16 + offset && i < 16 + offset + n;
+        char expected = inside ? src[i - 16] : '\x5a';
+        ASSERT_EQ(expected, dst[i]) << "offset " << offset << " n " << n << " byte " << i;
+      }
+    }
+  }
 }
 
 TEST_F(UtilTest, packedTermHash128Format) {
