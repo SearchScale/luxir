@@ -1291,6 +1291,10 @@ public:
     values[slot] = otherStr->values[otherSlot];
   }
   
+  // Retained variable-width payload; fixed slot arrays are accounted by the
+  // owning collection route. Ordinary top-k never calls this accessor.
+  size_t retainedSlotBytes(int32_t slot) const;
+
   ~StrColComparator() override = default;
 };
 

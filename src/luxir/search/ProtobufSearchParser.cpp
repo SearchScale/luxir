@@ -671,6 +671,7 @@ public:
     }
     if (facetReq.count_distinct) {
       if (facetReq.count_distinct->get_number || !facetReq.count_distinct->head_sort.empty()
+          || !facetReq.count_distinct->sort.empty()
           || !facetReq.count_distinct->ops.empty()) {
         throw RequestError("count_distinct accepts only field and missing");
       }
@@ -1717,7 +1718,7 @@ public:
     bool allowPruning = requirements.needRankedDocs
         && !parsedSorts.useFieldSort
         && (!requirements.needExactCount || requirements.needExactDomain);
-    if (allowPruning) {
+    if (allowPruning && !(collapse && !topDocsReq.collapse->sort.empty())) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);

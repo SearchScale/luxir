@@ -500,13 +500,23 @@ public:
 
 };
 
-// Fixed-stride inline facet entries keyed by int64 bucket key. A positive dense
+// Fixed-stride inline aggregate entries: int64 bucket keys for facets, exact
+// group keys for metric-ordered collapse. With int64 keys, a positive dense
 // key-space size permits keys in [0, size); zero permits arbitrary signed keys
 // with sparse storage. Dense entries use one flat key-indexed allocation plus
 // touched order; sparse entries use map
 // iteration order. Each representation keeps one stable order from finalize
 // through selection and result fill.
-class FacetEntryTable {
+struct NoAggregatePayload {
+  static constexpr size_t BYTES = 0;
+};
+
+// Key and payload policies are compile-time: the ordinal facet specialization
+// retains its packed layout and direct dense indexing.
+template <typename Key = int64_t, typename Hash = boost::hash<Key>,
+          typename Payload = NoAggregatePayload>
+class KeyedAggregateTable {
+  using KeyArg = std::conditional_t<std::is_same_v<Key, int64_t>, int64_t, const Key&>;
   enum class Rep { UNINITIALIZED, SPARSE, DENSE };
 
   // Initial, refittable crossover constants. The 64 MiB entry-array cap admits
@@ -521,10 +531,12 @@ class FacetEntryTable {
   // boost::unordered_flat_map's open-addressed slot array needs spare slots;
   // two value slots per touched key is a conservative budget reservation.
   static constexpr size_t SPARSE_HASH_BYTES_PER_ENTRY =
-      2 * (sizeof(std::pair<int64_t, char*>) + 1);
+      2 * (sizeof(std::pair<Key, char*>) + 1);
   static constexpr std::string_view BREAKER = "facet aggregate state";
 
-  BigFlatMap<int64_t, char*> sparseEntries;
+  BigFlatMap<Key, char*, Hash> sparseEntries;
+  [[no_unique_address]] Payload payload;
+  static constexpr size_t HEADER_BYTES = sizeof(int64_t) + Payload::BYTES;
   // The entry header counts documents delivered to metrics. Repeated values
   // add only facet occurrences, without changing compact metric denominators.
   boost::unordered_flat_map<char*, int64_t> extraOccurrences;
@@ -539,7 +551,7 @@ class FacetEntryTable {
   size_t sparseBytesCharged = 0;
   size_t touchedCapacityCharged = 0;
   size_t denseStorageBytesCharged = 0;
-  size_t stride = sizeof(int64_t);
+  size_t stride = HEADER_BYTES;
   int64_t keySpaceSize = 0;
   Rep rep = Rep::UNINITIALIZED;
 
@@ -610,8 +622,9 @@ class FacetEntryTable {
     }
   }
 
-  char* sparseFirstTouch(int64_t key) {
+  char* sparseFirstTouch(KeyArg key) {
     size_t bytes = stride + SPARSE_HASH_BYTES_PER_ENTRY;
+    if constexpr (requires { key.ramBytesUsed(); }) bytes += key.ramBytesUsed();
     charge(bytes);
     sparseBytesCharged += bytes;
     char* entry = entryPool.alloc(stride);
@@ -621,8 +634,8 @@ class FacetEntryTable {
     return entry;
   }
 
-  char* LUXIR_INLINE findEntry(int64_t key) {
-    if (rep == Rep::DENSE) {
+  char* LUXIR_INLINE findEntry(KeyArg key) {
+    if constexpr (std::is_same_v<Key, int64_t>) if (rep == Rep::DENSE) {
       assert(key >= 0 && key < keySpaceSize);
       char* entry = denseEntryForIndex((size_t)key);
       // Zero count is the absence sentinel. Inline mincount=0 deliberately
@@ -633,8 +646,8 @@ class FacetEntryTable {
     return iter == sparseEntries.end() ? nullptr : iter->second;
   }
 
-  char* firstTouch(int64_t key) {
-    if (rep == Rep::DENSE) {
+  char* firstTouch(KeyArg key) {
+    if constexpr (std::is_same_v<Key, int64_t>) if (rep == Rep::DENSE) {
       assert(key >= 0 && key < keySpaceSize);
       ensureTouchedCapacity();
       touchedKeys.push_back(key);
@@ -645,10 +658,11 @@ class FacetEntryTable {
 
   void LUXIR_INLINE insertEntry(char* entry, int32_t docid) {
     storeUnaligned<int64_t>(entry, 1);
-    char* ptr = entry + sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.insert(entry + sizeof(int64_t), docid);
+    char* ptr = entry + HEADER_BYTES;
     if (calcs.size() == 1) {
       calcs.front()->insert(ptr, docid);
-      assert(sizeof(int64_t) + calcEntryBytes.front() == stride);
+      assert(HEADER_BYTES + calcEntryBytes.front() == stride);
       return;
     }
     for (size_t i = 0; i < calcs.size(); i++) {
@@ -660,7 +674,8 @@ class FacetEntryTable {
 
   void LUXIR_INLINE updateEntry(char* entry, int32_t docid) {
     storeUnaligned<int64_t>(entry, loadUnaligned<int64_t>(entry) + 1);
-    char* ptr = entry + sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.update(entry + sizeof(int64_t), docid);
+    char* ptr = entry + HEADER_BYTES;
     if (calcs.size() == 1) {
       calcs.front()->update(ptr, docid);
       return;
@@ -671,10 +686,12 @@ class FacetEntryTable {
     }
   }
 
-  void mergeNewEntry(char* target, char* from) {
+  void mergeNewEntry(char* target, char* from, KeyedAggregateTable& other) {
     storeUnaligned<int64_t>(target, loadUnaligned<int64_t>(from));
-    target += sizeof(int64_t);
-    from += sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.mergeNew(target + sizeof(int64_t),
+        from + sizeof(int64_t), other.payload);
+    target += HEADER_BYTES;
+    from += HEADER_BYTES;
     for (size_t i = 0; i < calcs.size(); i++) {
       calcs[i]->mergeNew(target, from);
       target += calcEntryBytes[i];
@@ -682,11 +699,13 @@ class FacetEntryTable {
     }
   }
 
-  void mergeEntry(char* target, char* from) {
+  void mergeEntry(char* target, char* from, KeyedAggregateTable& other) {
     storeUnaligned<int64_t>(
         target, loadUnaligned<int64_t>(target) + loadUnaligned<int64_t>(from));
-    target += sizeof(int64_t);
-    from += sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.merge(target + sizeof(int64_t),
+        from + sizeof(int64_t), other.payload);
+    target += HEADER_BYTES;
+    from += HEADER_BYTES;
     for (size_t i = 0; i < calcs.size(); i++) {
       calcs[i]->merge(target, from);
       target += calcEntryBytes[i];
@@ -701,11 +720,13 @@ public:
     return saturatingMultiply((size_t)denseKeys, stride);
   }
 
-  FacetEntryTable() = default;
-  FacetEntryTable(const FacetEntryTable&) = delete;
-  FacetEntryTable& operator=(const FacetEntryTable&) = delete;
+  explicit KeyedAggregateTable(Payload policy = {}) : payload(std::move(policy)) {}
+  Payload& payloadPolicy() { return payload; }
+  static char* metricState(char* entry) { return entry + HEADER_BYTES; }
+  KeyedAggregateTable(const KeyedAggregateTable&) = delete;
+  KeyedAggregateTable& operator=(const KeyedAggregateTable&) = delete;
 
-  ~FacetEntryTable() {
+  ~KeyedAggregateTable() {
     if (tracker != nullptr) {
       releaseCharge(denseStorageBytesCharged + sparseBytesCharged
                     + touchedCapacityCharged);
@@ -757,7 +778,7 @@ public:
     int64_t quarterKeys = keySpaceSize / 4 + (keySpaceSize % 4 != 0);
     bool likelyDense = keySpaceSize <= DENSE_SMALL_KEYS
         || expectedValues >= quarterKeys;
-    bool wantDense = !forceSparse
+    bool wantDense = std::is_same_v<Key, int64_t> && !forceSparse
         && (forceDense || (denseFitsCap && likelyDense));
     if (wantDense && keySpaceSize > 0) {
       if (denseSizeValid && tryInitializeDense(denseBytes, expectedTouched)) {
@@ -776,7 +797,7 @@ public:
 
   // Resolve once when many documents share a key. The caller must touch a
   // new entry before resolving it again; zero marks uninitialized metric state.
-  char* resolveEntry(int64_t key) {
+  char* resolveEntry(KeyArg key) {
     assert(rep != Rep::UNINITIALIZED);
     char* entry = findEntry(key);
     if (entry == nullptr) {
@@ -797,7 +818,7 @@ public:
   // instantiated per domain and column shape, and inlining add() into those
   // large bodies leaves the inliner no budget to fold the devirtualized
   // calculator update in here, turning it into a virtual call per document.
-  void LUXIR_NOINLINE add(int64_t key, int32_t docid) {
+  void LUXIR_NOINLINE add(KeyArg key, int32_t docid) {
     assert(rep != Rep::UNINITIALIZED);
     char* entry = findEntry(key);
     if (entry == nullptr) {
@@ -830,7 +851,7 @@ public:
   }
 
   template <typename RemapKey>
-  void merge(FacetEntryTable& other, RemapKey&& remapKey) {
+  void merge(KeyedAggregateTable& other, RemapKey&& remapKey) {
     assert(rep != Rep::UNINITIALIZED || other.empty());
     if (rep == Rep::DENSE && !other.empty() && stats != nullptr) {
       stats->denseMerges.fetch_add(1, std::memory_order_relaxed);
@@ -839,14 +860,14 @@ public:
       }
     }
     const bool carryOccurrences = !other.extraOccurrences.empty();
-    other.forEachEntry([&](int64_t key, char* from) {
-      int64_t targetKey = remapKey(key);
+    other.forEachEntry([&](KeyArg key, char* from) {
+      decltype(auto) targetKey = remapKey(key);
       char* target = findEntry(targetKey);
       if (target == nullptr) {
         target = firstTouch(targetKey);
-        mergeNewEntry(target, from);
+        mergeNewEntry(target, from, other);
       } else {
-        mergeEntry(target, from);
+        mergeEntry(target, from, other);
       }
       if (carryOccurrences) {
         auto it = other.extraOccurrences.find(from);
@@ -855,16 +876,16 @@ public:
     });
   }
 
-  void merge(FacetEntryTable& other) {
-    merge(other, [](int64_t key) { return key; });
+  void merge(KeyedAggregateTable& other) {
+    merge(other, [](KeyArg key) -> KeyArg { return key; });
   }
 
   void finalize() {
     for (auto* calc : calcs) calc->beginFinalize(size());
-    forEachEntry([&](int64_t key, char* entry) {
+    forEachEntry([&](KeyArg key, char* entry) {
       unused(key);
       int64_t count = loadUnaligned<int64_t>(entry);
-      char* ptr = entry + sizeof(int64_t);
+      char* ptr = entry + HEADER_BYTES;
       for (size_t i = 0; i < calcs.size(); i++) {
         calcs[i]->finalize(ptr, count);
         ptr += calcEntryBytes[i];
@@ -874,7 +895,7 @@ public:
 
   template<typename Accept>
   void forEachEntry(Accept&& accept) {
-    if (rep == Rep::DENSE) {
+    if constexpr (std::is_same_v<Key, int64_t>) if (rep == Rep::DENSE) {
       for (int64_t key : touchedKeys) {
         size_t index = (size_t)key;
         accept(key, denseEntries.data() + index * stride);
@@ -891,5 +912,6 @@ public:
   bool dense() const { return rep == Rep::DENSE; }
 };
 
+using FacetEntryTable = KeyedAggregateTable<>;
 
 }

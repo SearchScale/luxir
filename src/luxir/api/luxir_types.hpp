@@ -533,6 +533,7 @@ struct Collapse {
   std::span<const std::string_view> field;
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::span<const SortSpec> head_sort;
+  std::span<const SortSpec> sort;
   bool get_number = false;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
 };

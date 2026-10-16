@@ -650,6 +650,16 @@ public:
     head = candidate;
   }
 
+  // Merge an independent fold using the retained slot values, including
+  // expression results and string ordinals, without reading documents again.
+  void fold(int32_t slot, std::optional<SortDoc>& head,
+            FieldCollector& other, const SortDoc& candidate) {
+    if (head && compare(*head, candidate, CompareSource::OTHER, &other) <= 0) return;
+    ensureSlotCapacity((int64_t)slot + 1);
+    copy(slot, other, candidate.slot, candidate.doc);
+    head = SortDoc(candidate.doc, candidate.score, slot);
+  }
+
   struct CompetitiveRange {
     int32_t begin;
     int32_t end;

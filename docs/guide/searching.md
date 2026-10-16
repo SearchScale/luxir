@@ -192,6 +192,49 @@ keys. Returning all groups or paging deeply also requires keeping more group
 heads in memory. Without totals, Luxir can skip documents whose ranking
 cannot reach the requested page.
 
+To order groups by their metrics, use `collapse.sort`. Its clauses name
+metric operations in `collapse.ops`, in priority order:
+
+```json
+{
+  "query": "title_t:jacket",
+  "sort": "score desc",
+  "get_scores": true,
+  "collapse": {
+    "field": "product_s",
+    "sort": ["from_price asc", "average_rating desc"],
+    "ops": {
+      "from_price": "min(price_f)",
+      "average_rating": "avg(rating_i)"
+    }
+  },
+  "limit": 10
+}
+```
+
+Each metric folds the group's eligible matching documents. Missing or failed
+metric values sort last in either direction; equal values continue to the
+next clause. Groups still tied follow their best member under the list's
+`sort`, then that member's document order. The displayed member is unchanged:
+it follows `head_sort`, defaulting to the list sort. With `get_scores: true`,
+`_group_.rank` contains the typed metric values in clause order, including
+nulls; the row's `_score_` remains its own relevance score.
+
+Metric order is exhaustive: every eligible group is accumulated before
+paging, even for a small `limit`. `offset`, `limit`, and `found` count groups;
+`limit: 0` returns requested totals without rows. Memory grows with all
+matching groups and metric states, and exceeding the request budget fails
+the request. Page member counts, display heads, operations and domain resets
+then run on the selected page as usual.
+
+Sort clauses must name metrics in `collapse.ops`. Sort metrics with their
+own `domain` override are currently unsupported; other page operations may
+reset their domains normally. Metric-ordered lists also work beneath facet
+and group buckets and in `Fusion.ops`; Fusion itself has no collapse order.
+With group-unit kNN, kNN first selects its candidate groups and their scored
+witnesses, then the metrics order those witnesses' groups. Metric ordering
+does not enlarge the kNN window.
+
 To display a different member while keeping the group's rank, set
 `collapse.head_sort`. It accepts the same clauses and expressions as `sort`,
 with document order resolving ties. For example, rank products by relevance

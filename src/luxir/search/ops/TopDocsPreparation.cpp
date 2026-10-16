@@ -15,7 +15,7 @@ void retainPreparedWindow(RequestMemTracker& tracker,
 }
 }  // namespace
 
-template <bool Structural>
+template <bool Structural, bool MetricGroups>
 void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
   {
     auto release = scope_guard([&]() noexcept {
@@ -23,8 +23,8 @@ void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
     });
     prepareDomains<Structural>(tg);
   }
-  dispatch<Structural>(tg, thisOp().domainVariants.empty() ? std::span<const DomainHandle>(effectiveDomains)
-                                                           : std::span<const DomainHandle>(inputDomains));
+  dispatch<Structural, MetricGroups>(tg, thisOp().domainVariants.empty()
+      ? std::span<const DomainHandle>(effectiveDomains) : std::span<const DomainHandle>(inputDomains));
 }
 
 template <bool Structural>
@@ -329,8 +329,10 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
   }
 }
 
-template void TopDocsReq::CalcBase::prepareAndDispatch<false>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareAndDispatch<true>(oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<false, false>(oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<true, false>(oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<false, true>(oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<true, true>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareDomains<false>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareDomains<true>(oneapi::tbb::task_group*);
 template void TopDocsReq::CalcBase::prepareMainVariants<false>(oneapi::tbb::task_group*);

@@ -31,6 +31,9 @@ struct CollapseKey {
   // Singleton and component tags are identities, never result-order keys.
   std::optional<uint64_t> singleton;
   boost::container::small_vector<Component, 2> components;
+  size_t ramBytesUsed() const {
+    return components.size() > 2 ? components.capacity() * sizeof(Component) : 0;
+  }
   bool operator==(const CollapseKey& other) const {
     return singleton == other.singleton && components == other.components;
   }

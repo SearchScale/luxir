@@ -11,6 +11,9 @@ SearchOp::Calculator* TopDocsReq::createCalculator(
     Calculator* parent, int64_t slot, int64_t numSlots,
     const StructuralConstraint* structural) {
   auto* scope = structural ? structural : parent ? parent->structuralConstraint() : nullptr;
+  if (metricOrder) {
+    return createMetricGroupCalculator(*this, parent, slot, numSlots, scope);
+  }
   if (scope && domainVariants.hasResetVariants()) {
     return new Calc<true>(*this, parent, slot, numSlots, scope);
   }

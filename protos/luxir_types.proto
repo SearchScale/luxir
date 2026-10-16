@@ -107,6 +107,9 @@ message Collapse {
   // Per-group operations on matching members; facet count units start at docs.
   // Explicit group units still resolve to this nearest enclosing collapse.
   map<string, SearchOp> ops = 5;
+  // Exhaustive group order by metrics in ops; missing/failed values last.
+  // Ties use the best member under the list sort, then document order.
+  repeated SortSpec sort = 6;
 }
 
 message TopDocs {
@@ -786,7 +789,7 @@ message GroupKey {
 message GroupTable {
   repeated GroupKey keys = 1;
   repeated sint64 counts = 2;
-  // One typed array per row; empty when the displayed member is the ranking member.
+  // Metric sort values, or list rank values when head_sort chooses another member.
   repeated ArrVal ranks = 3;
   // Each operation is an array aligned with keys, as in FacetResult.ops.
   map<string, Val> ops = 4;

@@ -391,6 +391,8 @@ public:
           : (uint64_t)(int64_t)result.intValue);
     }
 
+    api::Val finalizedValue(size_t slot) const;
+
     int compare(size_t a, size_t b) override {
       return compareResults(a, b);
     }

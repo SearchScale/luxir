@@ -12,6 +12,17 @@
 using namespace luxir;
 using namespace luxir::test;
 
+// Shared catalog rows for member-card and aggregate-order measurements.
+static Doc collapseCatalogDoc(int32_t id, int32_t products, int32_t variants) {
+  int32_t product = id % products, variant = id / products;
+  return flatdoc("id", std::to_string(id), "key_s", "p" + std::to_string(product),
+      "shop_s", "s" + std::to_string(product % 17),
+      "color_s", "c" + std::to_string(variant % 8),
+      "price_i", (int64_t)(100 + variants - variant), "rank_i", (int64_t)product,
+      "stock_i", (int64_t)((product + variant) % 3 != 0),
+      "eligible_s", (product + variant) % 101 == 0 ? "yes" : "no");
+}
+
 // Product variants spread across segments. Every group has one shop component;
 // the tuple is correlated and has the same membership as the scalar key.
 // Args: page groups, variants/group, segments, selective, tuple.
@@ -45,13 +56,8 @@ static void BM_CollapseMembers(benchmark::State& state, int mode) {
     for (int32_t s = 0; s < segments; s++) {
       std::vector<Doc> docs;
       for (int32_t id = s * total / segments; id < (s + 1) * total / segments; id++) {
-        int32_t product = id % products, variant = id / products;
-        docs.push_back(flatdoc("id", std::to_string(id), "key_s", "p" + std::to_string(product),
-            "shop_s", "s" + std::to_string(product % 17),
-            "color_s", "c" + std::to_string(variant % 8),
-            "price_i", (int64_t)(100 + variants - variant), "rank_i", (int64_t)product,
-            "stock_i", (int64_t)((product + variant) % 3 != 0),
-            "eligible_s", (product + variant) % 101 == 0 ? "yes" : "no"));
+        int32_t product = id % products;
+        docs.push_back(collapseCatalogDoc(id, products, variants));
         if (nullKeys && product % 2 == 0) {
           std::erase_if(docs.back(), [](const auto& field) { return field.name == "shop_s"; });
         }
@@ -314,3 +320,59 @@ static void BM_RootDomainReset(benchmark::State& state, bool reset) {
 TUNING_BENCHMARK_CAPTURE(BM_RootDomainReset, query, true)->UseRealTime()->Arg(160'000)->Arg(2'000'000);
 TUNING_BENCHMARK_CAPTURE(BM_RootDomainReset, filter, false)->UseRealTime()->Arg(160'000)->Arg(2'000'000);
 LUXIR_BENCHMARK_CAPTURE(BM_RootDomainReset, deletes, true)->Arg(120);
+
+// Same scattered seven-segment catalog as the member-card cases. The facet
+// supports one sort expression; the two-clause equivalent is an exact integer
+// encoding, since product rank is in [0, products) and price is integral.
+static void BM_CollapseMetricOrder(benchmark::State& state, bool facet, bool twoClauses) {
+  int32_t variants = (int32_t)state.range(0), segments = 7;
+  int32_t products = unit_tests ? 120 : (int32_t)LuxirTest::scaleTestWork(20'000);
+  std::string name = "members_reset_bm_" + std::to_string(products) + "_"
+      + std::to_string(variants) + "_" + std::to_string(segments);
+  CollectionHelper helper(name);
+  int32_t total = products * variants;
+  std::vector<int32_t> sizes;
+  for (int32_t s = 0; s < segments; s++) sizes.push_back((s + 1) * total / segments - s * total / segments);
+  if (!helper.indexMatchesShape(sizes)) {
+    helper.clear();
+    for (int32_t s = 0; s < segments; s++) {
+      std::vector<Doc> docs;
+      for (int32_t id = s * total / segments; id < (s + 1) * total / segments; id++)
+        docs.push_back(collapseCatalogDoc(id, products, variants));
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+  }
+  std::string body = R"({"collection":")" + name + R"(","fields":[],"sort":"_docid_ asc",)";
+  if (facet) {
+    std::string metric = twoClauses
+        ? "min(price_i)*" + std::to_string(products + 1) + "-max(rank_i)" : "min(price_i)";
+    body += R"JSON("limit":0,"ops":{"products":{"field_facet":{"field":"key_s",
+      "limit":10,"sort":["order asc"],"ops":{"order":")JSON" + metric + R"("}}}}})";
+  } else {
+    body += R"JSON("limit":10,"get_number":true,"collapse":{"field":"key_s","sort":)JSON"
+        + std::string(twoClauses ? R"(["lo asc","hi desc"])" : R"(["lo asc"])")
+        + R"JSON(,"ops":{"lo":"min(price_i)")JSON"
+        + (twoClauses ? R"JSON(,"hi":"max(rank_i)")JSON" : "") + "}}}";
+  }
+  auto execute = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    if (!api::read_json(req->rawRequest(), body, req->mr)) throw std::runtime_error(body);
+    req->execute(false);
+    if (!req->ok()) throw std::runtime_error(req->errorMsg());
+    return req;
+  };
+  {
+    auto req = execute();
+    state.counters["peak_tracked"] = (double)req->memoryTracker.peak();
+    state.counters["groups"] = facet ? products : req->docList()->found.value_or(-1);
+  }
+  for (auto _ : state) {
+    auto req = execute();
+    benchmark::DoNotOptimize(req->responses.size());
+  }
+  state.SetItemsProcessed(state.iterations() * total);
+}
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, groups_min, false, false)->Arg(8)->Arg(100);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, facet_min, true, false)->Arg(8)->Arg(100);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, groups_two, false, true)->Arg(8)->Arg(100);
+LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, facet_two, true, true)->Arg(8)->Arg(100);
