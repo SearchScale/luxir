@@ -76,20 +76,6 @@ namespace luxir::api::jsond {
 template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
 template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
-// True if the number token starting at `it` has a fraction or exponent (JSON syntax:
-// only '.', 'e', 'E' can introduce one; the token ends at a delimiter/ws/NUL).
-inline bool numberTokenIsFloat(const auto* it, const auto* end) {
-  for (auto p = it; p != end; ++p) {
-    char c = (char)*p;
-    if (c == '.' || c == 'e' || c == 'E') return true;
-    if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-        c == '\0') {
-      break;
-    }
-  }
-  return false;
-}
-
 // One JSON number token, parsed in a single pass: an integral token (no fraction or
 // exponent) into `i`, anything else into `d`.
 struct Number {
@@ -101,10 +87,9 @@ struct Number {
 
 // Parses the number at `p` with glaze's strict JSON grammar and its fast_float
 // conversion (the code glaze's own double read runs), so values are bit-identical to
-// the per-type reads. Returns false wherever those reads fail: a malformed token ("01",
-// "1.", ".5", "+1", "NaN"), an integral token outside int64, or a double conversion
-// error; the caller then reruns the generic read, which owns the error. Bytes after the
-// token are the caller's to validate ("1e" parses 1 and leaves "e").
+// glaze's per-type reads. Returns false for a malformed token ("01", "1.", ".5", "+1",
+// "NaN"), an integral token outside int64, or a double conversion error. Bytes after
+// the token are the caller's to validate ("1e" parses 1 and leaves "e").
 template <bool NullTerminated>
 inline bool parseNumber(const char* p, const char* end, Number& out) {
   auto pns = glz::parse_number_string<NullTerminated>(p, end);
@@ -122,11 +107,12 @@ inline bool parseNumber(const char* p, const char* end, Number& out) {
 }
 
 // Reads an array whose elements are all JSON numbers (`it` at its '[') straight into a
-// typed ArrInt or ArrDouble: one pass per number into one buffer, instead of a Val per
-// element collapsed afterwards. Ints promote to double exactly as that collapse does.
+// typed ArrInt or ArrDouble: one pass per number into one buffer, no Val per element.
+// Ints stay exact until the first non-integral token, then promote as (double)int64.
 // Returns false, with `it` and ctx unchanged, for any other array or any syntax error;
-// the caller's generic read then produces the result or the error, so this path only
-// accepts input the generic read accepts, and with the same value.
+// the caller's generic read then produces the ArrVal/ArrStr or the error. That read
+// parses each number with the same parseNumber, so every all-number array it accepts
+// is taken here first and it never yields ArrInt/ArrDouble itself.
 // Not inlined: the stack buffer must stay out of the recursive Val reader's frame.
 template <auto Opts>
 [[gnu::noinline]] bool readNumberArray(Val& value, auto& ctx, auto& it, auto& end) {
@@ -1304,34 +1290,16 @@ struct from<JSON, luxir::api::Val> {
         if (bool(ctx.error)) [[unlikely]] {
           break;
         }
-        // Collapse a homogeneous array to its typed arm (most specific wins); ints
-        // promote when mixed with doubles; anything else stays a generic ArrVal.
-        bool allS = !tmp.v.empty(), allI = allS, allNum = allS;
-        for (const auto &e : tmp.v) {
-          bool isI = std::holds_alternative<std::int64_t>(e.kind);
-          allS = allS && std::holds_alternative<std::string_view>(e.kind);
-          allI = allI && isI;
-          allNum = allNum && (isI || std::holds_alternative<double>(e.kind));
-        }
-        size_t n = tmp.v.size();
-        auto &mr = ctx.memory_resource();
+        // All-number arrays were taken by readNumberArray; an all-string array
+        // collapses to ArrStr, anything else stays a generic ArrVal.
+        bool allS = !tmp.v.empty();
+        for (const auto &e : tmp.v) allS = allS && std::holds_alternative<std::string_view>(e.kind);
         if (allS) {
-          auto *a = (std::string_view *)mr.allocate(n * sizeof(std::string_view),
-                                                    alignof(std::string_view));
+          size_t n = tmp.v.size();
+          auto *a = (std::string_view *)ctx.memory_resource().allocate(
+              n * sizeof(std::string_view), alignof(std::string_view));
           for (size_t i = 0; i < n; i++) a[i] = std::get<std::string_view>(tmp.v[i].kind);
           value.kind.template emplace<api::ArrStr>().v = {a, n};
-        } else if (allI) {
-          auto *a = (std::int64_t *)mr.allocate(n * sizeof(std::int64_t), alignof(std::int64_t));
-          for (size_t i = 0; i < n; i++) a[i] = std::get<std::int64_t>(tmp.v[i].kind);
-          value.kind.template emplace<api::ArrInt>().v = {a, n};
-        } else if (allNum) {
-          auto *a = (double *)mr.allocate(n * sizeof(double), alignof(double));
-          for (size_t i = 0; i < n; i++) {
-            const auto &k = tmp.v[i].kind;
-            auto *d = std::get_if<double>(&k);
-            a[i] = d ? *d : (double)std::get<std::int64_t>(k);
-          }
-          value.kind.template emplace<api::ArrDouble>().v = {a, n};
         } else {
           value.kind.template emplace<api::ArrVal>() = tmp;
         }
@@ -1339,15 +1307,13 @@ struct from<JSON, luxir::api::Val> {
       }
       default: {
         api::jsond::Number num;
-        if (api::jsond::parseNumber<O.null_terminated>(it, end, num)) [[likely]] {
-          if (num.isInt) value.kind.template emplace<std::int64_t>(num.i);
-          else value.kind.template emplace<double>(num.d);
-          it = num.next;
-        } else if (api::jsond::numberTokenIsFloat(it, end)) {  // the generic reads own errors
-          util::from_json<O>(value.kind.template emplace<double>(), ctx, it, end);
-        } else {
-          util::from_json<O>(value.kind.template emplace<std::int64_t>(), ctx, it, end);
+        if (!api::jsond::parseNumber<O.null_terminated>(it, end, num)) [[unlikely]] {
+          ctx.error = error_code::parse_number_failure;
+          break;
         }
+        if (num.isInt) value.kind.template emplace<std::int64_t>(num.i);
+        else value.kind.template emplace<double>(num.d);
+        it = num.next;
         break;
       }
     }
