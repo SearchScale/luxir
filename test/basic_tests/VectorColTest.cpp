@@ -818,24 +818,36 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
   EXPECT_NO_THROW(indexVal(inverter, vh, zero));
 }
 
-TEST_F(VectorColTest, rejectsDoubleValuesOutsideFiniteFloat32Range) {
+// Every element must be a finite float32, whatever arm carries it: a double past
+// float32 range, or a NaN/Inf in a double or typed f32 vector, fails the document
+// (cosine included - it is not skipped as a zero vector).
+TEST_F(VectorColTest, rejectsNonFiniteElements) {
   RAMDir dir;
   auto schema = std::make_shared<Schema>();
-  auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/1);
-  schema->fieldTypeMap["strict_v"] = strictType;
+  schema->fieldTypeMap["strict_v"] = std::make_shared<VectorFieldType>("strict_v", /*dims=*/3);
+  schema->fieldTypeMap["cos_v"] = std::make_shared<VectorFieldType>(
+      "cos_v", /*dims=*/3, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
+      VectorFieldType::METRIC_COSINE);
   Inverter inverter(dir, 1, schema);
-  auto& vh = inverter.getIndexHandler("strict_v");
   std::pmr::monotonic_buffer_resource mr;
 
-  EXPECT_THROW(indexVal(inverter, vh,
-                        makeDoubles(mr, {std::numeric_limits<double>::max()})),
-               std::runtime_error);
-  EXPECT_THROW(indexVal(inverter, vh,
-                        makeDoubles(mr, {std::numeric_limits<double>::infinity()})),
-               std::runtime_error);
-  EXPECT_THROW(indexVal(inverter, vh,
-                        makeDoubles(mr, {std::numeric_limits<double>::quiet_NaN()})),
-               std::runtime_error);
+  auto expectElement1 = [&](const char* field, const luxir::api::Val& val) {
+    try {
+      indexVal(inverter, inverter.getIndexHandler(field), val);
+      ADD_FAILURE() << "expected a non-finite element error";
+    } catch (const std::runtime_error& e) {
+      EXPECT_NE(std::string_view(e.what()).find("element 1 is not a finite float32"),
+                std::string_view::npos) << e.what();
+    }
+  };
+  using DL = std::numeric_limits<double>;
+  using FL = std::numeric_limits<float>;
+  expectElement1("strict_v", makeDoubles(mr, {0.5, DL::max(), 0.5}));
+  expectElement1("strict_v", makeDoubles(mr, {0.5, -DL::infinity(), 0.5}));
+  expectElement1("strict_v", makeDoubles(mr, {0.5, DL::quiet_NaN(), 0.5}));
+  expectElement1("strict_v", makeVec(mr, {0.5f, FL::quiet_NaN(), 0.5f}));
+  expectElement1("strict_v", makeVec(mr, {0.5f, FL::infinity(), 0.5f}));
+  expectElement1("cos_v", makeVec(mr, {0.5f, FL::quiet_NaN(), 0.5f}));
 }
 
 // Schema round-trip: toProto/fromProto preserves VECTOR field with dims.

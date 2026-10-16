@@ -194,7 +194,9 @@ POST /collections/books/_update
 }
 ```
 
-Integer elements are accepted; doubles must narrow to finite float32.
+Integer elements are accepted. Every element must be a finite float32: a double
+past float32 range, or a NaN or infinity in any arm (typed gRPC vectors included),
+fails the document.
 
 Over gRPC, use the typed `Val.vec` and `Val.arr_vec` arms. In protobuf text,
 a single-valued vector field is:

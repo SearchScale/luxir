@@ -103,15 +103,12 @@ TEST_F(ValCoerceTest, toVectorsNarrowsDoubles) {
   EXPECT_EQ(floats, (std::vector<float>{0.5f, (float)-1e-3, (float)3.4e38, -0.0f}));
   EXPECT_EQ(lens, (std::vector<int32_t>{4}));
 
-  double big[] = {0.5, 1e39, std::nan("")};
-  v.kind.emplace<api::ArrDouble>().v = {big, 3};
-  try {
-    coerce::toVectors(v, "f", floats, lens);
-    FAIL() << "expected a range error";
-  } catch (const std::runtime_error& e) {
-    EXPECT_NE(std::string_view(e.what()).find("element 1 is outside finite float32 range"),
-              std::string_view::npos) << e.what();
-  }
+  // past float32 range narrows to inf; the vector handler rejects non-finite elements
+  double big[] = {1e39, -1e39};
+  v.kind.emplace<api::ArrDouble>().v = {big, 2};
+  EXPECT_FALSE(coerce::toVectors(v, "f", floats, lens));
+  float inf = std::numeric_limits<float>::infinity();
+  EXPECT_EQ(floats, (std::vector<float>{inf, -inf}));
 }
 
 TEST_F(ValCoerceTest, toTextRendersCanonically) {

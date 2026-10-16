@@ -2350,28 +2350,34 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
   req->done();
 }
 
-// A NaN stored vector must not poison the comparators (a non-total order
-// makes the sorts UB and the bounded cuts fold-order dependent); finiteScore
-// maps its score to the worst finite float so it deterministically ranks
-// last (still collected - unlike -infinity, which the score collectors'
-// sentinel would silently drop).
-TEST_F(KnnQueryTest, nanStoredVectorRanksLast) {
+// A NaN score must not poison the comparators (a non-total order makes the
+// sorts UB and the bounded cuts fold-order dependent); finiteScore maps it to
+// the worst finite float so the doc deterministically ranks last (still
+// collected - unlike -infinity, which the score collectors' sentinel would
+// silently drop). Stored vectors are finite, but opposite float32 overflows
+// accumulated in separate SIMD lanes still sum to inf + -inf = NaN (4 dims: a
+// shorter vector runs a sequential FMA chain, which saturates to inf instead).
+TEST_F(KnnQueryTest, nanScoreRanksLast) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::IP);
 
-  h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0}));
+  h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0, 0}));
   h.index(flatdoc("id", std::string("bad"), "embedding_v",
-                  std::vector<float>{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}));
-  h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0}));
+                  std::vector<float>{3e38f, -3e38f, 0, 0}));
+  h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {2, 2, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 3u);
   EXPECT_EQ(ids[0], "good1");
   EXPECT_EQ(ids[1], "good2");
   EXPECT_EQ(ids[2], "bad");
+  auto scores = resultScores(*req);
+  ASSERT_EQ(scores.size(), 3u);
+  EXPECT_EQ(scores[2], std::nextafter(std::numeric_limits<float>::lowest(), 0.0f))
+      << "bad must score NaN (mapped), not merely low";
   req->done();
 }
 
