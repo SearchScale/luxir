@@ -17,6 +17,7 @@
 #include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <memory_resource>
 #include <span>
@@ -399,17 +400,17 @@ const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   return it != segOrds.end() && it->first == segId ? &segs[(size_t)it->second] : nullptr;
 }
 
-IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t numSegments,
+IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, size_t numSegments,
                                       size_t first, int32_t ordinal)
-    : name(name), numSegments(numSegments),
+    : name(name), hash(hash), numSegments(numSegments),
       ordinals(std::make_unique<std::atomic<int32_t>[]>(numSegments)) {
   for (size_t i = 0; i < numSegments; i++) {
     ordinals[i].store(i < first ? -1 : UNRESOLVED, std::memory_order_relaxed);
   }
   ordinals[first].store(ordinal, std::memory_order_relaxed);
   bytes = sizeof(FieldRecord) + numSegments * sizeof(std::atomic<int32_t>)
-      + sizeof(FieldRecords::value_type)
-      + (name.size() > std::string().capacity() ? 2 * (name.size() + 1) : 0);
+      + FieldRecords::BYTES_PER_RECORD
+      + (name.size() > std::string().capacity() ? name.size() + 1 : 0);
   fieldMetadataMemory.names.fetch_add(1, std::memory_order_relaxed);
   fieldMetadataMemory.nameBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
@@ -421,16 +422,55 @@ IndexReader::FieldRecord::~FieldRecord() {
   delete stats;
 }
 
+IndexReader::FieldRecords::Table::Table(size_t capacity)
+    : mask(capacity - 1), slots(std::make_unique<std::atomic<const FieldRecord*>[]>(capacity)) {
+  assert(std::has_single_bit(capacity));
+}
+
+// Linear probing; tables stay at most half full, so every probe ends.
+const IndexReader::FieldRecord* IndexReader::FieldRecords::Table::find(
+    std::string_view name, size_t hash) const noexcept {
+  for (size_t i = hash & mask;; i = (i + 1) & mask) {
+    const FieldRecord* record = slots[i].load(std::memory_order_acquire);
+    if (!record) return nullptr;
+    if (record->hash == hash && record->name == name) return record;
+  }
+}
+
+void IndexReader::FieldRecords::Table::place(const FieldRecord* record) noexcept {
+  size_t i = record->hash & mask;
+  while (slots[i].load(std::memory_order_relaxed)) i = (i + 1) & mask;
+  slots[i].store(record, std::memory_order_release);
+}
+
+const IndexReader::FieldRecord* IndexReader::FieldRecords::insert(std::unique_ptr<FieldRecord> record) {
+  std::lock_guard lock(insertMutex);
+  Table* table = tables.empty() ? nullptr : tables.back().get();
+  if (table) {
+    if (auto* existing = table->find(record->name, record->hash)) return existing;
+  }
+  size_t needed = 2 * (records.size() + 1);
+  if (!table || needed > table->mask + 1) {
+    tables.push_back(std::make_unique<Table>(std::max<size_t>(16, std::bit_ceil(needed))));
+    table = tables.back().get();
+    for (const auto& kept : records) table->place(kept.get());
+  }
+  const FieldRecord* kept = record.get();
+  records.push_back(std::move(record));
+  table->place(kept);
+  current.store(table, std::memory_order_release);
+  return kept;
+}
+
 IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
-  const FieldRecord* record = nullptr;
-  auto get = [&](const auto& item) { record = item.second.get(); };
-  if (!core->fields->cvisit(name, get)) {
+  size_t hash = PackedTermHash{}(name);
+  const FieldRecord* record = core->fields->find(name, hash);
+  if (!record) {
     for (size_t i = 0; i < core->segs.size(); i++) {
       int32_t ordinal = core->segs[i].postingsReader().findOrdinal(name);
       if (ordinal < 0) continue;
-      auto fresh = std::make_unique<FieldRecord>(name, core->segs.size(), i, ordinal);
-      core->fields->try_emplace(std::string(name), std::move(fresh));
-      core->fields->cvisit(name, get);
+      record = core->fields->insert(
+          std::make_unique<FieldRecord>(name, hash, core->segs.size(), i, ordinal));
       break;
     }
   }

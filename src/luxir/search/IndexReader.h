@@ -11,7 +11,6 @@
 
 #include "DocSet.h"
 #include "Similarity.h"
-#include <boost/unordered/concurrent_flat_map.hpp>
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
@@ -207,17 +206,45 @@ private:
   struct FieldRecord {
     static constexpr int32_t UNRESOLVED = -2;
     std::string name;
+    size_t hash;
     size_t numSegments;
     std::unique_ptr<std::atomic<int32_t>[]> ordinals;
     mutable std::atomic<Similarity::FieldStats*> fieldStats{nullptr};
     mutable SharedLazyCell<OrdMap, true> ordMap;
     size_t bytes;
 
-    FieldRecord(std::string_view name, size_t numSegments, size_t first, int32_t ordinal);
+    FieldRecord(std::string_view name, size_t hash, size_t numSegments, size_t first, int32_t ordinal);
     ~FieldRecord();
   };
-  using FieldRecords = boost::unordered::concurrent_flat_map<
-      std::string, std::unique_ptr<FieldRecord>, PackedTermHash, PackedTermEqual>;
+
+  // Records by name. Insert-only, so a lookup takes no lock and writes no
+  // shared memory. Inserts serialize; one that grows the table publishes a
+  // doubled copy, and replaced tables live as long as the records because a
+  // lookup may still be probing one.
+  class FieldRecords {
+    struct Table {
+      size_t mask;
+      std::unique_ptr<std::atomic<const FieldRecord*>[]> slots;
+      explicit Table(size_t capacity);
+      const FieldRecord* find(std::string_view name, size_t hash) const noexcept;
+      void place(const FieldRecord* record) noexcept;
+    };
+    std::atomic<const Table*> current{nullptr};
+    std::mutex insertMutex;
+    std::vector<std::unique_ptr<Table>> tables;
+    std::vector<std::unique_ptr<FieldRecord>> records;
+
+  public:
+    static constexpr size_t BYTES_PER_RECORD =
+        sizeof(std::unique_ptr<FieldRecord>) + sizeof(std::atomic<const FieldRecord*>);
+
+    const FieldRecord* find(std::string_view name, size_t hash) const noexcept {
+      const Table* table = current.load(std::memory_order_acquire);
+      return table ? table->find(name, hash) : nullptr;
+    }
+    // Returns the record kept for its name: this one, or one inserted first.
+    const FieldRecord* insert(std::unique_ptr<FieldRecord> record);
+  };
 
   // A physical snapshot is shared directly by readers with different schemas.
   // Its lazy catalogs and maps never retain a reader or schema.

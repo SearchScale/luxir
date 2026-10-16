@@ -380,4 +380,36 @@ TEST_F(FieldMetadataTest, coreNamesAreSharedAndLazy) {
   EXPECT_EQ(0u, fresh->fieldCacheStats().pages);
 }
 
+TEST_F(FieldMetadataTest, namesStayFoundWhileTheTableGrows) {
+  test::CollectionHelper helper;
+  constexpr int FIELDS = 130;
+  openFields(helper, FIELDS);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  constexpr int THREADS = 16;
+  std::barrier start(THREADS);
+  std::vector<std::vector<IndexReader::FieldSegments>> views(THREADS);
+  std::vector<std::jthread> threads;
+  for (int t = 0; t < THREADS; t++) {
+    threads.emplace_back([&, t] {
+      views[t].resize(FIELDS);
+      start.arrive_and_wait();
+      // Each thread starts elsewhere, so inserts and growth race with lookups.
+      for (int round = 0; round < 2; round++) {
+        for (int j = 0; j < FIELDS; j++) {
+          int i = (j + t * 37) % FIELDS;
+          auto view = reader->field(std::format("f{:05}_i", i));
+          if (round) EXPECT_EQ(views[t][i], view);
+          views[t][i] = view;
+        }
+      }
+    });
+  }
+  threads.clear();
+  for (int i = 0; i < FIELDS; i++) {
+    ASSERT_TRUE(views[0][i].exists());
+    EXPECT_EQ(std::format("f{:05}_i", i), views[0][i].name());
+    for (int t = 1; t < THREADS; t++) EXPECT_EQ(views[0][i], views[t][i]);
+  }
+}
+
 } // end namespace
