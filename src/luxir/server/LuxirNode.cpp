@@ -26,18 +26,22 @@ static int reservedArenaSlots(const LuxirConfig& config) {
 // one fewer.  Raise the pool to the widest node's workers.  It is never
 // lowered: each arena caps its own concurrency, and a global_control lowers
 // the limit for every arena in the process (the smallest active value wins),
-// so a narrow node must not starve a wider one.  Leaked on purpose: a static
-// would be destroyed after the TBB runtime may have shut down.
+// so a narrow node must not starve a wider one.  The high-water mark is kept
+// here rather than read from active_value(), which also reflects controls this
+// function does not own.  Leaked on purpose: a static would be destroyed after
+// the TBB runtime may have shut down.
 static void ensureWorkerPool(int workers) {
   using oneapi::tbb::global_control;
   static std::mutex mutex;
   static global_control* control = nullptr;
+  static std::size_t raised = (std::size_t)std::max(1, oneapi::tbb::info::default_concurrency());
   std::lock_guard<std::mutex> lock(mutex);
   std::size_t wanted = (std::size_t)workers + 1;
-  if (global_control::active_value(global_control::max_allowed_parallelism) >= wanted) return;
-  auto* raised = new global_control(global_control::max_allowed_parallelism, wanted);
+  if (wanted <= raised) return;
+  auto* next = new global_control(global_control::max_allowed_parallelism, wanted);
   delete control;  // the smaller limit holds until here
-  control = raised;
+  control = next;
+  raised = wanted;
 }
 
 LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view server)
