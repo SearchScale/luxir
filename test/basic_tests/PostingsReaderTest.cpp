@@ -398,7 +398,7 @@ TEST_F(FieldMetadataTest, namesStayFoundWhileTheTableGrows) {
         for (int j = 0; j < FIELDS; j++) {
           int i = (j + t * 37) % FIELDS;
           auto view = reader->field(std::format("f{:05}_i", i));
-          if (round) EXPECT_EQ(views[t][i], view);
+          if (round) { EXPECT_EQ(views[t][i], view); }
           views[t][i] = view;
         }
       }
