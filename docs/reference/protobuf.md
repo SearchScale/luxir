@@ -667,7 +667,7 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Exact match count when get\_number was requested. For Fusion, counts distinct documents in the union of source ranked lists, before paging. |
+| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Exact match count when get\_number was requested. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
 | <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when get\_number was requested, after missing=drop. |
 | <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupTable`](#message-luxir.grouptable) | singular | Collapse only: complete metadata aligned with this batch's rows. |
 | <a id="field-luxir.doclist.columns"></a>[`columns`](#field-luxir.doclist.columns) | 3 | map&lt;`string`, [`Column`](#message-luxir.column)&gt; | map | Dense columns; each has exactly row\_count slots. |
@@ -901,7 +901,7 @@ Alternate representations of the same input value, keyed by local label. Absent 
 
 ### luxir.Fusion
 
-Hybrid-search fusion: run several source queries (each a full TopDocs spec) and merge their results into a single ranked list.<br><br>Per-source response-shape fields (\`fields\`, \`batch\_size\`, \`offset\`, \`get\_scores\`, \`get\_number\`, \`document\_format\`) are ignored - Fusion controls response shape at the top level. Per-source \`ops\` are rejected; put facets and metrics in Fusion.ops. Each source's \`query\`, \`sort\`, \`limit\`, and any per-source \`filter\` are used to produce that source's ranked list.<br><br>The fusion-level \`filter\` is ANDed with each source's own filters.
+Hybrid-search fusion: run several source queries (each a full TopDocs spec) and merge their results into a single ranked list.<br><br>Per-source response-shape fields (\`fields\`, \`batch\_size\`, \`offset\`, \`get\_scores\`, \`get\_number\`, \`document\_format\`) are ignored - Fusion controls response shape at the top level. Per-source \`ops\` are rejected; put facets and metrics in Fusion.ops. Each source's \`query\`, \`sort\`, \`limit\`, and any per-source \`filter\` are used to produce that source's ranked list. A source collapse accepts only field and missing, and its limit counts groups; the head documents enter document fusion. Source collapse head\_sort, sort, get\_number and ops are errors.<br><br>The fusion-level \`filter\` is ANDed with each source's own filters.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -915,16 +915,17 @@ Required fusion method: exactly one.
 |---|---|---|---|---|
 | <a id="field-luxir.fusion.sources"></a>[`sources`](#field-luxir.fusion.sources) | 1 | map&lt;`string`, [`TopDocs`](#message-luxir.topdocs)&gt; | map | Named source queries. At least one source is required. |
 | <a id="field-luxir.fusion.filter"></a>[`filter`](#field-luxir.fusion.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated | Filters applied to every source. except\_ops is not supported here or in source filters. |
-| <a id="field-luxir.fusion.limit"></a>[`limit`](#field-luxir.fusion.limit) | 3 | `sint64` | optional | Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining. |
+| <a id="field-luxir.fusion.limit"></a>[`limit`](#field-luxir.fusion.limit) | 3 | `sint64` | optional | Maximum fused rows (groups with collapse) to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.fusion.rrf"></a>[`rrf`](#field-luxir.fusion.rrf) | 10 | [`RrfFusion`](#message-luxir.rrffusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.linear"></a>[`linear`](#field-luxir.fusion.linear) | 11 | [`LinearFusion`](#message-luxir.linearfusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
-| <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused document; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
-| <a id="field-luxir.fusion.get_number"></a>[`get_number`](#field-luxir.fusion.get_number) | 5 | `bool` | singular | return the number of distinct documents in the source union |
+| <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused row; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
+| <a id="field-luxir.fusion.get_number"></a>[`get_number`](#field-luxir.fusion.get_number) | 5 | `bool` | singular | eligible groups with collapse, otherwise distinct source-union documents |
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
 | <a id="field-luxir.fusion.fields"></a>[`fields`](#field-luxir.fusion.fields) | 7 | `string` | repeated | as TopDocs.fields: empty returns every retrievable field, '\*' patterns expand |
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
 | <a id="field-luxir.fusion.document_format"></a>[`document_format`](#field-luxir.fusion.document_format) | 9 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
-| <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, as counted by found. Fusion limit and offset do not affect this candidate domain. |
+| <a id="field-luxir.fusion.collapse"></a>[`collapse`](#field-luxir.fusion.collapse) | 17 | [`Collapse`](#message-luxir.collapse) | singular | Collapse the fused document list before paging. Source windows never refill. found counts eligible groups; found\_docs counts eligible fused documents. |
+| <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, even with collapse. Fusion limit and offset do not affect this candidate domain. |
 | <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite, &gt;= 0, and within float range, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
 
 <a id="message-luxir.fuzzyquery"></a>

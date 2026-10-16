@@ -267,9 +267,6 @@ TEST_F(CollapseMetricTest, memoryFailureEmptyIndexAndDocsRendering) {
   auto zero = run("metric_empty", body);
   EXPECT_EQ(0, zero->docList()->found.value_or(-1));
   EXPECT_EQ(0, zero->docList()->found_docs.value_or(-1));
-  api::Fusion fusion;
-  EXPECT_FALSE(api::read_json(fusion,
-      R"({"rrf":{},"collapse":{"field":"key_s","sort":["lo asc"]}})", req->mr));
 }
 
 TEST_F(CollapseMetricTest, metricListsUnderBucketsAndFusion) {

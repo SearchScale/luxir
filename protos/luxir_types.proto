@@ -156,7 +156,9 @@ message TopDocs {
 // response shape at the top level. Per-source `ops` are rejected; put facets
 // and metrics in Fusion.ops.
 // Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
-// to produce that source's ranked list.
+// to produce that source's ranked list. A source collapse accepts only field
+// and missing, and its limit counts groups; the head documents enter document fusion.
+// Source collapse head_sort, sort, get_number and ops are errors.
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
@@ -167,7 +169,7 @@ message Fusion {
   // in source filters.
   repeated Filter filter = 2;
 
-  // Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining.
+  // Maximum fused rows (groups with collapse) to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 3;
 
   // Required fusion method: exactly one.
@@ -177,19 +179,23 @@ message Fusion {
   }
 
   // Response shape (mirrors TopDocs).
-  // Zero-based rank of the first returned fused document; must be >= 0.
+  // Zero-based rank of the first returned fused row; must be >= 0.
   // Return up to limit after skipping. Source limits remain candidate-pool
   // sizes: paging cannot reach beyond the union of their ranked windows.
   // Each response DocList.offset is the absolute rank of that batch's first
   // row, or the requested offset for an empty page.
   int64 offset = 4;
-  bool get_number = 5; // return the number of distinct documents in the source union
+  bool get_number = 5; // eligible groups with collapse, otherwise distinct source-union documents
   bool get_scores = 6;
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8; // same batching rules as TopDocs.batch_size
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
 
-  // Runs over the union of filtered source ranked lists, as counted by found.
+  // Collapse the fused document list before paging. Source windows never refill.
+  // found counts eligible groups; found_docs counts eligible fused documents.
+  Collapse collapse = 17;
+
+  // Runs over the union of filtered source ranked lists, even with collapse.
   // Fusion limit and offset do not affect this candidate domain.
   map<string, SearchOp> ops = 15;
 
@@ -800,8 +806,8 @@ message GroupTable {
 // just the degenerate cases.  Which fields land where is a function of the
 // request (see DocFormat), never of the data.
 message DocList {
-  // Exact match count when get_number was requested. For Fusion, counts
-  // distinct documents in the union of source ranked lists, before paging.
+  // Exact match count when get_number was requested. Counts groups with
+  // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
   optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.

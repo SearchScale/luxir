@@ -376,3 +376,53 @@ LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, groups_min, false, false)->Arg(8
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, facet_min, true, false)->Arg(8)->Arg(100);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, groups_two, false, true)->Arg(8)->Arg(100);
 LUXIR_BENCHMARK_CAPTURE(BM_CollapseMetricOrder, facet_two, true, true)->Arg(8)->Arg(100);
+
+// Document RRF over two catalog windows, optionally collapsed before paging.
+static void BM_FusionCollapse(benchmark::State& state, bool collapsed) {
+  int32_t variants = (int32_t)state.range(0), segments = 7;
+  int32_t products = unit_tests ? 120 : (int32_t)LuxirTest::scaleTestWork(20'000);
+  std::string name = "members_reset_bm_" + std::to_string(products) + "_"
+      + std::to_string(variants) + "_" + std::to_string(segments);
+  CollectionHelper helper(name);
+  int32_t total = products * variants;
+  std::vector<int32_t> sizes;
+  for (int32_t s = 0; s < segments; s++) {
+    sizes.push_back((s + 1) * total / segments - s * total / segments);
+  }
+  if (!helper.indexMatchesShape(sizes)) {
+    helper.clear();
+    for (int32_t s = 0; s < segments; s++) {
+      std::vector<Doc> docs;
+      for (int32_t id = s * total / segments; id < (s + 1) * total / segments; id++) {
+        docs.push_back(collapseCatalogDoc(id, products, variants));
+      }
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+  }
+  std::string json = R"({"collection":")" + name + R"(","ops":{"f":{"fusion":{
+    "rrf":{},"sources":{"price":{"sort":"price_i asc","limit":1000},
+    "rank":{"sort":"rank_i asc","limit":1000}},"limit":10,
+    "get_number":true,"fields":["id"])";
+  if (collapsed) json += R"(,"collapse":"key_s")";
+  json += "}}}}";
+  auto execute = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    if (!api::read_json(req->rawRequest(), json, req->mr)) throw std::runtime_error(json);
+    req->execute(false);
+    if (!req->ok()) throw std::runtime_error(req->errorMsg());
+    return req;
+  };
+  {
+    auto req = execute();
+    state.counters["peak_tracked"] = (double)req->memoryTracker.peak();
+    state.counters["found"] = req->docList("f")->found.value_or(-1);
+    state.counters["found_docs"] = req->docList("f")->found_docs.value_or(
+        req->docList("f")->found.value_or(-1));
+  }
+  for (auto _ : state) {
+    auto req = execute();
+    benchmark::DoNotOptimize(req->responses.size());
+  }
+}
+LUXIR_BENCHMARK_CAPTURE(BM_FusionCollapse, docs, false)->Arg(8)->Arg(100);
+LUXIR_BENCHMARK_CAPTURE(BM_FusionCollapse, groups, true)->Arg(8)->Arg(100);

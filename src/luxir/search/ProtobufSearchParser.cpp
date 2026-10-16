@@ -99,7 +99,7 @@ struct SearchParserImpl {
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   const CollapsePlan* enclosingCollapse = nullptr;
   const CollapsePlan* inheritedFacetMeasure = nullptr;
-  TopDocsReq* owningList = nullptr;
+  std::span<ParsedFilter>* owningList = nullptr;
   std::string_view owningListChild;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
@@ -385,12 +385,16 @@ public:
 
   void addSubs(SearchOp& currOp, OpsMap ops, int depth,
                OpsPlacement placement,
-               boost::unordered_flat_map<std::string_view, SearchOp*>* destination = nullptr) {
+               boost::unordered_flat_map<std::string_view, SearchOp*>* destination = nullptr,
+               std::span<ParsedFilter>* listFilters = nullptr) {
     if (ops.empty()) return;
     if (depth >= maxOpDepth) {
       throw std::runtime_error("search operation nesting exceeds the maximum depth of "
                                + std::to_string(maxOpDepth));
     }
+    bool entersList = placement == OpsPlacement::TOP_DOCS || placement == OpsPlacement::GROUP_BUCKET;
+    auto* currentList = entersList
+        ? (listFilters ? listFilters : &static_cast<TopDocsReq&>(currOp).filters) : nullptr;
     BucketDomainPlan* bucketPlan = nullptr;
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
       ParseContext context{req.requestPool, *req.schema, req.arena,
@@ -401,9 +405,8 @@ public:
       auto domains = parseChildDomains(ops, parser);
       if (!domains.empty()) {
         std::vector<Query*> filters;
-        auto* owner = placement == OpsPlacement::GROUP_BUCKET
-            ? &static_cast<TopDocsReq&>(currOp) : owningList;
-        if (owner) for (const auto& filter : owner->filters) {
+        auto* owner = placement == OpsPlacement::GROUP_BUCKET ? currentList : owningList;
+        if (owner) for (const auto& filter : *owner) {
           if (placement == OpsPlacement::GROUP_BUCKET
               || std::ranges::find(filter.exceptOps, owningListChild) == filter.exceptOps.end()) {
             filters.push_back(filter.query);
@@ -436,9 +439,8 @@ public:
         throw RequestError("reserved bucket/group op name: " + std::string(name));
       }
       SearchOp* sub;
-      bool entersList = placement == OpsPlacement::TOP_DOCS || placement == OpsPlacement::GROUP_BUCKET;
-      auto* nextList = entersList ? &static_cast<TopDocsReq&>(currOp) : owningList;
-      if (nextList && nextList->filters.empty()) nextList = nullptr;
+      auto* nextList = entersList ? currentList : owningList;
+      if (nextList && nextList->empty()) nextList = nullptr;
       auto nextChild = !entersList ? owningListChild
           : nextList && placement == OpsPlacement::TOP_DOCS ? name : std::string_view{};
       if (nextList != owningList || (nextList && nextChild != owningListChild)) {
@@ -1552,9 +1554,15 @@ public:
     CollapsePlan* collapse = nullptr;
     if (topDocsReq.collapse) {
       if (placement == TopDocsPlacement::FUSION_SOURCE) {
-        throw RequestError("collapse is not supported on a fusion source");
+        const auto& spec = *topDocsReq.collapse;
+        if (!spec.head_sort.empty() || !spec.sort.empty() || spec.get_number || !spec.ops.empty()) {
+          throw RequestError("fusion source '" + std::string(name)
+              + "': collapse supports only field and missing; head_sort, sort, get_number and ops"
+                " require source finalization");
+        }
       }
-      collapse = resolveCollapse(*topDocsReq.collapse, topDocsReq.get_number);
+      collapse = resolveCollapse(*topDocsReq.collapse,
+          placement != TopDocsPlacement::FUSION_SOURCE && topDocsReq.get_number);
       enclosingCollapse = collapse;
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
@@ -2123,6 +2131,21 @@ public:
   }
 
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
+    auto* oldCollapse = enclosingCollapse;
+    auto* oldMeasure = inheritedFacetMeasure;
+    auto restore = scope_guard([&]() noexcept {
+      enclosingCollapse = oldCollapse;
+      inheritedFacetMeasure = oldMeasure;
+    });
+    CollapsePlan* collapse = nullptr;
+    if (fusionProto.collapse) {
+      if (!fusionProto.collapse->sort.empty()) {
+        throw RequestError("fusion.collapse.sort is not supported");
+      }
+      collapse = resolveCollapse(*fusionProto.collapse, fusionProto.get_number);
+      enclosingCollapse = collapse;
+      inheritedFacetMeasure = collapse;
+    }
     int64_t offset = fusionProto.offset;
     if (offset < 0) {
       throw std::runtime_error(fusionPrefix(name) + "offset must be >= 0");
@@ -2173,6 +2196,12 @@ public:
       if (weights[i] == 0) continue;
       auto& [srcName, srcProto] = sourceEntries[i];
       size_t idx = sources.size();
+      auto* sourceCollapse = enclosingCollapse;
+      auto* sourceMeasure = inheritedFacetMeasure;
+      auto restoreSource = scope_guard([&]() noexcept {
+        enclosingCollapse = sourceCollapse;
+        inheritedFacetMeasure = sourceMeasure;
+      });
       auto* src = parseTopDocs(
           srcName, *srcProto, TopDocsPlacement::FUSION_SOURCE);
       // Linear fusion normalizes relevance scores; a field-sorted source
@@ -2191,6 +2220,7 @@ public:
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
+    parseContext.collapse = enclosingCollapse;
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");
@@ -2224,6 +2254,13 @@ public:
       std::move(sourceWeights), topCount, sharedFilters, sharedFilterWeights,
       method, rrfK);
 
+    fusion->collapse = collapse;
+    if (collapse && !fusionProto.collapse->head_sort.empty()) {
+      fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
+    }
+    fusion->diverseSources = std::ranges::any_of(fusion->sources,
+        [](const TopDocsReq* source) { return source->collapse != nullptr; });
+
     // Sources are children of this FusionOp in the SearchOp tree but not
     // in `subOps` (different lifecycle - they deliver via rankingSink
     // rather than emit).  Set parent so any downstream code that walks up
@@ -2233,6 +2270,11 @@ public:
     }
 
     addSubs(*fusion, fusionProto.ops, depth, OpsPlacement::FUSION);
+    if (collapse) {
+      inheritedFacetMeasure = nullptr;
+      addSubs(*fusion, fusionProto.collapse->ops, depth, OpsPlacement::GROUP_BUCKET,
+              &fusion->groupOps, &fusion->filters);
+    }
     return fusion;
   }
 

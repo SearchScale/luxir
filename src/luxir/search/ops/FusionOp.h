@@ -74,6 +74,10 @@ public:
   std::span<FilterCache::Use*> filterUses;
   Method method = Method::RRF;
   int32_t rrfK = 60;  // RRF only
+  CollapsePlan* collapse = nullptr;
+  std::optional<SortPlan> headSort;
+  boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
+  bool diverseSources = false;
 
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
@@ -136,6 +140,7 @@ public:
     for (auto* weight : filterWeights) weight->releaseSegmentState(segment);
     for (auto* source : sources) source->releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
+    for (auto& [name, child] : groupOps) child->releaseSegmentState(segment);
   }
 
   bool needsCompleteBucketInput() const override {
@@ -150,7 +155,10 @@ public:
         || std::ranges::any_of(sources, [](const TopDocsReq* source) {
              return source->facetBucketSharesSegmentState();
            })
-        || SearchOp::facetBucketSharesSegmentState();
+        || SearchOp::facetBucketSharesSegmentState()
+        || std::ranges::any_of(groupOps, [](const auto& entry) {
+             return entry.second->facetBucketSharesSegmentState();
+           });
   }
 
   // Sources are not in `subOps` (different lifecycle: they deliver via
@@ -161,6 +169,7 @@ public:
     for (auto* src : sources) {
       src->init();
     }
+    for (auto& [name, child] : groupOps) child->init();
   }
 
   class Calc : public SearchOp::Calculator {
@@ -385,7 +394,18 @@ public:
 
     // Fuse the per-source ranked lists, then emit a fused DocList via the
     // shared streaming emitter.
-    void doFusion() {
+    virtual void doFusion() { doFusionImpl<false>(); }
+
+    // A collapsed source's ranked group heads, with each head's rank score.
+    struct RankedHead {
+      segdoc doc;
+      float score;
+    };
+    void appendCollapsedSource(MergeableCollector& collector, std::vector<RankedHead>& heads);
+    virtual void finishCollapsedFusion();
+
+    template <bool Diverse>
+    void doFusionImpl() {
       auto& op = thisOp();
 
       // Accumulate fused scores by segdoc, one source at a time.  Each
@@ -393,7 +413,9 @@ public:
       // fusion normalizes over the source's whole ranked list.  Every listed
       // doc enters `fused`, even with a zero contribution, so the candidate
       // set (found and the ops domain) is the union of the source lists for
-      // every method.
+      // every method.  A possible opt-in on fusion.collapse could instead fuse
+      // each source's best rank per group, giving a product credit when its
+      // text and vector matches land on different variants.
       boost::unordered_flat_map<segdoc, float, SegdocHash> fused;
       auto addRanks = [&](const auto& ranked, float weight) {
         for (int32_t rank = 0; rank < (int32_t)ranked.size(); rank++) {
@@ -402,10 +424,28 @@ public:
         }
       };
       std::vector<float> normalized;
+      auto addScores = [&](const auto& scoreDocs, double weight) {
+        normalized.clear();
+        for (auto& sd : scoreDocs) normalized.push_back(sd.score);
+        minMaxNormalize(normalized);
+        for (size_t i = 0; i < scoreDocs.size(); i++) {
+          fused[scoreDocs[i].doc] += (float)(weight * (double)normalized[i]);
+        }
+      };
+      [[maybe_unused]] std::vector<RankedHead> heads;
       for (size_t s = 0; s < op.sources.size(); s++) {
         auto* mc = deliveredCollectors[s];
         if (mc == nullptr) continue;
         double weight = op.sourceWeights[s];
+        if constexpr (Diverse) {
+          if (op.sources[s]->collapse != nullptr) {
+            heads.clear();
+            appendCollapsedSource(*mc, heads);
+            if (op.method == Method::RRF) addRanks(heads, (float)weight);
+            else addScores(heads, weight);
+            continue;
+          }
+        }
         if (mc->useFieldSort) {
           // Field-sorted collectors carry no relevance score; only RRF
           // accepts them.
@@ -415,13 +455,7 @@ public:
           addRanks(mc->scoreCollector->sort(), (float)weight);
         } else {
           assert(op.method == Method::LINEAR_MIN_MAX);
-          auto scoreDocs = mc->scoreCollector->sort();
-          normalized.clear();
-          for (auto& sd : scoreDocs) normalized.push_back(sd.score);
-          minMaxNormalize(normalized);
-          for (size_t i = 0; i < scoreDocs.size(); i++) {
-            fused[scoreDocs[i].doc] += (float)(weight * (double)normalized[i]);
-          }
+          addScores(mc->scoreCollector->sort(), weight);
         }
       }
 
@@ -436,6 +470,12 @@ public:
                   return a.first < b.first;
                 });
 
+      if constexpr (Diverse) {
+        if (op.collapse != nullptr) {
+          finishCollapsedFusion();
+          return;
+        }
+      }
       if (!subCalcs.empty()) {
         std::vector<segdoc> candidates;
         candidates.reserve(fusedList.size());
@@ -487,8 +527,16 @@ public:
   Calculator* createCalculator(
       Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
       const StructuralConstraint* structural = nullptr) override {
+    if (collapse != nullptr || diverseSources) {
+      return createDiverseCalculator(parent, slot, numSlots, structural);
+    }
     return new Calc(*this, parent, slot, numSlots, structural);
   }
+
+  Calculator* createDiverseCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
+                                      const StructuralConstraint* structural);
+
+  size_t collapsedResidentBytes() const;
 
   bool canEmitAsBucketChild() const override { return true; }
 
@@ -507,6 +555,7 @@ public:
       unused(name);
       bytes = saturatingAdd(bytes, child->facetBucketResidentBytes());
     }
+    if (collapse != nullptr) bytes = saturatingAdd(bytes, collapsedResidentBytes());
     return bytes;
   }
 };

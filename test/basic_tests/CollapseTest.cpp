@@ -294,14 +294,6 @@ TEST_F(CollapseTest, validationAndAbsentKeys) {
     req->execute();
     EXPECT_FALSE(req->ok()) << collapse;
   }
-  {
-    auto req = localReq(luxirNode->getSearchEngine());
-    ASSERT_TRUE(luxir::api::read_json(req->rawRequest(),
-        R"({"ops":{"f":{"fusion":{"sources":{"s":{"collapse":"key_s"}},"rrf":{}}}}})", req->mr));
-    req->collection("main").execute();
-    EXPECT_FALSE(req->ok());
-    EXPECT_NE(std::string::npos, req->errorMsg().find("collapse is not supported on a fusion source"));
-  }
   for (std::string missing : {"expand", "group", "drop"}) {
     auto req = run("main", "*:*", spec({"key_s"}, missing));
     EXPECT_EQ(missing == "drop" ? 0 : 1, req->docList()->found);

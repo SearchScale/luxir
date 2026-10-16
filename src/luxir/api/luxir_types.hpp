@@ -559,6 +559,7 @@ struct Fusion {                                                  // needs TopDoc
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   map_view<std::string_view, double> weights;
+  ::hpp_proto::optional_indirect_view<Collapse> collapse;
   std::variant<std::monostate, RrfFusion, LinearFusion> method;  // align 4
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)

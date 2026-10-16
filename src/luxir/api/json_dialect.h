@@ -1113,6 +1113,8 @@ struct from<JSON, luxir::api::Fusion> {
           } else if (key == "weights") {
             decltype(auto) weights = ::hpp_proto::detail::as_modifiable(ctx, value.weights);
             glz::util::parse_repeated<O>(true, weights, ctx, vit, vend);
+          } else if (key == "collapse") {
+            util::from_json<O>(value.collapse, ctx, vit, vend);
           } else if (key == "rrf" || key == "linear") {
             // one method arm: a second one is an error (proto3 canonical
             // JSON), not a silent last-wins

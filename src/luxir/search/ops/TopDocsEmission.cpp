@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "TopDocsReq.h"
+#include "CollapsedPage.h"
 
 namespace luxir {
 namespace {
 // A ranked source supplies member rows and exact keys/totals. Selection is
 // complete; enrichment and streaming preserve the same page/group protocol.
 template <typename RankedSource>
-void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource& collector) {
+void emitPage(const CollapsedPageSettings& settings,
+              SearchOp::Calculator& calc, RankedSource& collector) {
+  auto& qr = settings.owner;
   auto getDocList = [&calc](SearchResponse* resp) -> api::DocList& {
     return *calc.slotArm<api::DocList>(resp);
   };
@@ -51,8 +54,8 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
     }
   };
   std::shared_ptr<Page> page;
-  int64_t offset = std::min<int64_t>(qr.topDocsProto.offset, (int64_t)scoreDocs.size());
-  if (calc.memberReplay && offset < (int64_t)scoreDocs.size()) {
+  int64_t offset = std::min<int64_t>(settings.offset, (int64_t)scoreDocs.size());
+  if (settings.members && offset < (int64_t)scoreDocs.size()) {
     page = std::make_shared<Page>(qr.req.memoryTracker);
     size_t size = scoreDocs.size() - (size_t)offset;
     page->keys.reserve(size);
@@ -67,12 +70,12 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
     }
     std::unique_ptr<FieldSortCollector> headCollector;
     std::pmr::vector<std::optional<FieldSortCollector::SortDoc>> heads(&page->resource);
-    if (qr.headSort) {
-      auto clauses = qr.headSort->clauses;
+    if (settings.headSort) {
+      auto clauses = settings.headSort->clauses;
       if (clauses.empty()) clauses.emplace_back(SortClause::SCORE, SortField::DESC);
       headCollector = std::make_unique<FieldSortCollector>(
           (int64_t)size, clauses, qr.req.reader.get(),
-          qr.topDocsProto.get_scores || qr.headSort->rankNeedsScores);
+          settings.getScores || settings.headSort->rankNeedsScores);
       heads.resize(size);
     }
     // Expand singletons are already complete, including their score.
@@ -86,10 +89,12 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
                        size_t begin, DocSet* eligibility, auto&& accept) {
       auto& segment = qr.req.reader->segments()[segnum];
       auto release = scope_guard([&]() noexcept {
-        if constexpr (!Identity) qr.releaseSegmentState(segment);
+        if constexpr (!Identity) {
+          if (settings.releaseSegment) settings.releaseSegment(qr, segment);
+        }
       });
       if constexpr (Identity) {
-        CollapseMembers members(*qr.collapse, keys, qr.req.memoryTracker);
+        CollapseMembers members(settings.collapse, keys, qr.req.memoryTracker);
         members.forKeys(segment.ord, eligibility,
             [&](size_t slot, int32_t doc, float) { accept(slot, doc); });
       } else {
@@ -99,12 +104,10 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
           headCollector->setSegment(segment, &pool);
           expressions.emplace(*headCollector, pool, segment);
         }
-        Query::SegmentSource& source = calc.preparedWeight
-            ? static_cast<Query::SegmentSource&>(*calc.preparedWeight)
-            : static_cast<Query::SegmentSource&>(*qr.weight);
-        CollapseMembers members(*qr.collapse, keys, qr.req.memoryTracker);
+        Query::SegmentSource& source = *settings.members;
+        CollapseMembers members(settings.collapse, keys, qr.req.memoryTracker);
         members.forSegment(segment.ord, eligibility, source,
-            headCollector && (qr.topDocsProto.get_scores || qr.headSort->rankNeedsScores),
+            headCollector && (settings.getScores || settings.headSort->rankNeedsScores),
             [&](size_t slot, int32_t doc, float score) {
               size_t pageSlot = begin + slot;
               page->counts[pageSlot]++;
@@ -114,15 +117,15 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
             });
       }
     };
-    if (qr.groupOps.empty()) {
+    if (settings.groupOps.empty()) {
       if (ordinary) for (size_t segnum = 0; segnum < qr.req.reader->segments().size(); segnum++) {
         produce.template operator()<false>(segnum, page->keys, 0,
-            calc.memberReplay->domains[segnum].get(), [](size_t, int32_t) {});
+            settings.domains[segnum].get(), [](size_t, int32_t) {});
       }
     } else {
-      calc.pageGroups = build::allocMessage<luxir::api::GroupTable>(qr.req.lastResponse->mr);
+      settings.pageGroups = build::allocMessage<luxir::api::GroupTable>(qr.req.lastResponse->mr);
       std::vector<SearchOp*> children;
-      for (auto& [name, child] : qr.groupOps) children.push_back(child);
+      for (auto& [name, child] : settings.groupOps) children.push_back(child);
       std::vector<SelectedFacetBucket<size_t>> buckets;
       for (size_t slot = 0; slot < size; slot++) buckets.push_back({
           .key = slot, .id = {}, .count = 0,
@@ -177,8 +180,8 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
           *qr.req.reader, FacetBucketProducer::JOINT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             domains.template operator()<false>(segnum, block,
-                calc.memberReplay->domains[segnum], feed);
-          }, FacetBucketBlockExecutor::BINDING_BYTES, calc.memberReplay->domains,
+                settings.domains[segnum], feed);
+          }, FacetBucketBlockExecutor::BINDING_BYTES, settings.domains,
           [&](size_t segnum, auto block, DomainHandle eligibility, FacetBucketFeed feed) {
             domains.template operator()<true>(segnum, block, std::move(eligibility), feed);
           });
@@ -191,10 +194,11 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
       }
     }
   }
-  calc.memberReplay.reset();
-  auto metadata = [&collector, scoreDocs, page, offset, &qr, groupResults = calc.pageGroups, keyAt](
+  if (settings.releaseMembers) settings.releaseMembers(calc);
+  auto metadata = [&collector, scoreDocs, page, offset, &qr, settings,
+                   groupResults = settings.pageGroups, keyAt](
       luxir::api::DocList& list, int64_t begin, int64_t end, std::pmr::memory_resource& mr) {
-    if (qr.collapse->getNumber) list.found_docs = collector.totalHits();
+    if (settings.collapse.getNumber) list.found_docs = collector.totalHits();
     auto* groupTable = build::allocMessage<luxir::api::GroupTable>(mr);
     list.groups = groupTable;
     auto& table = *groupTable;
@@ -214,21 +218,22 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
       }
     }
     auto* keys = build::allocArray(table.keys, (size_t)(end - begin), mr);
-    int64_t* counts = page && qr.topDocsProto.collapse->get_number
+    int64_t* counts = page && settings.spec.get_number
         ? build::allocArray(table.counts, (size_t)(end - begin), mr) : nullptr;
-    luxir::api::ArrVal* ranks = (metricOrder || (page && qr.headSort)) && qr.topDocsProto.get_scores
+    luxir::api::ArrVal* ranks = settings.getScores
+        && (metricOrder || settings.alwaysRank || (page && settings.headSort))
         ? build::allocArray(table.ranks, (size_t)(end - begin), mr) : nullptr;
     MemPool pool;
     for (int64_t i = begin; i < end; i++) {
       const auto& rank = scoreDocs[(size_t)i];
-      qr.collapse->emit(keys[i - begin],
+      settings.collapse.emit(keys[i - begin],
           keyAt((size_t)rank.slot), mr, pool);
       size_t slot = (size_t)(i - offset);
       if (counts) counts[i - begin] = page->counts[slot];
       if constexpr (metricOrder) {
         if (ranks) collector.emitRank(ranks[i - begin], rank.slot, mr);
-      } else if (ranks && page->heads[slot] != rank.doc) {
-        emitCollapseRank(ranks[i - begin], qr.sortPlan,
+      } else if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
+        emitCollapseRank(ranks[i - begin], settings.sort,
             *qr.req.reader, rank.doc, rank.score, mr);
       }
     }
@@ -241,12 +246,29 @@ void emitCollapsedPage(TopDocsReq& qr, TopDocsReq::CalcBase& calc, RankedSource&
     [scoreDocs, page, offset](int64_t i) {
       return page ? page->scores[(size_t)(i - offset)] : scoreDocs[(size_t)i].score;
     },
-    groupCount, qr.topDocsProto.fields,
-    qr.topDocsProto.batch_size, qr.topDocsProto.offset,
-    qr.topDocsProto.get_number, qr.topDocsProto.get_scores,
-    qr.topDocsProto.document_format, emission, std::move(metadata));
+    groupCount, settings.fields,
+    settings.batchSize, settings.offset,
+    settings.getNumber, settings.getScores,
+    settings.documentFormat, emission, std::move(metadata));
+}
+CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
+  return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
+      op.headSort, op.groupOps, op.topDocsProto.fields, op.topDocsProto.batch_size,
+      op.topDocsProto.offset, op.topDocsProto.get_number, op.topDocsProto.get_scores,
+      op.topDocsProto.document_format,
+      calc.memberReplay ? (calc.preparedWeight
+          ? static_cast<Query::SegmentSource*>(calc.preparedWeight.get()) : op.weight) : nullptr,
+      calc.memberReplay ? std::span<const DomainHandle>(calc.memberReplay->domains)
+                        : std::span<const DomainHandle>{}, calc.pageGroups, false,
+      [](SearchOp& owner, IndexReader::Segment& segment) { owner.releaseSegmentState(segment); },
+      [](SearchOp::Calculator& base) { static_cast<TopDocsReq::CalcBase&>(base).memberReplay.reset(); }};
 }
 }  // namespace
+
+void emitCollapsedPage(const CollapsedPageSettings& settings,
+                       SearchOp::Calculator& calc, ScoreCollector<true>& collector) {
+  emitPage(settings, calc, collector);
+}
 
 void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     auto& qr = *this;
@@ -274,9 +296,9 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
 
     if (qr.collapse != nullptr) {
       if (mergeableCollector->useFieldSort) {
-        emitCollapsedPage(qr, calc, *mergeableCollector->groupFieldCollector);
+        emitPage(pageSettings(qr, calc), calc, *mergeableCollector->groupFieldCollector);
       }
-      else emitCollapsedPage(qr, calc, *mergeableCollector->groupScoreCollector);
+      else emitPage(pageSettings(qr, calc), calc, *mergeableCollector->groupScoreCollector);
     } else if (mergeableCollector->useFieldSort) {
       auto& collector = *mergeableCollector->fieldCollector;
       auto sortDocs = collector.sort();
@@ -312,7 +334,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
 
 void TopDocsReq::fillMetricGroupResponse(CalcBase& calc) {
   auto* data = calc.metricGroups->merger.getData();
-  if (data) emitCollapsedPage(*this, calc, *data);
+  if (data) emitPage(pageSettings(*this, calc), calc, *data);
   else {
     auto& list = *calc.slotArm<api::DocList>(nullptr);
     list.offset = topDocsProto.offset;

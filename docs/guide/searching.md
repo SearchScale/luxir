@@ -355,6 +355,25 @@ documents of the same key removed, before
 applying offset and limit. To order tied groups by key, add an explicit sort
 clause on the key field, for example `"sort": ["score desc", "product_s asc"]`.
 
+For hybrid retrieval, `fusion.collapse` applies this same best-member rule
+after document fusion. Its counts, display heads and group operations use the
+source-window union. Sources may also collapse independently for diversity;
+only their head documents enter fusion. For example:
+
+```json
+{"ops":{"hybrid":{"fusion":{
+  "rrf":{},
+  "sources":{"text":{"query":"title_t:jacket","collapse":"product_s","limit":100}},
+  "collapse":{"field":"product_s","get_number":true},
+  "limit":10,"get_number":true
+}}}}
+```
+
+Fusion heads retain their own fused document scores, while `_group_.rank`
+holds the best member's fused score. Group metric sort on fusion is currently
+rejected. See [hybrid search](vector-search.md#hybrid-search) for source
+options, evidence domains and resets.
+
 For vector retrieval, set `knn.unit: "groups"` to select `k` nearest groups
 before list paging. The default `docs` unit selects `k` documents and can
 underfill after collapse. `refine_candidates` counts candidate documents in
@@ -402,7 +421,7 @@ document lists; the enclosing collapse does not group Fusion's ranking:
 ```
 
 Collapsed child lists also work [inside facet buckets](faceting.md#top-documents-per-bucket)
-and [in Fusion's operations](vector-search.md#hybrid-search-with-rrf). Each
+and [in Fusion's operations](vector-search.md#hybrid-search). Each
 child uses its own key and sort over the documents its parent supplies.
 
 ## One request, several results
@@ -993,7 +1012,6 @@ preparation without collecting results. See
 ## Limits
 
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
-  Collapse on fusion sources is unsupported.
   Per-group `collapse.ops` uses the page's matching member domains.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets and metric facet sorts with

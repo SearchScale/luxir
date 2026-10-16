@@ -356,7 +356,7 @@ has no root shorthand, so both request and response use named `ops`.
 A source's `limit` bounds its candidate pool: a document outside a source's
 `limit` cannot contribute from that source, so size the pools for the recall
 the final fused `limit` needs. `ops` under the fusion see every document in
-any source's ranked list after filters, exactly the set `found` counts; the
+any source's ranked list after filters, the fused candidate set; the
 fusion's `limit` and `offset` do not change facet counts. Fusion `offset` pages
 within the union of the source windows and does not enlarge them, so deep
 fusion paging needs larger source limits; per-source `offset` is ignored.
@@ -386,8 +386,56 @@ collapses by its own key; it does not change the fused ranking. For example:
 }
 ```
 
-Collapse on a source in `Fusion.sources` remains unsupported. A Fusion
-operation can itself appear in a collapsed list's ordinary `ops`; its source
+A source can use `collapse` for diversity: its `limit` then counts groups,
+and its best member documents enter ordinary document fusion; under
+`linear`, the source normalizes its head scores over its group list. Sources
+may use independent keys and missing policies. Source collapse accepts only
+`field` and `missing`; `head_sort`, metric `sort`, `get_number` and `ops` are
+errors. A source's `knn.unit: "groups"` uses that source's collapse key.
+
+`fusion.collapse` groups the fused document list before paging. Groups rank
+by their best member's fused score, then that document's order. `offset`,
+`limit` and `found` count groups; `found_docs` counts eligible fused
+documents. `missing: "drop"` removes keyless candidates after fusion without
+refilling source windows. Each head's `_score_` is its own fused document
+score; `_group_.rank` contains the best member's fused score when scores are
+requested.
+As under a collapsed `top_docs`, facets in the fusion's `ops` then count
+groups by default (`count_unit: "docs"` counts documents), and a source's
+`knn.unit: "groups"` without its own collapse uses the fusion's key.
+
+```json
+{
+  "ops": {
+    "hybrid": {
+      "fusion": {
+        "rrf": {},
+        "sources": {
+          "text": {"query": "title_t:jacket", "collapse": "product_s", "limit": 100},
+          "vector": {
+            "query": {"knn": {"field": "embedding_v", "query": [0.2, 0.8], "k": 100}},
+            "limit": 100
+          }
+        },
+        "collapse": {
+          "field": "product_s", "head_sort": "price_i asc", "get_number": true,
+          "ops": {"colors": {"field_facet": {"field": "color_s"}}}
+        },
+        "limit": 10, "get_scores": true, "get_number": true
+      }
+    }
+  }
+}
+```
+
+Fused-group counts, display heads and per-group operations use only documents
+in the union of the source windows, with each document counted once. A `domain`
+reset beneath a group can recover all members, just as under a collapsed
+`top_docs`. Fusion's ordinary `ops` keep the full evidence union, including
+candidates excluded by the outer collapse's missing policy. Metric group order
+(`fusion.collapse.sort`) is currently an error.
+
+A Fusion operation can itself appear in a collapsed list's ordinary `ops`; its source
 domain is that list's matching documents, and Fusion still ranks documents.
 
 ### Source weights
