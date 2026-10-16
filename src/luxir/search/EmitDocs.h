@@ -682,7 +682,9 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // per-batch schema lookups; null marks the _score_ pseudo-field.  rows: the
 // field's values go to per-document maps (DocList.docs) instead of a dense
 // column - set for discovered names (empty / wildcard selectors), and for
-// every entry under ROWS format.
+// every entry under ROWS format.  infos and storedInfos are bound with the
+// first rows (see resolveReturnFieldMetadata), so a count-only response never
+// looks them up.
 struct ReturnField {
   std::string_view outputKey;
   std::string_view physicalName;
@@ -691,6 +693,19 @@ struct ReturnField {
   IndexReader::FieldSegments infos;
   IndexReader::FieldSegments storedInfos;
 };
+
+inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
+  boost::unordered_flat_map<std::string_view, IndexReader::FieldSegments, PackedTermHash, PackedTermEqual> resources;
+  for (auto& rf : fields) {
+    if (!rf.fieldType) continue;
+    if (rf.fieldType->type() != FieldType::TEXT) rf.infos = reader.field(rf.physicalName);
+    if (rf.fieldType->isStored()) {
+      auto [it, inserted] = resources.try_emplace(rf.fieldType->storedResource_);
+      if (inserted) it->second = reader.field(it->first);
+      rf.storedInfos = it->second;
+    }
+  }
+}
 
 // Streams a final ranked list of (segdoc, score) pairs back to the client as
 // one or more SearchResponses.  Both TopDocsReq and FusionOp use this (via
@@ -731,7 +746,7 @@ public:
   GetScore getScore;
   int64_t numCollected;
   int64_t totalHits;
-  std::span<const ReturnField> fields;  // resolved selectors, each carrying its placement
+  std::span<ReturnField> fields;  // resolved selectors, each carrying its placement
   int32_t maxBatchSize;
   int64_t offset;
   bool getNumber;
@@ -746,10 +761,11 @@ public:
   size_t colCap;  // dense response columns map capacity (column-placed fields + _score_)
   size_t rowCap;  // scratch columns map capacity (row-placed fields)
   int64_t batchStart;  // absolute rank cursor, clamped to numCollected
+  bool fieldMetadataResolved = false;
 
   DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
-                 std::span<const ReturnField> fields, int32_t maxBatchSize,
+                 std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool getNumber, bool getScores,
                  bool scoresInRows, bool parallel, size_t colCap, size_t rowCap)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
@@ -838,6 +854,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     std::span<const segdoc> segDocs(batchSegDocs);
     int columnSize = (int)segDocs.size();
     docListProto.row_count = columnSize;
+    if (columnSize > 0 && !fieldMetadataResolved) {
+      resolveReturnFieldMetadata(*req.reader, fields);
+      fieldMetadataResolved = true;
+    }
 
     // An isolated context: cancellation of the request group, or of whatever
     // context a resumed emitter runs in, must not skip loaders and leave a
@@ -1216,16 +1236,6 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
   }
   if (picked.empty()) return {};
-  boost::unordered_flat_map<std::string_view, IndexReader::FieldSegments, PackedTermHash, PackedTermEqual> resources;
-  for (auto& rf : picked) {
-    if (!rf.fieldType) continue;
-    if (rf.fieldType->type() != FieldType::TEXT) rf.infos = req.reader->field(rf.physicalName);
-    if (rf.fieldType->isStored()) {
-      auto [it, inserted] = resources.try_emplace(rf.fieldType->storedResource_);
-      if (inserted) it->second = req.reader->field(it->first);
-      rf.storedInfos = it->second;
-    }
-  }
   auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * picked.size(),
                                                       alignof(ReturnField));
   std::uninitialized_copy(picked.begin(), picked.end(), out);

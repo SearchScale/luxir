@@ -11,6 +11,7 @@
 #include <oneapi/tbb/global_control.h>
 #include <oneapi/tbb/task_group.h>
 
+#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
@@ -212,6 +213,28 @@ TEST_F(EmitDocsTest, defaultWideProjectionDecodesOnlyHitSegments) {
       EXPECT_EQ(before[seg].pages, stats.pages) << seg;
     }
   }
+}
+
+TEST_F(EmitDocsTest, countOnlyResponsesSkipReturnFieldMetadata) {
+  CollectionHelper helper;
+  constexpr int FIELDS = 200;
+  Doc values = flatdoc("id", std::string("one"));
+  for (int f = 0; f < FIELDS; f++) values.push_back({std::format("f{:04}_i", f), (int64_t)f});
+  ASSERT_TRUE(helper.indexAll({values}, UpdateMessage::COMMIT).success);
+  auto names = [] { return (int64_t)fieldMetadataMemory.names.load(); };
+  int64_t before = names();
+  auto count = localReq(helper.getSearchEngine());
+  count->collection("main").topDocs("q").allQuery().limit(0).getNumber(true);
+  count->execute(0);
+  ASSERT_OK(count);
+  EXPECT_LT(names() - before, FIELDS);
+  int64_t afterCount = names();
+  auto page = localReq(helper.getSearchEngine());
+  page->collection("main").topDocs("q").allQuery().limit(1);
+  page->execute(0);
+  ASSERT_OK(page);
+  ASSERT_EQ(1u, page->getDocs().size());
+  EXPECT_GE(names() - afterCount, FIELDS);
 }
 
 TEST_F(EmitDocsTest, siblingFailureDuringStoredRereads) {
