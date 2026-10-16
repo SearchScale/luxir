@@ -337,6 +337,31 @@ expression metrics remain document-weighted. See
 [Counting groups and distinct keys](faceting.md#counting-groups-and-distinct-keys)
 for nested facets, selections, independent distinct keys, and memory costs.
 
+A `fusion` in the list's ordinary `ops` ranks matching documents, including
+members omitted from the collapsed page. Fusion's sources and result remain
+document lists; the enclosing collapse does not group Fusion's ranking:
+
+```json
+{
+  "query": "title_t:jacket",
+  "collapse": "product_s",
+  "limit": 10,
+  "ops": {
+    "recent": {
+      "fusion": {
+        "rrf": {},
+        "sources": {"newest": {"sort": "created_dt desc", "limit": 50}},
+        "limit": 5
+      }
+    }
+  }
+}
+```
+
+Collapsed child lists also work [inside facet buckets](faceting.md#top-documents-per-bucket)
+and [in Fusion's operations](vector-search.md#hybrid-search-with-rrf). Each
+child uses its own key and sort over the documents its parent supplies.
+
 ## One request, several results
 
 Add `ops` beside the query when the response should include analytics as well
@@ -925,12 +950,11 @@ preparation without collecting results. See
 ## Limits
 
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
-  Collapse on fusion sources and under fusion or facet buckets is unsupported.
+  Collapse on fusion sources is unsupported.
   Per-group `collapse.ops` uses the page's matching member domains.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
-  ranges, and query facets. TEXT distinct facets, metric facet sorts with
-  distinct counts, and fusion directly in a collapsed list's list-level `ops`
-  are unsupported.
+  ranges, and query facets. TEXT distinct facets and metric facet sorts with
+  distinct counts are unsupported.
 - Document-unit kNN selects `k` documents before collapse, so repeated keys
   can produce fewer than `k` groups. Group-unit kNN selects groups, with ANN
   recall and underfill subject to candidate and IVF effort limits.

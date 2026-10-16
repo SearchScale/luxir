@@ -101,7 +101,6 @@ struct SearchParserImpl {
   const CollapsePlan* inheritedFacetMeasure = nullptr;
   TopDocsReq* owningList = nullptr;
   std::string_view owningListChild;
-  bool groupScope = false;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
@@ -484,22 +483,14 @@ public:
           enclosingCollapse = oldCollapse;
           inheritedFacetMeasure = oldMeasure;
         });
-        if (topDocs.collapse && (placement == OpsPlacement::FACET_BUCKET
-                                 || placement == OpsPlacement::FUSION)) {
-          throw RequestError("collapse is not supported under a facet bucket or Fusion.ops");
-        }
         auto topDocsPlacement = depth == 1 ? TopDocsPlacement::ROOT_OP
                                            : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
         if (topDocs.collapse) {
-          bool oldGroupScope = groupScope;
-          auto restoreGroup = scope_guard([&]() noexcept { groupScope = oldGroupScope; });
-          groupScope = false;
           addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
           // Keep the nearest collapse for explicit group units, while a
           // group's facets default to document counts. Child queries still
           // establish their own scores; omitted queries select unscored members.
-          groupScope = true;
           inheritedFacetMeasure = nullptr;
           addSubs(*qr, topDocs.collapse->ops, depth, OpsPlacement::GROUP_BUCKET,
                   &qr->groupOps);
@@ -509,9 +500,6 @@ public:
         return qr;
       },
       [&](const luxir::api::Fusion& fusion) -> SearchOp* {
-        if (enclosingCollapse != nullptr && !groupScope) {
-          throw RequestError("fusion under a collapsed list is not supported yet");
-        }
         return parseFusion(name, fusion, depth);
       },
       [&](const luxir::api::FieldFacet& facetReq) -> SearchOp* {

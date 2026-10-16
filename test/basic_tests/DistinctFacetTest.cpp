@@ -271,7 +271,6 @@ TEST_F(DistinctFacetTest, validationAndMemoryFailure) {
       R"json("limit":0,"collapse":"key_s","ops":{"q":{"query_facet":{"buckets":{"all":"*:*"},"count_unit":"groups","count_distinct":"id"}}})json",
       R"json("limit":0,"collapse":"key_s","ops":{"c":{"field_facet":{"field":"color_s","sort":[{"expr":"avg","dir":"desc"}],"ops":{"avg":"avg(price_i)"}}}})json",
       R"json("limit":0,"collapse":"key_s","ops":{"c":{"field_facet":{"field":"color_s","count_unit":"groups","count_distinct":"id"}}})json",
-      R"json("limit":0,"collapse":"key_s","ops":{"f":{"fusion":{"sources":{"s":{"query":"*:*"}},"rrf":{}}}})json",
       R"json("limit":0,"ops":{"c":{"field_facet":{"field":"color_s","count_distinct":{"field":[]}}}})json"}) {
     auto request = run("main", body, 1, false);
     EXPECT_FALSE(request->errorMsg().empty());

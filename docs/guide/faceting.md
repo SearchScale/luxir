@@ -226,7 +226,6 @@ the request; counts never become estimates or document counts. Use
 Distinct counting supports STRING/ID and INT/DATE field facets, numeric/date
 range facets, and query facets, including overlapping query buckets and nested
 operations. TEXT field facets and metric sorts with distinct counts remain
-unsupported. Fusion directly in a collapsed list's list-level `ops` is also
 unsupported.
 
 ## Field facets
@@ -518,14 +517,43 @@ selects every document in the bucket, and without a `sort` that list is in
 index order. A text query's scores do not depend on the bucket, so repeating
 the outer query ranks each bucket the way the main result list is ranked.
 
+A bucket's `top_docs` can use its own `collapse`, under field, range, or query
+facets. For example, return the cheapest matching variant of each product
+within each category:
+
+```json
+{
+  "limit": 0,
+  "ops": {
+    "categories": {
+      "field_facet": {
+        "field": "category_s",
+        "ops": {
+          "products": {
+            "top_docs": {"collapse": "product_s", "sort": "price_i asc", "limit": 3}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The child list collapses only its bucket's documents. Its facets default to
+groups under its own key, and explicit `count_unit: "groups"` uses that
+nearest collapse. A descendant [domain reset](#bucket-domain-resets) keeps
+the enclosing bucket identities while replacing the matching query, as for
+other bucket children.
+
 Per-bucket lists work under field, range, and query facets. A per-bucket
 `top_docs` may carry its own `ops`, which see every document in the bucket
 that its query and filters match, regardless of its `limit`; a per-bucket
-`fusion` accepts no `ops`. Two differences from a top-level list: it is never
-streamed in batches (`batch_size` is ignored and every row arrives in the final
-response), and a `document_format` left at the default follows the transport
-default rather than the enclosing operation's. Each bucket is ranked
-independently, which costs one pass over the bucket's documents per bucket.
+`fusion` runs its `ops` over its fused candidate set. Two differences from a
+top-level list: it is never streamed in batches (`batch_size` is ignored and
+every row arrives in the final response), and a `document_format` left at the
+default follows the transport default rather than the enclosing operation's.
+Each bucket is ranked independently, which costs one pass over the bucket's
+documents per bucket.
 
 ## Range facets
 

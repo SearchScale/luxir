@@ -351,7 +351,7 @@ has no root shorthand, so both request and response use named `ops`.
 | `rrf.k` | The rank-smoothing constant, `>= 0`. Omitted selects `60`, the conventional choice. |
 | `linear.normalization` | Score normalization for [linear fusion](#linear-fusion); `min_max`, the default, is the only one today. |
 | `limit`, `offset`, `fields`, `get_scores`, `get_number`, `document_format` | Response shape, on the fusion, not on a source. |
-| `ops` | Facets and metrics over the fused candidate set. |
+| `ops` | Operations over the fused candidate set, including collapsed `top_docs`. |
 
 A source's `limit` bounds its candidate pool: a document outside a source's
 `limit` cannot contribute from that source, so size the pools for the recall
@@ -362,6 +362,33 @@ within the union of the source windows and does not enlarge them, so deep
 fusion paging needs larger source limits; per-source `offset` is ignored.
 Place `ops` on the fusion itself. For facets over a full text match set, put a
 sibling `top_docs` operation at the request root.
+
+A collapsed `top_docs` in `Fusion.ops` is a separate list over that entire
+candidate set, before Fusion paging. It ranks by its own query or sort and
+collapses by its own key; it does not change the fused ranking. For example:
+
+```json
+{
+  "ops": {
+    "hybrid": {
+      "fusion": {
+        "rrf": {},
+        "sources": {"text": {"query": "title_t:jacket", "limit": 100}},
+        "limit": 10,
+        "ops": {
+          "products": {
+            "top_docs": {"collapse": "product_s", "sort": "price_i asc", "limit": 10}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Collapse on a source in `Fusion.sources` remains unsupported. A Fusion
+operation can itself appear in a collapsed list's ordinary `ops`; its source
+domain is that list's matching documents, and Fusion still ranks documents.
 
 ### Source weights
 
