@@ -105,8 +105,14 @@ public:
         : exactIntervals;
   }
 
-  bool matchesValue(int64_t value) const {
+  // The range test is inlined into every per-value loop; the exact-set
+  // search stays out of line.
+  LUXIR_INLINE bool matchesValue(int64_t value) const {
     if (exactValues.empty()) return envelope.lo <= value && value <= envelope.hi;
+    return matchesExact(value);
+  }
+
+  bool matchesExact(int64_t value) const {
     auto found = std::lower_bound(
         exactIntervals.begin(), exactIntervals.end(), value,
         [](const PointsReader::ValueRange& interval, int64_t target) {
@@ -183,21 +189,45 @@ public:
     bool multi;
     int32_t docid = -1;
 
-    bool valueMatches() {
-      if (docid == PostingsReader::END) return false;
+    LUXIR_INLINE void observe(int32_t doc) {
 #ifndef NDEBUG
-      if (verificationObserver != nullptr) verificationObserver(docid);
+      if (verificationObserver != nullptr) verificationObserver(doc);
+#else
+      unused(doc);
 #endif
+    }
+
+    bool matchesAt(int32_t doc, int32_t rank) {
+      observe(doc);
       if (!multi) {
         if (allMatch) return true;
-        return query.matchesValue(iter.value());
+        return query.matchesValue(iter.values().valueAt(rank));
       }
-      auto [start, end] = reader.getStartEndValueRank(iter.rank());
+      auto [start, end] = reader.getStartEndValueRank(rank);
       if (allMatch) return start < end;
       for (int64_t r = start; r < end; r++) {
         if (query.matchesValue(iter.values().valueAt(r))) return true;
       }
       return false;
+    }
+
+    bool valueMatches() {
+      return docid != PostingsReader::END && matchesAt(docid, iter.rank());
+    }
+
+    // Calls scan(test) with this column's per-document test. Scans step with
+    // iter.nextWhere, which keeps the cursor in registers, and store docid
+    // once per call; a single-valued predicate gets its own small loop so the
+    // value test inlines into it.
+    template <typename Scan>
+    LUXIR_INLINE int32_t withTest(Scan&& scan) {
+      if (!multi && !allMatch) {
+        return scan([this](int32_t doc, int32_t rank) LUXIR_INLINE {
+          observe(doc);
+          return query.matchesValue(iter.values().valueAt(rank));
+        });
+      }
+      return scan([this](int32_t doc, int32_t rank) { return matchesAt(doc, rank); });
     }
 
   public:
@@ -232,17 +262,16 @@ public:
     }
 
     int32_t next() override {
-      for (;;) {
-        docid = iter.next();
-        if (docid == PostingsReader::END || valueMatches()) return docid;
-      }
+      docid = withTest([this](auto test) { return iter.nextWhere(test); });
+      return docid;
     }
     int32_t advance(int32_t target) override {
       assert(docid < target);
       docid = iter.advance(target);
-      while (docid != PostingsReader::END && !valueMatches()) {
-        docid = iter.next();
-      }
+      if (docid == PostingsReader::END) return docid;
+      docid = withTest([this](auto test) {
+        return test(docid, iter.rank()) ? docid : iter.nextWhere(test);
+      });
       return docid;
     }
     int32_t docId() override { return docid; }
@@ -256,7 +285,13 @@ public:
     int32_t advanceWindow(int32_t min, int32_t max) override {
       if (min >= max) return max;
       if (docid < min) docid = iter.advance(min);
-      while (docid < max && !valueMatches()) docid = iter.next();
+      if (docid >= max) return docid;
+      docid = withTest([this, max](auto test) {
+        if (test(docid, iter.rank())) return docid;
+        return iter.nextWhere([&test, max](int32_t doc, int32_t rank) LUXIR_INLINE {
+          return doc >= max || test(doc, rank);
+        });
+      });
       return docid;
     }
 
@@ -265,13 +300,19 @@ public:
       skipCount(SkipStats::countBulkFillCalls);
       if (min >= max) return;
       if (docid < min) docid = iter.advance(min);
-      while (docid < max) {
-        if (valueMatches()) {
-          int32_t index = docid - min;
-          words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
-        }
-        docid = iter.next();
-      }
+      if (docid >= max) return;
+      docid = withTest([this, words, min, max](auto test) {
+        auto mark = [&test, words, min, max](int32_t doc, int32_t rank) LUXIR_INLINE {
+          if (doc >= max) return true;
+          if (test(doc, rank)) {
+            int32_t index = doc - min;
+            words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+          }
+          return false;
+        };
+        mark(docid, iter.rank());
+        return iter.nextWhere(mark);
+      });
     }
   };
 

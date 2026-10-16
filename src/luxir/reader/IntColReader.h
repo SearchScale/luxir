@@ -684,6 +684,35 @@ public:
 
       return doc;
     }
+
+    // Steps to the first later document for which accept(doc, rank) holds,
+    // or ENDDOC, as repeated next() calls would. The cursor stays in locals
+    // and is stored once on return: a scan that stores it for every document
+    // pays a store/reload chain whose cost depended on where the iterator
+    // landed in memory (forced column full scans varied by 15%).
+    template <typename Accept>
+    LUXIR_INLINE int32_t nextWhere(Accept&& accept) {
+      int32_t rank = docRank;
+      int32_t end = maxRank;
+      if (dense) {
+        while (++rank < end) {
+          if (accept(rank, rank)) {
+            docRank = rank;
+            return doc = rank;
+          }
+        }
+      } else {
+        while (++rank < end) {
+          int32_t next = docsIter.next();
+          if (accept(next, rank)) {
+            docRank = rank;
+            return doc = next;
+          }
+        }
+      }
+      docRank = rank - 1;
+      return doc = ENDDOC;
+    }
   };
 
   using SparseIterator = DocIterator<SparseValues>;  // decodes individual values (good for big skipping)
