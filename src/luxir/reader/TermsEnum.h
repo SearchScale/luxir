@@ -28,6 +28,20 @@ class TermsEnum {
 
   const SegFieldInfo& fieldInfo;
 
+  // currTerm's buffer holds a full PackedTerm plus COPY_SLACK, and the index
+  // files are padded past every term block, so a short copy into currTerm may
+  // move a fixed COPY_SLACK bytes: gcc inlines that as one vector move, with no
+  // libc call.
+  static constexpr size_t COPY_SLACK = 16;
+  static constexpr size_t TERM_BUFFER_BYTES =
+      PackedTerm::getMemSize(PackedTerm::MAX_BYTES) + COPY_SLACK;
+  void copyIntoTerm(char* dst, const char* src, size_t len) {
+    assert(dst >= (char*) currTerm.ptr()
+           && dst + std::max(len, COPY_SLACK) <= (char*) currTerm.ptr() + TERM_BUFFER_BYTES);
+    if (len <= COPY_SLACK) memcpy(dst, src, COPY_SLACK);
+    else memcpy(dst, src, len);
+  }
+
   PackedTerm currTerm;
   int32_t ordInBlock = -1; // the term number local to the current block
   // Bytes currTerm shares with the term immediately before it, in full-term
@@ -136,7 +150,7 @@ public:
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), postingsReader(postingsReader), fieldInfo(fieldInfo) {
     unused(this->pool, this->postingsReader);
-    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
+    currTerm = PackedTerm(pool.alloc(TERM_BUFFER_BYTES), 0);
     if (fieldInfo.nTerms == 0) return;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     // The writers pad the terms stream so this table starts 8-aligned (see
@@ -784,7 +798,7 @@ protected:
     termsIS.skip(sizeof(pulsedMask));
     suffixBytesTotal = termsIS.readVint();
 
-    copyShortBytes((char*) currTerm.ptr(), (const char*) startingTerm.ptr(), startingTerm.memorySize());
+    copyIntoTerm((char*) currTerm.ptr(), (const char*) startingTerm.ptr(), startingTerm.memorySize());
     // The block's first term is not delta-coded against anything, so nothing is
     // known to be shared with whatever term preceded it.
     sharedLen = 0;
@@ -851,7 +865,7 @@ protected:
     const char* data = currTerm.data();
     uint32_t len = currTerm.size();
     assert(len == currTerm.size());
-    // Suffixes are short: an inline copy, not a memcpy call (copyShortBytes).
+    // Suffixes are short: usually one fixed 16-byte move (copyIntoTerm).
 
     assert(blockPrefixLen <= len);
     uint32_t factoredLen = len - blockPrefixLen;
@@ -862,7 +876,7 @@ protected:
     // compares at that factored boundary.
     assert(prefixLen == factoredLen || data[blockPrefixLen + prefixLen] != *suffix);
 
-    copyShortBytes(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
+    copyIntoTerm(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
     currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
     // Never an over-estimate whatever the build: these bytes were not written
     // just now, they are inherited from the previous term's reconstruction, so

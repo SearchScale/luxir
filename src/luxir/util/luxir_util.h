@@ -134,39 +134,6 @@ LUXIR_INLINE inline void storeUnaligned(void* p, T value) {
 }
 #endif
 
-// Copy n non-overlapping bytes without a libc call: overlapping head/tail moves
-// up to 16 bytes, 16-byte steps beyond. For short copies in hot loops (term
-// reconstruction), where a memcpy call's PLT jump and entry dispatch cost more
-// than the copy and that cost moves with code layout.
-[[gnu::always_inline]] inline void copyShortBytes(char* dst, const char* src, size_t n) {
-  auto copy16 = [](char* d, const char* s) {
-    uint64_t lo = loadUnaligned<uint64_t>(s);
-    uint64_t hi = loadUnaligned<uint64_t>(s + 8);
-    storeUnaligned(d, lo);
-    storeUnaligned(d + 8, hi);
-  };
-  if (n > 16) {
-    // The final step overlaps the previous one rather than reading past the end.
-    for (size_t i = 0; i + 16 < n; i += 16) copy16(dst + i, src + i);
-    copy16(dst + n - 16, src + n - 16);
-  } else if (n >= 8) {
-    uint64_t head = loadUnaligned<uint64_t>(src);
-    uint64_t tail = loadUnaligned<uint64_t>(src + n - 8);
-    storeUnaligned(dst, head);
-    storeUnaligned(dst + n - 8, tail);
-  } else if (n >= 4) {
-    uint32_t head = loadUnaligned<uint32_t>(src);
-    uint32_t tail = loadUnaligned<uint32_t>(src + n - 4);
-    storeUnaligned(dst, head);
-    storeUnaligned(dst + n - 4, tail);
-  } else if (n > 0) {
-    char first = src[0], middle = src[n / 2], last = src[n - 1];
-    dst[0] = first;
-    dst[n / 2] = middle;
-    dst[n - 1] = last;
-  }
-}
-
 template<typename... Args>
 inline void unused(Args &&...) {}
 
