@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <latch>
@@ -10,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "luxir/server/LuxirNode.h"
+#include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 
 namespace luxir::test {
@@ -40,6 +42,24 @@ TEST_F(TaskArenaTest, allConfiguredWorkersRunConcurrently) {
   }
   finished.wait();
   EXPECT_EQ(workers, sawAll.load());
+}
+
+// A collection indexes in its node's index arena whichever thread opens it.  The
+// test thread runs in its own arena, as a transport thread auto-creating a
+// collection or the main thread reopening one runs outside the node's.
+TEST_F(TaskArenaTest, indexingRunsInIndexArena) {
+  LuxirNode node;
+  class Entries : public oneapi::tbb::task_scheduler_observer {
+  public:
+    std::atomic<int> count{0};
+    explicit Entries(oneapi::tbb::task_arena& arena) : oneapi::tbb::task_scheduler_observer(arena) { observe(true); }
+    ~Entries() override { observe(false); }
+    void on_scheduler_entry(bool) override { count++; }
+  } entries(node.getIndexArena());
+
+  CollectionHelper helper(node, "arena_bound");
+  helper.indexAll(std::array{flatdoc("id", "1")}, UpdateMessage::COMMIT);
+  EXPECT_GT(entries.count.load(), 0);
 }
 
 } // namespace luxir::test

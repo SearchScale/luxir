@@ -6005,7 +6005,7 @@ IndexResult commitAndDrain(CollectionHelper& helper) {
   CollectionHelper::UpdateBuilder commit;
   commit.commit(true);
   auto result = helper.submit(commit);
-  helper.getIndexWriter()->updateGraph.wait_for_all();
+  helper.getIndexWriter()->updateGraph->wait_for_all();
   helper.getIndexWriter()->snapshots.readers.getReader();
   return result;
 }

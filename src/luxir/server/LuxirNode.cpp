@@ -58,8 +58,9 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   : config(std::move(config)), workers(std::max(1, this->config.server.resolveWorkers())),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
-              oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast) {
-  ensureWorkerPool(workers);
+              oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
+    indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
+  ensureWorkerPool(workers + 1);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -92,7 +93,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget);
+  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena);
 
   if (following()) {
     // The follower first checks that it owns the data directory.
