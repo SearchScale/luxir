@@ -2563,9 +2563,8 @@ private:
 
   void startStreamingUpdate(std::string coll, UpdateUrlParams url) {
     const auto& ingest = node_.getConfig().ingest;
-    std::size_t arenaWidth = (std::size_t)computeWidth(node_.getTaskArena().max_concurrency());
     std::size_t maxInFlight = ingest.max_inflight_batches == 0
-        ? arenaWidth + 2
+        ? (std::size_t)node_.getWorkers() + 2
         : (std::size_t)ingest.max_inflight_batches;
     auto state = std::make_shared<HttpStreamUpdateState>(
         (std::size_t)ingest.stream_batch_size,
