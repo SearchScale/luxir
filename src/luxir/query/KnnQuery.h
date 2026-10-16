@@ -417,6 +417,8 @@ public:
       nprobe(nprobe), refineCandidates(refineCandidates),
       minScanFraction(minScanFraction), exact(exact), groups(groups) {}
 
+  bool recoverableAsPredicate() const noexcept override { return false; }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const KnnQuery&>(other);
     return sameGroups(rhs) && field == rhs.field && k == rhs.k
@@ -605,6 +607,12 @@ public:
         if (hits.empty()) return nullptr;
         return target.make<Supplier>(
             std::span<const Hit>(hits.data(), hits.size()));
+      }
+
+      size_t retainedBytes() const noexcept override {
+        size_t bytes = sizeof(*this) + perSegHits.capacity() * sizeof(perSegHits[0]);
+        for (const auto& hits : perSegHits) bytes += hits.capacity() * sizeof(Hit);
+        return bytes;
       }
 
       bool outputIsSubsetOfDomain() const noexcept override { return true; }

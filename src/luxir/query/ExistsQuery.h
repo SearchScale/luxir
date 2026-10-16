@@ -20,6 +20,8 @@ class ExistsQuery final : public Query {
   std::string_view field;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   explicit ExistsQuery(std::string_view field)
     : Query(QueryKind::EXISTS), field(field) {}
 

@@ -12,6 +12,8 @@ namespace luxir {
 // yields a null scorer for every segment.
 class MatchNoDocsQuery final : public luxir::Query {
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   MatchNoDocsQuery() : Query(QueryKind::NONE) {}
 
   bool equalsSameKind(const Query& other) const override {

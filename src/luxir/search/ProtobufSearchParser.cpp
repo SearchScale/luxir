@@ -99,6 +99,9 @@ struct SearchParserImpl {
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   const CollapsePlan* enclosingCollapse = nullptr;
   const CollapsePlan* inheritedFacetMeasure = nullptr;
+  TopDocsReq* owningList = nullptr;
+  std::string_view owningListChild;
+  bool groupScope = false;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
@@ -389,6 +392,41 @@ public:
       throw std::runtime_error("search operation nesting exceeds the maximum depth of "
                                + std::to_string(maxOpDepth));
     }
+    BucketDomainPlan* bucketPlan = nullptr;
+    if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
+      ParseContext context{req.requestPool, *req.schema, req.arena,
+          CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+          currOp.name, &req.warnings, &fields};
+      context.collapse = enclosingCollapse;
+      ProtobufQueryParser parser(context);
+      auto domains = parseChildDomains(ops, parser);
+      if (!domains.empty()) {
+        std::vector<Query*> filters;
+        auto* owner = placement == OpsPlacement::GROUP_BUCKET
+            ? &static_cast<TopDocsReq&>(currOp) : owningList;
+        if (owner) for (const auto& filter : owner->filters) {
+          if (placement == OpsPlacement::GROUP_BUCKET
+              || std::ranges::find(filter.exceptOps, owningListChild) == filter.exceptOps.end()) {
+            filters.push_back(filter.query);
+          }
+        }
+        for (auto& [key, domain] : domains) {
+          if (domain.applyParentFilters) {
+            domain.filters.insert(domain.filters.end(), filters.begin(), filters.end());
+          }
+          domain.applyParentFilters = false;
+        }
+        bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
+        bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
+            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+        validateDomainQueries(domains, *bucketPlan->planning);
+        bucketPlan->variants.begin(0);
+        addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
+        auto* weights = Query::Context::create(&req.arena, *bucketPlan->planning);
+        bucketPlan->variants.buildWeights(*weights, *bucketPlan->planning, 0);
+      }
+    }
     for (auto& [name, searchOp] : lastWins(ops)) {
       // map values are indirect views over the request bytes; deref to the SearchOp.
       // lastWins() collapses duplicate op names (protobuf map dedup semantics).
@@ -398,27 +436,44 @@ public:
               || name == "singleton" || name == "missing")) {
         throw RequestError("reserved bucket/group op name: " + std::string(name));
       }
-      auto* sub = parseOp(name, **searchOp, depth + 1, placement);
+      SearchOp* sub;
+      bool entersList = placement == OpsPlacement::TOP_DOCS || placement == OpsPlacement::GROUP_BUCKET;
+      auto* nextList = entersList ? &static_cast<TopDocsReq&>(currOp) : owningList;
+      if (nextList && nextList->filters.empty()) nextList = nullptr;
+      auto nextChild = !entersList ? owningListChild
+          : nextList && placement == OpsPlacement::TOP_DOCS ? name : std::string_view{};
+      if (nextList != owningList || (nextList && nextChild != owningListChild)) {
+        auto* oldList = owningList;
+        auto oldChild = owningListChild;
+        auto restore = scope_guard([&]() noexcept {
+          owningList = oldList;
+          owningListChild = oldChild;
+        });
+        owningList = nextList;
+        owningListChild = nextChild;
+        sub = parseOp(name, **searchOp, depth + 1, placement);
+      } else {
+        sub = parseOp(name, **searchOp, depth + 1, placement);
+      }
       if (sub == nullptr) {
         continue; // skip this op
       }
       (destination ? *destination : currOp.subOps)[name] = sub;
       sub->parent = &currOp;
+      if (bucketPlan && (**searchOp).domain) sub->bucketDomain = bucketPlan;
+      // Inheriting filters use the incoming domain; only a reset (here or
+      // below) needs recoverable identities and their prefix memo.
+      if (((**searchOp).domain && (**searchOp).domain->query) || sub->needsStructuralScope) {
+        sub->needsStructuralScope = true;
+        currOp.needsStructuralScope = true;
+      }
     }
   }
 
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
-    if (searchOp.domain.has_value()
-        && placement != OpsPlacement::REQUEST_ROOT
-        && placement != OpsPlacement::TOP_DOCS) {
-      std::string location = placement == OpsPlacement::FUSION
-          ? "Fusion.ops" : placement == OpsPlacement::GROUP_BUCKET
-          ? "a group bucket" : "a facet bucket";
-      throw std::runtime_error(
-          "op '" + std::string(name) + "' under " + location
-          + ": domain is only supported for ops dispatched by the request "
-            "root or TopDocs");
+    if (searchOp.domain && placement == OpsPlacement::FUSION) {
+      throw RequestError("domain is not supported under Fusion.ops");
     }
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(luxir::overloaded{
@@ -436,20 +491,25 @@ public:
         auto topDocsPlacement = depth == 1 ? TopDocsPlacement::ROOT_OP
                                            : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
-        addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
         if (topDocs.collapse) {
-          // A group bucket is a document domain, not another enclosing group
-          // measure or group-kNN scope. Its children establish their own query
-          // scores; an omitted query selects members unscored.
-          enclosingCollapse = nullptr;
+          bool oldGroupScope = groupScope;
+          auto restoreGroup = scope_guard([&]() noexcept { groupScope = oldGroupScope; });
+          groupScope = false;
+          addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
+          // Keep the nearest collapse for explicit group units, while a
+          // group's facets default to document counts. Child queries still
+          // establish their own scores; omitted queries select unscored members.
+          groupScope = true;
           inheritedFacetMeasure = nullptr;
           addSubs(*qr, topDocs.collapse->ops, depth, OpsPlacement::GROUP_BUCKET,
                   &qr->groupOps);
+        } else {
+          addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
         }
         return qr;
       },
       [&](const luxir::api::Fusion& fusion) -> SearchOp* {
-        if (enclosingCollapse != nullptr) {
+        if (enclosingCollapse != nullptr && !groupScope) {
           throw RequestError("fusion under a collapsed list is not supported yet");
         }
         return parseFusion(name, fusion, depth);
@@ -2132,7 +2192,7 @@ public:
         throw std::runtime_error(fusionPrefix(name) + "linear fusion source '"
             + std::string(srcName) + "' must rank by score; use rrf for sorted sources");
       }
-      src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
+      src->rankingSink = [idx](TopDocsReq::CalcBase& calc, MergeableCollector* mc) {
         static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
       };
       sources.push_back(src);

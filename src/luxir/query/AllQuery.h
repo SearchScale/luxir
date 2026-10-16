@@ -12,6 +12,8 @@ namespace luxir {
 
 class AllQuery final : public luxir::Query {
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableDenseClauseForTests = false;
 
   AllQuery() : Query(QueryKind::ALL) {}

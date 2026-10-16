@@ -406,6 +406,10 @@ public:
     : Query(QueryKind::RESCORE), child(child), program(program),
       constantOutput(constantOutput) {}
 
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
+
   bool equalsSameKind(const Query& other) const override {
     unused(other);
     return false;
@@ -483,6 +487,10 @@ public:
 
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
         child.releaseSegmentState(segment);
+      }
+
+      size_t retainedBytes() const noexcept override {
+        return sizeof(*this) + (child.prepared ? child.prepared->retainedBytes() : 0);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {

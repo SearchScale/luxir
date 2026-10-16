@@ -26,6 +26,8 @@ class PhraseQuery final : public Query {
   int32_t slop;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableShapesForTests = false;
 
   struct ScorerControls {

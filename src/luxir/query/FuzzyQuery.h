@@ -70,6 +70,8 @@ class FuzzyQuery final : public Query {
   }
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   // Default expansion cap when max_expansions is unset (Lucene parity).
   static constexpr int DEFAULT_MAX_EXPANSIONS = 50;
 

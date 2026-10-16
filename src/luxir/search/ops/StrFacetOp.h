@@ -396,7 +396,7 @@ public:
         && limit >= buckets
         && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
         && std::ranges::any_of(subOps, [](const auto& subOp) {
-             return subOp.second->canInline();
+             return subOp.second->canInlineInBucket();
            });
   }
 
@@ -533,8 +533,9 @@ public:
 
 
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FieldFacetReq::Calc(op, parent, slot, numSlots),
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
         profileRun(op.addExecutionProfileRun()),
         inlineOps(((StrFacetOp&)op).inlineSubOps),
         feedOps(((StrFacetOp&)op).subOps.begin(),
@@ -562,7 +563,7 @@ public:
       std::vector<std::pair<const std::string_view, SearchOp*>> remaining;
       remaining.reserve(feedOps.size());
       for (auto& subOp : feedOps) {
-        if (subOp.second->canInline()) {
+        if (subOp.second->canInlineInBucket()) {
           inlineOps.push_back(subOp);
         } else {
           remaining.push_back(subOp);
@@ -1590,7 +1591,10 @@ public:
                   : materializeTermDomain((int32_t)segnum, block[i].key,
                                           input[segnum].get()));
             }
-          }, FacetBucketBlockExecutor::BINDING_BYTES);
+          }, FacetBucketBlockExecutor::BINDING_BYTES, input,
+          [this](size_t segnum, auto block, DomainHandle eligibility, FacetBucketFeed feed) {
+            this->identityDomains(segnum, block, std::move(eligibility), feed, thisOp().ordMap);
+          });
     }
   };
 
@@ -1885,6 +1889,7 @@ public:
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
+    if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (countDistinct != nullptr || context.stringColumn == nullptr || ordMap == nullptr
         || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
       return nullptr;
@@ -1896,9 +1901,12 @@ public:
                                     *context.stringColumn);
   }
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
-    if (countDistinct != nullptr) return new DistinctCalc<true>(*this, parent, slot, numSlots, ordMap);
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot, int64_t numSlots,
+      const StructuralConstraint* structural = nullptr) override {
+    if (countDistinct != nullptr) return new DistinctCalc<true>(
+        *this, parent, slot, numSlots, ordMap, {}, structural);
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
 
   // Retained by one bucket binding while its segments are fed: the
@@ -1932,7 +1940,7 @@ public:
       if (inlineAllCandidate) {
         // calcAll may promote the remaining inlinable sub-ops.
         for (auto& [name, child] : subOps) {
-          if (child->canInline()) {
+          if (child->canInlineInBucket()) {
             stride = saturatingAdd(stride, child->inlineEntryBytes());
           }
         }

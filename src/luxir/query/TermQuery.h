@@ -30,6 +30,8 @@ protected:
   bool useFrontierBound;
   bool hasInjectedTermStats = false;
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   class Scorer;
   class TermBulkScorer;
   static inline bool disableCandidateLeapfrogForTests = false;

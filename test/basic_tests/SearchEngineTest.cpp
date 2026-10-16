@@ -4662,13 +4662,13 @@ TEST_F(SearchEngineTest, opDomainValidationIsParseTime) {
       "apply_parent_filters requires domain.query");
   expectError(R"json({"limit":0,"ops":{"outer":{"field_facet":{
     "field":"brand_s","ops":{"inner":{"expr_op":"sum(price_i)",
-      "domain":{"query":{"all":true}}}}}}}})json",
-      "under a facet bucket: domain is only supported");
+      "domain":{"apply_parent_filters":false}}}}}}})json",
+      "apply_parent_filters requires domain.query");
   expectError(R"json({"ops":{"f":{"fusion":{
     "sources":{"s":{"query":{"all":true}}},"rrf":{},
     "ops":{"x":{"expr_op":"sum(price_i)",
       "domain":{"query":{"all":true}}}}}}}})json",
-      "under Fusion.ops: domain is only supported for ops dispatched by the request root or TopDocs");
+      "domain is not supported under Fusion.ops");
 
   auto missing = localReq(luxirNode->getSearchEngine());
   auto& facet = missing->collection("main").topDocs("q").allQuery()

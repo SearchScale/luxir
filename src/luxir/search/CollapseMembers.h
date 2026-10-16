@@ -21,9 +21,19 @@ class CollapseMembers {
 public:
   CollapseMembers(const CollapsePlan& plan, std::span<const CollapseKey> keys,
                   RequestMemTracker& tracker);
+  template <bool Replay, typename Visit>
+  void walk(int32_t segment, DocSet* eligibility, Query::SegmentSource* source,
+            bool scores, Visit&& visit);
   template <typename Visit>
   void forSegment(int32_t segment, DocSet* eligibility,
-                  Query::SegmentSource& source, bool scores, Visit&& visit);
+                  Query::SegmentSource& source, bool scores, Visit&& visit) {
+    walk<true>(segment, eligibility, &source, scores, std::forward<Visit>(visit));
+  }
+  template <typename Visit>
+  void forKeys(int32_t segment, DocSet* eligibility, Visit&& visit) {
+    walk<false>(segment, eligibility, nullptr, false, std::forward<Visit>(visit));
+  }
+
 };
 
 // Cold response-stage evaluation. Emits the list's actual rank clauses (not

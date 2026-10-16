@@ -376,6 +376,11 @@ private:
 public:
   QueryKind getKind() const { return kind; }
 
+  // Predicates recover structural membership segmentwise. Selection queries
+  // choose a window and need fresh preparation over the reset's complete
+  // input. Preparation/caching provenance is a separate property.
+  virtual bool recoverableAsPredicate() const noexcept { return false; }
+
   void markPlannerGenerated() {
 #ifndef NDEBUG
     plannerGenerated = true;
@@ -1551,6 +1556,10 @@ public:
       virtual PreparedDomainDependence domainDependence() const noexcept {
         return PreparedDomainDependence::PREPARE_DOMAIN;
       }
+      // Owned retained state only; borrowed input and cache primitives have
+      // their own lifetimes/accounting. Callers retaining a selection window
+      // can charge its actual size instead of reserving maxDoc-sized sets.
+      virtual size_t retainedBytes() const noexcept { return sizeof(PreparedWeight); }
       virtual ~PreparedWeight() = default;
     };
 

@@ -84,6 +84,8 @@ class DomainHandle {
       : storage(std::move(storage)), retained(std::move(retained)) {}
   };
 
+  static inline const char chargedLifetime = 0;
+
   DocSet* docs = nullptr;
   std::shared_ptr<const void> lifetime;
 
@@ -137,10 +139,26 @@ public:
       throw std::invalid_argument(
           "borrowed domain requires its storage pin before retention");
     }
-    lifetime = std::make_shared<RetainedLifetime>(
+    bool charged = isCharged();
+    auto combined = std::make_shared<RetainedLifetime>(
         std::move(lifetime), std::move(retained));
+    lifetime = charged ? std::shared_ptr<const void>(std::move(combined), &chargedLifetime)
+        : std::move(combined);
     return std::move(*this);
   }
+
+  // The alias marks accounting ownership without enlarging every delivery
+  // handle. Its control block still owns both storage and the charge.
+  template <typename T>
+  DomainHandle chargedWith(std::shared_ptr<T> charge) && {
+    if (charge == nullptr) return std::move(*this);
+    auto result = std::move(*this).retainedWith(std::move(charge));
+    result.lifetime = std::shared_ptr<const void>(std::move(result.lifetime), &chargedLifetime);
+    return result;
+  }
+
+  bool isCharged() const noexcept { return lifetime.get() == &chargedLifetime; }
+  bool ownsStorage() const noexcept { return docs && lifetime.get() == docs; }
 
   DocSet* get() const { return docs; }
   bool isDeliverable() const { return docs == nullptr || lifetime != nullptr; }

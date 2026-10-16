@@ -160,8 +160,9 @@ public:
     }
 
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-        : Calculator(op, parent, slot, numSlots),
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+        : Calculator(op, parent, slot, numSlots, structural),
           driver(op.req.reader->segments().size(),
                  [this](std::unique_ptr<AggregateAccumulator> accumulator) {
                    emitResult(*accumulator);
@@ -681,9 +682,10 @@ public:
     }
   };
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot = -1,
-                               int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
 
   InlineCalculator* createInlineCalculator(
@@ -705,6 +707,7 @@ public:
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
+    if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (context.stringColumn == nullptr) return nullptr;
     for (const auto& bucket : context.stringColumn->buckets) {
       if (!bucket.id.has_value()) return nullptr;

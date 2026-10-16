@@ -4,6 +4,8 @@
 #pragma once
 
 #include "luxir/reader/DocsEnum.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/reader/PointsReader.h"
 #include "luxir/search/SearchOverrides.h"
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -81,22 +83,30 @@ struct Eligibility {
 
 } // namespace collapse_members_detail
 
-template <typename Visit>
-void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
-    Query::SegmentSource& source, bool scores, Visit&& visit) {
+template <bool Replay, typename Visit>
+void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
+    Query::SegmentSource* source, bool scores, Visit&& visit) {
   using namespace collapse_members_detail;
   auto& seg = plan.reader.segments()[(size_t)segment];
   MemPool pool;
-  auto* supplier = source.scorerSupplier(pool, seg);
-  if (supplier == nullptr) return;
-  int64_t domainCost = std::min<int64_t>(supplier->cost(),
-      eligibility ? eligibility->card() : seg.maxDoc());
-  if (domainCost == 0) return;
-  auto demand = Query::Demand::fromLeadCost(domainCost);
-  auto* scorerPlan = supplier->resolve(pool, supplier->makePlanContext(demand));
-  // Exact next/advance is the public scorer protocol, including two-phase
-  // verification. No min-competitive score is installed during replay.
-  auto* scorer = scorerPlan->build(pool);
+  int64_t domainCost;
+  Query::Scorer* scorer;
+  if constexpr (Replay) {
+    auto* supplier = source->scorerSupplier(pool, seg);
+    if (supplier == nullptr) return;
+    domainCost = std::min<int64_t>(supplier->cost(),
+        eligibility ? eligibility->card() : seg.maxDoc());
+    if (domainCost == 0) return;
+    auto demand = Query::Demand::fromLeadCost(domainCost);
+    auto* scorerPlan = supplier->resolve(pool, supplier->makePlanContext(demand));
+    // Replay the prepared list source without installing a ranking floor.
+    scorer = scorerPlan->build(pool);
+  } else {
+    domainCost = eligibility ? eligibility->card() : seg.maxDoc();
+    if (domainCost == 0) return;
+    scorer = eligibility ? QueryPrep::createDocSetScorer(pool, eligibility, seg)
+        : pool.make<AllQuery::Scorer>(seg);
+  }
   Eligibility eligible(eligibility);
   auto matches = [&](int32_t doc) {
     if (!eligible.contains(doc)) return false;
@@ -109,15 +119,40 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
   };
 
   bool indexed = true;
-  for (const auto& key : keys) {
-    if (key.singleton) continue;
-    for (const auto& component : key.components) indexed &= component.present;
+  if constexpr (Replay) {
+    for (const auto& key : keys) {
+      if (key.singleton) continue;
+      for (const auto& component : key.components) indexed &= component.present;
+    }
   }
   std::vector<const SegFieldInfo*> info(plan.fields.size());
   for (size_t c = 0; c < info.size(); c++) {
     info[c] = plan.fields[c].segments.at(seg);
-    if (!info[c]) { indexed = false; break; }
-    if (!plan.fields[c].ordinal() && info[c]->pointsMetaOff == 0) indexed = false;
+    if (!info[c]) {
+      if constexpr (Replay) { indexed = false; break; }
+      continue;
+    }
+    if constexpr (Replay) {
+      if (!plan.fields[c].ordinal() && info[c]->pointsMetaOff == 0) indexed = false;
+    }
+  }
+
+  // IDENTITY can use any indexed present component as the lead, verifying
+  // the full correlated key afterwards. A null component or an unindexed
+  // component must not send the other page keys to a live-doc column scan.
+  std::pmr::vector<uint8_t> indexedKeys(&resource);
+  auto recoverable = [&](size_t slot, size_t c) {
+    return keys[slot].components[c].present && info[c] != nullptr && (plan.fields[c].ordinal()
+        ? (info[c]->flags & FieldType::INDEX_DOCS) != 0 : info[c]->pointsMetaOff != 0);
+  };
+  if constexpr (!Replay) {
+    indexedKeys.resize(keys.size());
+    indexed = false;
+    for (size_t slot = 0; slot < keys.size(); slot++) {
+      if (keys[slot].singleton) continue;
+      for (size_t c = 0; c < info.size(); c++) indexedKeys[slot] |= recoverable(slot, c);
+      indexed |= indexedKeys[slot] != 0;
+    }
   }
 
   // Estimate before opening streams. A page covering a large part of a
@@ -145,9 +180,11 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
     // expensive points plan before materializing any doc arrays.
     for (size_t c = 0; c < info.size() && estimated < (double)domainCost; c++) {
       if (plan.fields[c].ordinal()) continue;
+      if constexpr (!Replay) { if (!info[c] || !info[c]->pointsMetaOff) continue; }
       PointsReader points(seg.postingsReader(), *info[c]);
       for (const auto& key : keys) {
         if (key.singleton) continue;
+        if constexpr (!Replay) { if (!key.components[c].present) continue; }
         int64_t value = key.components[c].value;
         auto fence = points.fenceRange(value, value);
         if (!fence.empty) estimated += (double)(points.leafOrdinalEnd(fence.lastLeaf)
@@ -160,6 +197,29 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
     // prices that key-driven work at twice the sequential domain work.
     double domainWork = (double)domainCost;
     if (domainCost < DocSetBuilder::arrayLimitFor(seg.maxDoc())) domainWork *= 0.5;
+    if constexpr (!Replay) {
+      // Only a present indexed component can supply the identity lead. In
+      // particular a high-cardinality null component supplies no selectivity.
+      estimated = 0;
+      for (size_t slot = 0; slot < keys.size(); slot++) {
+        if (!indexedKeys[slot]) continue;
+        double best = (double)seg.maxDoc();
+        for (size_t c = 0; c < info.size(); c++) {
+          if (!recoverable(slot, c)) continue;
+          double cost;
+          if (plan.fields[c].ordinal()) {
+            cost = (double)seg.maxDoc() / std::max<int64_t>(1, plan.fields[c].ords->numOrds());
+          } else {
+            PointsReader points(seg.postingsReader(), *info[c]);
+            int64_t value = keys[slot].components[c].value;
+            auto fence = points.fenceRange(value, value);
+            cost = fence.empty ? 0 : (double)(fence.endOrdinal - fence.firstOrdinal);
+          }
+          best = std::min(best, cost);
+        }
+        estimated += STREAM_SETUP_ROWS + best;
+      }
+    }
     useKeys = estimated < domainWork;
   }
   if (useKeys) {
@@ -180,11 +240,38 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
     auto releaseRemap = scope_guard([&]() noexcept { tracker.release(remapBytes); });
     keyReader.remapRetained(keys, local, available);
     std::pmr::vector<MemberPostings> streams(&resource);
+    std::pmr::vector<uint8_t> verifyKeys(&resource);
+    if constexpr (!Replay) verifyKeys.resize(keys.size());
     streams.reserve(keys.size());
     for (size_t slot = 0; slot < keys.size(); slot++) {
       if (keys[slot].singleton || !available[slot]) continue;
+      if constexpr (!Replay) { if (!indexedKeys[slot]) continue; }
+      [[maybe_unused]] size_t lead = 0;
+      if constexpr (!Replay) {
+        // Open only the cheapest indexed predicate. Materializing a broad
+        // numeric tuple component beside a selective term would defeat the
+        // lead choice. Verify the full correlated key on its candidates.
+        uint64_t best = std::numeric_limits<uint64_t>::max();
+        for (size_t c = 0; c < info.size(); c++) {
+          if (!recoverable(slot, c)) continue;
+          int64_t value = local[slot].components[c].value;
+          uint64_t cost;
+          if (plan.fields[c].ordinal()) {
+            TermsEnum terms(pool, seg.postingsReader(), *info[c]);
+            terms.seekOrd(value);
+            cost = (uint64_t)terms.docFreq();
+          } else {
+            PointsReader points(seg.postingsReader(), *info[c]);
+            auto fence = points.fenceRange(value, value);
+            cost = fence.endOrdinal - fence.firstOrdinal;
+          }
+          if (cost < best) { best = cost; lead = c; }
+        }
+        verifyKeys[slot] = keys[slot].components.size() > 1;
+      }
       auto& stream = streams.emplace_back(slot, &resource);
       for (size_t c = 0; c < info.size(); c++) {
+        if constexpr (!Replay) { if (c != lead) continue; }
         auto& part = stream.components.emplace_back(&resource);
         int64_t value = local[slot].components[c].value;
         if (plan.fields[c].ordinal()) {
@@ -193,14 +280,8 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
           part.open(terms.postingsState());
         } else {
           PointsReader points(seg.postingsReader(), *info[c]);
-          auto fence = points.fenceRange(value, value);
-          if (!fence.empty) {
-            for (uint32_t leaf = fence.firstLeaf; leaf <= fence.lastLeaf; leaf++) {
-              for (const auto& point : points.decodeLeaf(leaf)) {
-                if (point.value == value) part.docs.push_back(point.docid);
-              }
-            }
-          }
+          points.forEachRangeDoc(value, value,
+              [&](int32_t doc) { part.docs.push_back(doc); });
           std::sort(part.docs.begin(), part.docs.end());
         }
       }
@@ -218,11 +299,29 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
       auto entry = queue.top(); queue.pop();
       auto& stream = streams[entry.stream];
       if (collapseMemberStats) collapseMemberStats->candidates++;
-      if (matches(entry.doc)) member(stream.slot, entry.doc, scores ? scorer->score() : 0.0f);
+      if (matches(entry.doc)) {
+        bool equal = true;
+        if constexpr (!Replay) {
+          if (verifyKeys[stream.slot]) {
+            const auto* key = keyReader.read(segment, entry.doc, true);
+            equal = key && *key == local[stream.slot];
+          }
+        }
+        if (equal) member(stream.slot, entry.doc, scores ? scorer->score() : 0.0f);
+      }
       int32_t doc = stream.advance(entry.doc + 1);
       if (doc != DocsOnlyEnum::END) queue.push({doc, entry.stream});
     }
-    return;
+    if constexpr (Replay) return;
+    else {
+      if (std::ranges::all_of(indexedKeys, [](uint8_t value) { return value != 0; })) return;
+      // The fallback below is only for keys with no recoverable component.
+      // Indexed streams consumed the forward eligibility scorer; the residual
+      // key set needs a fresh walk over that same input, not its remaining tail.
+      eligible.cursor = 0;
+      scorer = eligibility ? QueryPrep::createDocSetScorer(pool, eligibility, seg)
+          : pool.make<AllQuery::Scorer>(seg);
+    }
   }
 
   if (collapseMemberStats) collapseMemberStats->domainSegments++;
@@ -236,6 +335,7 @@ void CollapseMembers::forSegment(int32_t segment, DocSet* eligibility,
   boost::unordered_flat_map<const CollapseKey*, size_t, Hash, Equal,
       std::pmr::polymorphic_allocator<Slot>> slots(&resource);
   for (size_t slot = 0; slot < keys.size(); slot++) {
+    if constexpr (!Replay) { if (useKeys && indexedKeys[slot]) continue; }
     if (!keys[slot].singleton) slots.emplace(&keys[slot], slot);
   }
   if (slots.empty()) return;

@@ -105,6 +105,7 @@ message Collapse {
   repeated SortSpec head_sort = 3; // Display member order; defaults to the list sort.
   bool get_number = 4; // Count members of each returned group in the finalized match set.
   // Per-group operations on matching members; facet count units start at docs.
+  // Explicit group units still resolve to this nearest enclosing collapse.
   map<string, SearchOp> ops = 5;
 }
 
@@ -609,7 +610,8 @@ message FieldFacet {
   SelectionMode selection_mode = 8; // ALL requires a nonempty selection
 
   // Unset inherits a parent facet's measure, or counts groups beneath a
-  // collapsed list. GROUPS requires an enclosing collapse. Controls count,
+  // collapsed list; entering group ops defaults to docs. Explicit GROUPS uses
+  // the nearest enclosing collapse, including inside a group. Controls count,
   // count order, mincount, and missing; metrics still fold documents.
   optional CountUnit count_unit = 9;
   // Exact distinct keys per bucket, also usable without collapse. Same key
@@ -671,17 +673,20 @@ message QueryFacet {
   Collapse count_distinct = 10; // Exact distinct keys; same specification as Collapse.
 }
 
-// Overrides the incoming document set for an operation directly in
-// SearchRequest.ops or TopDocs.ops. Not supported directly in Fusion.ops
-// or beneath facet buckets.
+// Overrides an operation's incoming document set, including beneath facet
+// and group buckets. A reset retains the enclosing structural identities,
+// and re-evaluates selection-query identities outer to inner in the new
+// scope; child membership can differ from the parent's counted window.
+// Not supported directly in Fusion.ops.
 message Domain {
   // If present, replaces the incoming domain with this query's matches
-  // across the collection. If absent, inherits the incoming domain.
+  // within live documents and the enclosing structural bucket identities.
+  // If absent, inherits the incoming domain.
   Query query = 2;
 
-  // With query set, reapply the immediate parent's filters, including facet
+  // With query set, reapply the owning list's filters, including facet
   // selections, while respecting except_ops. Default false discards them.
-  // Requires query; does not restore the parent's query or ancestor domain.
+  // Requires query; does not restore matching queries above this operation.
   optional bool apply_parent_filters = 3;
 
   // Additional non-scoring constraints, ANDed with the inherited or reset

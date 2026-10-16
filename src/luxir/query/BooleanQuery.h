@@ -779,6 +779,13 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
+  bool recoverableAsPredicate() const noexcept override {
+    for (auto clauses : {mandatory, optional, prohibited, filter}) {
+      for (auto* clause : clauses) if (!clause->recoverableAsPredicate()) return false;
+    }
+    return true;
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const BooleanQuery&>(other);
     if (minShouldMatch != rhs.minShouldMatch
@@ -5012,6 +5019,21 @@ public:
           minShouldMatch(minShouldMatch),
           needsScores(needsScores), allowsPruning(allowsPruning),
           uniformConstantCandidate(uniformConstantCandidate) {}
+
+      size_t retainedBytes() const noexcept override {
+        size_t bytes = sizeof(*this) + mandatoryScores.capacity() * sizeof(uint8_t)
+            + filterDomains.capacity() * sizeof(DomainHandle);
+        // Only directly owned materializations belong to this prepared
+        // window. Borrowed cache primitives keep their external accounting.
+        for (const auto& domain : filterDomains) {
+          if (domain.ownsStorage()) bytes += domain.get()->ramBytesUsed();
+        }
+        for (const auto* sources : {&mandatorySources, &optionalSources, &prohibitedSources}) {
+          bytes += sources->capacity() * sizeof(QueryPrep::PreparedSource);
+          for (const auto& source : *sources) if (source.prepared) bytes += source.prepared->retainedBytes();
+        }
+        return bytes;
+      }
 
       Query::ScorerSupplier* scorerSupplierImpl(
           MemPool& targetPool, IndexReader::Segment& segment,

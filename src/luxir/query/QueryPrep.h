@@ -1459,6 +1459,10 @@ inline DomainHandle materializeEffectiveFilter(
   return use->effectiveDomain((size_t) segment.ord, reader, domain);
 }
 
+DomainHandle materializeEffectiveFilter(
+    const PreparedSource& source, IndexReader& reader,
+    IndexReader::Segment& segment, DocSet* domain, FilterCache::Probe probe);
+
 inline DomainHandle materializeEffectiveFilter(
     Query::Weight& weight, FilterCache::Use* use, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {

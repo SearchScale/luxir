@@ -26,6 +26,8 @@ protected:
   std::string_view field;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableDenseFillForTests = false;
   static inline bool disableTruthfulCostForTests = false;
 

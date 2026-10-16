@@ -8,6 +8,7 @@
 #include <string>
 
 #include "luxir/search/RequestMemTracker.h"
+#include "luxir/search/DomainVariantPlan.h"
 
 using namespace luxir;
 
@@ -71,4 +72,24 @@ TEST(RequestMemTrackerTest, unlimitedTrackerStillRejectsCounterOverflow) {
   }
   EXPECT_EQ(MAX, tracker.bytes());
   tracker.release(MAX);
+}
+
+TEST(RequestMemTrackerTest, domainAccountingFollowsItsOwnerOnce) {
+  RequestMemTracker tracker(1024);
+  DomainHandle survivor;
+  {
+    DomainHandle docs(std::make_unique<ArrDocSet>(std::vector<int32_t>{1, 3, 5}));
+    EXPECT_TRUE(docs.ownsStorage());
+    auto charged = DomainVariantPlan::account(std::move(docs), tracker, "bucket input");
+    size_t bytes = tracker.bytes();
+    EXPECT_GT(bytes, 0u);
+    auto retained = std::move(charged).retainedWith(std::make_shared<int>(7));
+    survivor = DomainVariantPlan::account(std::move(retained), tracker, "retained bucket input");
+    EXPECT_TRUE(survivor.isCharged());
+    EXPECT_EQ(bytes, tracker.bytes());
+    EXPECT_EQ(3, survivor.get()->card());
+  }
+  EXPECT_GT(tracker.bytes(), 0u);
+  survivor = {};
+  EXPECT_EQ(0u, tracker.bytes());
 }

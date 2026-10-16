@@ -33,6 +33,8 @@ class NumericPredicateQuery final : public Query {
   std::span<const PointsReader::ValueRange> exactIntervals;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableShapesForTests = false;
 #ifndef NDEBUG
   // Observe actual verification, not column decoding or metadata navigation.

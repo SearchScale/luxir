@@ -1146,7 +1146,439 @@ TEST_F(CollapseTest, bucketAndGroupOpNamesAndScope) {
           + R"JSON(":"min(sort_i)"})JSON" + (parent.starts_with("\"collapse") ? "}}" : "}}}}"), "reserved");
     }
   }
-  reject(R"({"collection":"main","collapse":{"field":"key_s","ops":{"f":{"field_facet":{"field":"key_s","count_unit":"groups"}}}}})", "enclosing collapse");
-  reject(R"({"collection":"main","collapse":{"field":"key_s","ops":{"d":{"top_docs":{},"domain":{"query":"*:*"}}}}})", "domain is only supported");
+  reject(R"({"collection":"main","collapse":{"field":"key_s","ops":{"d":{"top_docs":{},
+    "domain":{"apply_parent_filters":true}}}}})", "requires domain.query");
   reject(R"JSON({"collection":"main","ops":{"f":{"field_facet":{"field":"key_s","count_distinct":{"field":"key_s","ops":{"m":"count()"}}}}}})JSON", "only field and missing");
+}
+
+TEST_F(CollapseTest, resetGroupDomainOracle) {
+  std::vector<Doc> docs;
+  for (int i = 0; i < 72; i++) {
+    auto doc = flatdoc("id", "r" + std::to_string(i), "stock_i", (int64_t)(i % 4), "available_i",
+                       (int64_t)(i % 3 != 0));
+    if (i % 7)
+      doc.emplace_back("key_s", "g" + std::to_string(i % 5));
+    if (i % 5)
+      doc.emplace_back("key_i", (int64_t)(i % 3));
+    if (i % 6)
+      doc.emplace_back("color_s", i % 2 ? "red" : "blue");
+    docs.push_back(std::move(doc));
+  }
+  size_t recomputations = 0;
+  SearchOverridesGuard strategy(collapseMemberStrategy, forcedFacetBucketBlockBuckets,
+                                structuralPrefixRecomputations);
+  structuralPrefixRecomputations = &recomputations;
+  forcedFacetBucketBlockBuckets = 2;
+  for (int segments : {1, 3}) {
+    std::string collection = "reset" + std::to_string(segments);
+    CollectionHelper helper(collection);
+    for (int s = 0; s < segments; s++)
+      ASSERT_TRUE(helper
+                      .indexAll(std::span<const Doc>(docs).subspan(s * docs.size() / segments,
+                                                                   docs.size() / segments),
+                                UpdateMessage::COMMIT)
+                      .success);
+    ASSERT_TRUE(helper.deleteByIds({"r3", "r39"}, UpdateMessage::COMMIT).success);
+    auto execute = [&](std::string tail, int parallel) {
+      auto req = localReq(helper.getSearchEngine());
+      auto json = R"({"collection":")" + collection + R"(","sort":"id asc","limit":-1,
+        "fields":["id","key_s","key_i","color_s","stock_i","available_i"],"document_format":"rows",
+        )" + tail +
+                  '}';
+      EXPECT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+      req->execute(parallel);
+      EXPECT_TRUE(req->ok()) << req->errorMsg() << json;
+      return req;
+    };
+    auto all = execute(R"("query":"*:*")", 1);
+    auto ranked = execute(R"("query":"color_s:red","filter":["available_i:1"])", 1);
+    struct Shape {
+      std::vector<std::string> fields;
+      std::string policy;
+      bool parentFilters;
+    };
+    std::vector<Shape> shapes;
+    for (auto fields : {std::vector<std::string>{"key_s"}, {"key_i"}, {"key_s", "key_i"}}) {
+      for (std::string policy : {"expand", "group", "drop"}) {
+        for (bool parentFilters : {false, true})
+          shapes.push_back({fields, policy, parentFilters});
+      }
+    }
+    for (const auto& [fields, policy, parentFilters] : shapes) {
+      std::vector<Key> keys;
+      std::map<Key, int64_t> counts;
+      for (auto* response : ranked->responses)
+        for (auto& doc : response->proto.ops.at("q")->docList()->docs) {
+          auto key = memberKey(doc, fields, policy);
+          if (policy == "drop" && std::ranges::any_of(key.parts, [](const Part &value) {
+                return std::holds_alternative<std::monostate>(value);
+              }))
+            continue;
+          if (counts[key]++ == 0)
+            keys.push_back(key);
+        }
+      auto domain = R"("domain":{"query":"*:*","filter":["stock_i:>0"],"apply_parent_filters":)" +
+                    std::string(parentFilters ? "true}" : "false}");
+      auto collapse = spec(fields, policy);
+      collapse.pop_back();
+      collapse += R"(,"get_number":true,"ops":{"members":{"top_docs":{"limit":-1,
+        "sort":"id asc","fields":["id"],"document_format":"rows"},)" +
+                  domain + R"(},"swatches":{"field_facet":{"field":"color_s","limit":-1,
+        "missing":true},)" +
+                  domain + "}}}";
+      struct Expected {
+        std::vector<std::string> ids;
+        std::map<std::string, int64_t> colors;
+        int64_t missing = 0;
+      };
+      std::map<Key, Expected> expectedGroups;
+      for (auto* response : all->responses) {
+        for (const auto& doc : response->proto.ops.at("q")->docList()->docs) {
+          if (doc.fields.at("stock_i")->asInt() == 0 ||
+              (parentFilters && doc.fields.at("available_i")->asInt() == 0))
+            continue;
+          auto& expected = expectedGroups[memberKey(doc, fields, policy)];
+          expected.ids.emplace_back(doc.fields.at("id")->asString());
+          if (auto* color = doc.fields.find("color_s")) {
+            expected.colors[std::string((*color)->asString())]++;
+          } else
+            expected.missing++;
+        }
+      }
+      for (auto [source, parallel] : {std::pair{CollapseMemberStrategy::KEYS, 1},
+                                      {CollapseMemberStrategy::KEYS, -1},
+                                      {CollapseMemberStrategy::DOMAIN, 1},
+                                      {CollapseMemberStrategy::DOMAIN, -1}}) {
+        collapseMemberStrategy = source;
+        auto actual = execute(R"("query":"color_s:red","filter":["available_i:1"],
+        "collapse":)" + collapse,
+                              parallel);
+        ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+        size_t row = 0;
+        for (auto* response : actual->responses) {
+          const auto& list = *response->proto.ops.at("q")->docList();
+          for (size_t i = 0; i < list.groups->keys.size(); i++, row++) {
+            ASSERT_LT(row, keys.size());
+            const auto& expected = expectedGroups[keys[row]];
+            const auto& members = *groupOp(*list.groups, "members", i).docList();
+            std::vector<std::string> ids;
+            for (auto& doc : members.docs)
+              ids.emplace_back(doc.fields.at("id")->asString());
+            EXPECT_EQ(expected.ids, ids) << collapse;
+            EXPECT_EQ(counts.at(keys[row]), list.groups->counts[i]);
+            const auto& facet = *groupOp(*list.groups, "swatches", i).facetResult();
+            std::map<std::string, int64_t> actualColors;
+            auto labels = std::get<api::ColStr>(facet.bucket_ids->kind).v;
+            for (size_t j = 0; j < labels.size(); j++) {
+              actualColors[std::string(labels[j])] = facet.counts[j];
+            }
+            EXPECT_EQ(expected.colors, actualColors);
+            EXPECT_EQ(expected.missing, facet.missing.value_or(-1));
+          }
+        }
+        EXPECT_EQ(keys.size(), row);
+      }
+    }
+  }
+  EXPECT_EQ(0u, recomputations);
+}
+
+TEST_F(CollapseTest, resetKeepsEveryEnclosingBucketIdentity) {
+  CollectionHelper helper;
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = segment * 24; i < (segment + 1) * 24; i++) docs.push_back(flatdoc(
+        "id", "n" + std::to_string(i), "zone_s", "z" + std::to_string(i % 3),
+        "number_i", (int64_t)(i % 5), "key_i", (int64_t)(i % 4), "stock_i", (int64_t)(i % 4),
+        "color_s", i % 7 == 0 ? "red" : "blue"));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds({"n4", "n35"}, UpdateMessage::COMMIT).success);
+  auto execute = [&](std::string body, int parallel, bool prepared) {
+    auto req = localReq(helper.getSearchEngine());
+    EXPECT_TRUE(api::read_json(req->rawRequest(), body, req->mr)) << body;
+    req->testForcePrepare = prepared;
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  auto all = execute(R"({"collection":"main","query":"*:*","limit":-1,"sort":"id asc",
+        "document_format":"rows",
+        "fields":["id","zone_s","number_i","key_i","stock_i"]})", 1, false);
+  std::string request = R"({"collection":"main","query":"color_s:red","limit":0,
+        "ops":{"zones":{
+        "field_facet":{"field":"zone_s","limit":-1,"ops":{
+    "stock":{"query_facet":{"buckets":{"positive":"stock_i:>0"},"ops":{
+      "ranges":{"range_facet":{"field":"number_i","start":0,"end":6,
+        "gap":2,"ops":{
+        "keys":{"field_facet":{"field":"key_i","limit":-1,"ops":{
+          "rows":{"top_docs":{"sort":"id asc","limit":-1,"document_format":"rows",
+        "fields":["id"]},"domain":{"query":"*:*","filter":["stock_i:>=2"]}
+        }
+        }}}
+      }}}
+    }}}
+  }}}}})";
+  auto child = [](const api::FacetResult& facet, std::string_view name, size_t row) -> const api::Val& {
+    return std::get<api::ArrVal>(facet.ops.at(name)->kind).v[row];
+  };
+  for (int parallel : {1, -1}) for (bool prepared : {false, true}) {
+    auto actual = execute(request, parallel, prepared);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    auto& zones = *actual->docList()->ops.at("zones")->facetResult();
+    auto labels = std::get<api::ColStr>(zones.bucket_ids->kind).v;
+    for (size_t z = 0; z < labels.size(); z++) {
+      auto& stock = *child(zones, "stock", z).facetResult();
+      auto& ranges = *child(stock, "ranges", 0).facetResult();
+      auto bounds = std::get<api::ArrArrInt>(ranges.bucket_ids->kind).v;
+      for (size_t r = 0; r < ranges.counts.size(); r++) {
+        auto& keys = *child(ranges, "keys", r).facetResult();
+        auto values = std::get<api::ColInt>(keys.bucket_ids->kind).v;
+        for (size_t k = 0; k < values.size(); k++) {
+          std::vector<std::string> expected, found;
+          for (auto* response : all->responses)
+              for (auto& doc : response->proto.ops.at("q")->docList()->docs) {
+            int64_t number = doc.fields.at("number_i")->asInt();
+            if (doc.fields.at("zone_s")->asString() == labels[z] && number >= bounds[r].v[0]
+                && number < bounds[r].v[1] && doc.fields.at("key_i")->asInt() == values[k]
+                && doc.fields.at("stock_i")->asInt() >= 2) {
+              expected.emplace_back(doc.fields.at("id")->asString());
+            }
+          }
+          for (auto& doc : child(keys, "rows", k).docList()->docs) {
+            found.emplace_back(doc.fields.at("id")->asString());
+          }
+          EXPECT_EQ(expected, found);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(CollapseTest, topDocsResetInsideBucketRetainsStructuralScope) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "zone_s", "x", "color_s", "red"),
+      flatdoc("id", "b", "zone_s", "x", "color_s", "blue"),
+      flatdoc("id", "c", "zone_s", "y", "color_s", "blue")}, UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"color_s:red",
+        "limit":0,"ops":{
+      "zones":{"field_facet":{"field":"zone_s","ops":{"browse":{"top_docs":{
+        "query":"color_s:red","limit":0,"ops":{
+        "colors":{"field_facet":{"field":"color_s","limit":-1},"domain":{
+        "query":"*:*"}}
+      }}}}},"domain":{"query":"color_s:red"}}}})", req->mr));
+    req->execute(parallel);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    auto& zones = *req->docList()->ops.at("zones")->facetResult();
+    auto& list = *std::get<api::ArrVal>(zones.ops.at("browse")->kind).v[0].docList();
+    auto& colors = *list.ops.at("colors")->facetResult();
+    EXPECT_EQ((std::vector<int64_t>{1, 1}), std::vector(colors.counts.begin(), colors.counts.end()));
+  }
+}
+
+TEST_F(CollapseTest, bucketResetKeepsRoutedOwningFilters) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "brand_s", "x", "color_s", "red", "stock_i", (int64_t)1),
+      flatdoc("id", "b", "brand_s", "x", "color_s", "blue", "stock_i", (int64_t)0),
+      flatdoc("id", "c", "brand_s", "y", "color_s", "blue", "stock_i", (int64_t)1)},
+      UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"JSON({"collection":"main",
+        "query":"color_s:red","limit":0,
+      "filter":[{"query":"stock_i:1","except_ops":["brands"]}],
+      "ops":{"brands":{"field_facet":{"field":"brand_s","ops":{
+        "colors":{"field_facet":{"field":"color_s","limit":-1},"domain":{
+        "query":"*:*","apply_parent_filters":true}},
+        "red_only":{"expr_op":"sum(stock_i)","domain":{"filter":["color_s:red"]}
+        }
+      }}}}})JSON", req->mr));
+    req->execute(parallel);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    auto& brands = *req->docList()->ops.at("brands")->facetResult();
+    auto& colors = *std::get<api::ArrVal>(brands.ops.at("colors")->kind).v[0].facetResult();
+    EXPECT_EQ((std::vector<int64_t>{1, 1}), std::vector(colors.counts.begin(), colors.counts.end()));
+    EXPECT_EQ(1, std::get<api::ArrVal>(brands.ops.at("red_only")->kind).v[0].asInt());
+
+    auto inner = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(inner->rawRequest(), R"JSON({"collection":"main",
+      "query":"color_s:red","filter":["stock_i:1"],"limit":0,"ops":{
+      "brands":{"field_facet":{"field":"brand_s","ops":{
+        "list":{"top_docs":{"limit":0,"ops":{
+          "colors":{"field_facet":{"field":"color_s","limit":-1},
+            "domain":{"query":"*:*","apply_parent_filters":true}}
+        }}}
+      }}}}})JSON", inner->mr));
+    inner->execute(parallel);
+    ASSERT_TRUE(inner->ok()) << inner->errorMsg();
+    const auto& outer = *inner->docList()->ops.at("brands")->facetResult();
+    const auto& list = *std::get<api::ArrVal>(outer.ops.at("list")->kind).v[0].docList();
+    EXPECT_EQ(2u, list.ops.at("colors")->facetResult()->counts.size());
+  }
+}
+
+TEST_F(CollapseTest, smallBucketDomainsUseActualMemoryBudget) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 20'000; i++) docs.push_back(flatdoc("id", "d" + std::to_string(i),
+      "key_s", "p" + std::to_string(i / 2), "color_s", i % 2 ? "red" : "blue", "stock_i", (int64_t)1));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  forcedRequestMemoryMaxBytes = 8192;
+  for (bool reset : {false, true}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto json = std::string(R"({"collection":"main","query":"id:d0","limit":1,
+        "collapse":{"field":"key_s","ops":{
+      "colors":{"field_facet":{"field":"color_s","limit":-1},"domain":{)")
+        + (reset ? R"("query":"*:*",)" : "") + R"("filter":["stock_i:>0"]}}}}
+        })";
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->execute(1);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& colors = *groupOp(*req->docList()->groups, "colors", 0).facetResult();
+    EXPECT_EQ(reset ? 2u : 1u, colors.counts.size());
+    for (auto count : colors.counts) EXPECT_EQ(1, count);
+    EXPECT_LT(req->memoryTracker.peak(), 8192u);
+  }
+}
+
+TEST_F(CollapseTest, nestedTopDocsResetUsesPageMemoryBudget) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 20'000; i++) docs.push_back(flatdoc(
+      "id", "d" + std::to_string(i), "key_s", "p" + std::to_string(i / 2),
+      "stock_i", (int64_t)(i % 2 == 0)));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  forcedRequestMemoryMaxBytes = 8192;
+  for (int parallel : {1, -1}) for (bool prepared : {false, true})
+      for (bool parentFilters : {false, true}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto json = std::string(R"({"collection":"main","query":"id:d0","limit":1,
+      "collapse":{"field":"key_s","ops":{"browse":{"top_docs":{"query":"id:d0",
+        "filter":["stock_i:>0"],"limit":0,"ops":{
+        "variants":{"top_docs":{"sort":"id asc","limit":3,"fields":["id"],
+        "document_format":"rows"},
+          "domain":{"query":"*:*","filter":["stock_i:>=0"],"apply_parent_filters":)")
+        + (parentFilters ? "true" : "false") + "}}}}}}}}";
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->testForcePrepare = prepared;
+    req->execute(parallel);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& browse = *groupOp(*req->docList()->groups, "browse", 0).docList();
+    const auto& variants = *browse.ops.at("variants")->docList();
+    ASSERT_EQ(parentFilters ? 1 : 2, variants.row_count);
+    EXPECT_EQ("d0", variants.docs[0].fields.at("id")->asString());
+    if (!parentFilters) {
+      EXPECT_EQ("d1", variants.docs[1].fields.at("id")->asString());
+    }
+    EXPECT_LT(req->memoryTracker.peak(), 8192u);
+  }
+}
+
+TEST_F(CollapseTest, bucketFilterAdmissionProbesOncePerSegment) {
+  CollectionHelper helper;
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 24; i++) docs.push_back(flatdoc("id", std::to_string(segment * 24 + i),
+        "key_s", "p" + std::to_string(i), "color_s", "red", "stock_i", (int64_t)1));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto* cache = reader->filterCache();
+  ASSERT_NE(nullptr, cache);
+  for (int iteration = 0; iteration < 3; iteration++) {
+    auto before = cache->counters();
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"*:*",
+        "limit":24,
+      "collapse":{"field":"key_s","ops":{
+        "colors":{"field_facet":{"field":"color_s"},"domain":{"query":"*:*","filter":["stock_i:>0"]}
+        }
+      }}})", req->mr));
+    req->execute(1);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_LE(cache->counters().misses - before.misses, 3u);
+    EXPECT_EQ(24u, req->docList()->groups->keys.size());
+  }
+}
+
+TEST_F(CollapseTest, matchAllBucketResetWithoutDeletes) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "color_s", "red"),
+      flatdoc("id", "b", "color_s", "blue")}, UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main",
+      "query":"color_s:red","limit":0,"ops":{"offers":{"query_facet":{
+        "buckets":{"all":"*:*"},"ops":{"colors":{
+          "field_facet":{"field":"color_s","limit":-1},"domain":{"query":"*:*"}
+        }
+        }}}}})", req->mr));
+    req->execute(parallel);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& offers = *req->docList()->ops.at("offers")->facetResult();
+    ASSERT_EQ(1u, offers.counts.size());
+    EXPECT_EQ(1, offers.counts[0]);
+    const auto& colors = *std::get<api::ArrVal>(offers.ops.at("colors")->kind).v[0].facetResult();
+    EXPECT_EQ((std::vector<int64_t>{1, 1}), std::vector(colors.counts.begin(), colors.counts.end()));
+  }
+}
+
+TEST_F(CollapseTest, rootResetAndInheritReuseTheirSharedPrimitive) {
+  CollectionHelper helper("root_reuse");
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "stock_i", (int64_t)1),
+      flatdoc("id", "b", "stock_i", (int64_t)1),
+      flatdoc("id", "c", "stock_i", (int64_t)0)}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  SkipStatsScope skip;
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"root_reuse",
+        "ops":{
+    "reset":{"top_docs":{"limit":0,"get_number":true},
+      "domain":{"query":"*:*","filter":["stock_i:>0"]}},
+    "inherit":{"top_docs":{"limit":0,"get_number":true},
+      "domain":{"filter":["stock_i:>0"]}}
+  }})", req->mr));
+  req->execute(1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  for (std::string_view name : {"reset", "inherit"}) {
+    EXPECT_EQ(1, req->responses[0]->proto.ops.at(name)->docList()->found);
+  }
+  // Adoption serves once; an unnecessary second materialization would serve
+  // that owned raw set again. Cached admission produces neither counter.
+  EXPECT_EQ(SkipStats::ownedFilterMaterializations, SkipStats::ownedFilterServes);
+}
+
+TEST_F(CollapseTest, fusionChildrenRetainStructuralPrefixes) {
+  CollectionHelper helper;
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int group = 0; group < 2; group++) {
+      docs.push_back(flatdoc("id", std::format("{}-{}", segment, group),
+          "key_s", std::to_string(group), "color_s", segment == 0 ? "red" : "blue"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"color_s:red",
+      "sort":"id asc","limit":2,"collapse":{"field":"key_s","ops":{
+        "f":{"fusion":{"sources":{"s":{"sort":"id asc","limit":3}},"rrf":{},"limit":1,
+          "ops":{"q":{"top_docs":{"limit":0,"ops":{
+            "colors":{"field_facet":{"field":"color_s","limit":-1},
+              "domain":{"query":"*:*"}}}}}}}}}}})", req->mr));
+    req->execute(parallel);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& groups = *req->docList()->groups;
+    for (size_t i = 0; i < groups.keys.size(); i++) {
+      const auto& fused = *groupOp(groups, "f", i).docList();
+      const auto& child = *fused.ops.at("q")->docList();
+      const auto& colors = *child.ops.at("colors")->facetResult();
+      EXPECT_EQ((std::vector<int64_t>{2, 1}),
+          std::vector<int64_t>(colors.counts.begin(), colors.counts.end()));
+    }
+  }
 }

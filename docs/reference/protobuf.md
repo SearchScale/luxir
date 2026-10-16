@@ -513,7 +513,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.missing"></a>[`missing`](#field-luxir.collapse.missing) | 2 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
 | <a id="field-luxir.collapse.head_sort"></a>[`head_sort`](#field-luxir.collapse.head_sort) | 3 | [`SortSpec`](#message-luxir.sortspec) | repeated | Display member order; defaults to the list sort. |
 | <a id="field-luxir.collapse.get_number"></a>[`get_number`](#field-luxir.collapse.get_number) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
-| <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. |
+| <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. Explicit group units still resolve to this nearest enclosing collapse. |
 
 <a id="message-luxir.collectioncachecontrol"></a>
 
@@ -680,14 +680,14 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 
 ### luxir.Domain
 
-Overrides the incoming document set for an operation directly in SearchRequest.ops or TopDocs.ops. Not supported directly in Fusion.ops or beneath facet buckets.
+Overrides an operation's incoming document set, including beneath facet and group buckets. A reset retains the enclosing structural identities, and re-evaluates selection-query identities outer to inner in the new scope; child membership can differ from the parent's counted window. Not supported directly in Fusion.ops.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.domain.query"></a>[`query`](#field-luxir.domain.query) | 2 | [`Query`](#message-luxir.query) | singular | If present, replaces the incoming domain with this query's matches across the collection. If absent, inherits the incoming domain. |
-| <a id="field-luxir.domain.apply_parent_filters"></a>[`apply_parent_filters`](#field-luxir.domain.apply_parent_filters) | 3 | `bool` | optional | With query set, reapply the immediate parent's filters, including facet selections, while respecting except\_ops. Default false discards them. Requires query; does not restore the parent's query or ancestor domain. |
+| <a id="field-luxir.domain.query"></a>[`query`](#field-luxir.domain.query) | 2 | [`Query`](#message-luxir.query) | singular | If present, replaces the incoming domain with this query's matches within live documents and the enclosing structural bucket identities. If absent, inherits the incoming domain. |
+| <a id="field-luxir.domain.apply_parent_filters"></a>[`apply_parent_filters`](#field-luxir.domain.apply_parent_filters) | 3 | `bool` | optional | With query set, reapply the owning list's filters, including facet selections, while respecting except\_ops. Default false discards them. Requires query; does not restore matching queries above this operation. |
 | <a id="field-luxir.domain.filter"></a>[`filter`](#field-luxir.domain.filter) | 5 | [`Query`](#message-luxir.query) | repeated | Additional non-scoring constraints, ANDed with the inherited or reset domain. Entries and query must each specify a query kind. |
 
 <a id="message-luxir.error"></a>
@@ -855,7 +855,7 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.ops"></a>[`ops`](#field-luxir.fieldfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.fieldfacet.selected"></a>[`selected`](#field-luxir.fieldfacet.selected) | 7 | [`Val`](#message-luxir.val) | singular | Scalar or array of selected values, coerced as AnyOfQuery values. Selected buckets missing from the ordinary page append in input order with exact counts, even below mincount or absent from the index. Null is an error. |
 | <a id="field-luxir.fieldfacet.selection_mode"></a>[`selection_mode`](#field-luxir.fieldfacet.selection_mode) | 8 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | ALL requires a nonempty selection |
-| <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list. GROUPS requires an enclosing collapse. Controls count, count order, mincount, and missing; metrics still fold documents. |
+| <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list; entering group ops defaults to docs. Explicit GROUPS uses the nearest enclosing collapse, including inside a group. Controls count, count order, mincount, and missing; metrics still fold documents. |
 | <a id="field-luxir.fieldfacet.count_distinct"></a>[`count_distinct`](#field-luxir.fieldfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys per bucket, also usable without collapse. Same key types and missing policies as Collapse. Conflicting measures are errors. |
 
 <a id="message-luxir.fieldvariants"></a>

@@ -22,6 +22,10 @@ public:
   explicit ForcePrepareQuery(Query* child)
     : Query(QueryKind::FORCE_PREPARE), child(child) {}
 
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const ForcePrepareQuery&>(other);
     return sameScoringClause(child, rhs.child);
@@ -78,6 +82,10 @@ public:
 
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
         child.releaseSegmentState(segment);
+      }
+
+      size_t retainedBytes() const noexcept override {
+        return sizeof(*this) + (child.prepared ? child.prepared->retainedBytes() : 0);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {

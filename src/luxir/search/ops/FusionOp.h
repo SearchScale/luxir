@@ -138,6 +138,11 @@ public:
     SearchOp::releaseSegmentState(segment);
   }
 
+  bool needsCompleteBucketInput() const override {
+    // Fusion gathers all segment inputs before executing its result children.
+    return true;
+  }
+
   bool facetBucketSharesSegmentState() const override {
     return std::ranges::any_of(filterWeights, [](const auto* weight) {
              return weight->hasReleasableSegmentState();
@@ -189,8 +194,9 @@ public:
     // op.sources.size(), the last delivery launches doFusion.
     std::atomic<int32_t> sourcesDelivered{0};
 
-    Calc(FusionOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : SearchOp::Calculator(op, parent, slot, numSlots) {
+    Calc(FusionOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : SearchOp::Calculator(op, parent, slot, numSlots, structural) {
       auto numSources = op.sources.size();
       auto numSegs = op.req.reader->segments().size();
       sourceCalcs.reserve(numSources);
@@ -478,8 +484,10 @@ public:
   };
 
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
 
   bool canEmitAsBucketChild() const override { return true; }

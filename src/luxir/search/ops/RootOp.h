@@ -31,7 +31,9 @@ public:
     std::vector<DomainHandle> domains;
 
   public:
-    Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots) : SearchOp::Calculator(op, parent, slot, numSlots) {}
+    Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : SearchOp::Calculator(op, parent, slot, numSlots, structural) {}
 
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       // Top-level ops map: slot array sized to the root op's subOps; one Val per sub.
@@ -257,10 +259,10 @@ public:
   };
 
   Calc* createCalculator(
-      Calculator* parent, int64_t slot = -1,
-      int64_t numSlots = -1) override {
+      Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
     assert(parent == nullptr);
-    return new Calc(*this, nullptr, slot, numSlots);
+    return new Calc(*this, nullptr, slot, numSlots, structural);
   }
 
 };

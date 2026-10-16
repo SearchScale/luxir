@@ -447,9 +447,12 @@ TEST_F(GroupKnnTest, enrichmentReplaysOnlyAdmittedMembers) {
   CollectionHelper helper;
   schema(helper);
   ASSERT_TRUE(helper.indexAll({
-      flatdoc("id", "a", "key_s", "x", "price_i", (int64_t)4, "vec_vs", std::vector<std::vector<float>>{{0.0f, 0, 0, 0}}),
-      flatdoc("id", "b", "key_s", "x", "price_i", (int64_t)2, "vec_vs", std::vector<std::vector<float>>{{1.0f, 0, 0, 0}}),
-      flatdoc("id", "c", "key_s", "x", "price_i", (int64_t)0, "vec_vs", std::vector<std::vector<float>>{{50.0f, 0, 0, 0}}),
+      flatdoc("id", "a", "key_s", "x", "price_i", (int64_t)4,
+          "vec_vs", std::vector<std::vector<float>>{{0.0f, 0, 0, 0}}),
+      flatdoc("id", "b", "key_s", "x", "price_i", (int64_t)2,
+          "vec_vs", std::vector<std::vector<float>>{{1.0f, 0, 0, 0}}),
+      flatdoc("id", "c", "key_s", "x", "price_i", (int64_t)0,
+          "vec_vs", std::vector<std::vector<float>>{{50.0f, 0, 0, 0}}),
       flatdoc("id", "d", "key_s", "y", "price_i", (int64_t)1, "vec_vs", std::vector<std::vector<float>>{{2.0f, 0, 0, 0}})},
       UpdateMessage::COMMIT).success);
   for (bool groups : {false, true}) for (int parallel : {1, -1}) {
@@ -472,17 +475,229 @@ TEST_F(GroupKnnTest, enrichmentReplaysOnlyAdmittedMembers) {
   }
 }
 
-TEST_F(GroupKnnTest, groupChildNeedsItsOwnCollapse) {
+TEST_F(GroupKnnTest, groupChildUsesNearestCollapseAndFacetsDefaultToDocs) {
   CollectionHelper helper;
   schema(helper);
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_s", "x", "vec_vs",
-      std::vector<std::vector<float>>{{0.0f, 0, 0, 0}})}, UpdateMessage::COMMIT).success);
-  auto bad = run("main", R"("collapse":{"field":"key_s","ops":{"child":{"top_docs":{"query":)"
-      + knn(1, true) + "}}}}", 1, false);
-  EXPECT_NE(std::string::npos, bad->errorMsg().find("enclosing collapse"));
-  auto good = run("main", R"("collapse":{"field":"key_s","ops":{"child":{"top_docs":{"collapse":"key_s","query":)"
-      + knn(1, true) + "}}}}", -1);
-  ASSERT_TRUE(good->ok()) << good->errorMsg();
-  const auto& table = *good->docList()->groups;
-  EXPECT_EQ(1, std::get<api::ArrVal>(table.ops.at("child")->kind).v[0].docList()->row_count);
+      std::vector<std::vector<float>>{{0, 0, 0, 0}}),
+      flatdoc("id", "b", "key_s", "x", "vec_vs", std::vector<std::vector<float>>{{1, 0, 0, 0}})},
+      UpdateMessage::COMMIT).success);
+  for (bool own : {false, true}) for (int parallel : {1, -1}) {
+    auto actual = run("main", R"("collapse":{"field":"key_s","ops":{
+      "docs":{"field_facet":{"field":"key_s"}},
+      "groups":{"field_facet":{"field":"key_s","count_unit":"groups"}},
+      "child":{"top_docs":{)" + std::string(own ? R"("collapse":"key_s",)" : "")
+        + R"("query":)" + knn(1, true) + "}}}}", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    const auto& table = *actual->docList()->groups;
+    EXPECT_EQ(1, std::get<api::ArrVal>(table.ops.at("child")->kind).v[0].docList()->row_count);
+    EXPECT_EQ(2, std::get<api::ArrVal>(table.ops.at("docs")->kind).v[0].facetResult()->counts[0]);
+    EXPECT_EQ(1, std::get<api::ArrVal>(table.ops.at("groups")->kind).v[0].facetResult()->counts[0]);
+  }
+}
+
+TEST_F(GroupKnnTest, selectionBucketsReevaluateAndResetQueriesUseTheirScope) {
+  CollectionHelper helper;
+  schema(helper);
+  std::vector<Doc> documents{
+      flatdoc("id", "a", "key_s", "x", "price_i", (int64_t)4,
+          "vec_vs", std::vector<std::vector<float>>{{0, 0, 0, 0}}),
+      flatdoc("id", "b", "key_s", "x", "price_i", (int64_t)2,
+          "vec_vs", std::vector<std::vector<float>>{{1, 0, 0, 0}}),
+      flatdoc("id", "c", "key_s", "x", "price_i", (int64_t)0,
+          "vec_vs", std::vector<std::vector<float>>{{50, 0, 0, 0}})};
+  for (const auto& doc : documents) {
+    ASSERT_TRUE(helper.indexAll(std::span(&doc, 1), UpdateMessage::COMMIT).success);
+  }
+  auto selection = knn(1, false);
+  for (auto query : {selection, R"({"rescore":{"query":)" + selection + R"(,"expr":"score"}})",
+      R"({"boolean":{"required":[)" + selection + R"(,"*:*" ]}})"}) {
+    for (bool throughList : {false, true}) for (bool filtered : {false, true}) for (int parallel : {1, -1}) {
+      auto reset = R"("members":{"top_docs":{"limit":-1,"fields":["id"],"document_format":"rows"}
+        ,"domain":{"query":"*:*")"
+          + std::string(filtered ? R"(,"filter":["price_i:<3"]}})" : "}}");
+      auto children = throughList ? R"("through":{"top_docs":{"query":"id:b",
+        "limit":0,"ops":{)" + reset + "}}}" : reset;
+      auto actual = run("main", R"("query":"id:b","limit":0,"ops":{"qf":{"query_facet":{
+        "buckets":{"near":)"
+          + query + R"(},"ops":{)" + children + "}}}}", parallel);
+      ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+      const auto& facet = *actual->docList()->ops.at("qf")->facetResult();
+      EXPECT_EQ(1, facet.counts[0]); // The original window contains b.
+      const api::Val* members;
+      if (throughList) {
+        auto& list = *std::get<api::ArrVal>(facet.ops.at("through")->kind).v[0].docList();
+        members = &*list.ops.at("members");
+      } else members = &std::get<api::ArrVal>(facet.ops.at("members")->kind).v[0];
+      ASSERT_EQ(1, members->docList()->row_count);
+      EXPECT_EQ(filtered ? "b" : "a", members->docList()->docs[0].fields.at("id")->asString());
+    }
+  }
+  for (int outer : {1, 2}) for (int parallel : {1, -1}) {
+    auto actual = run("main", R"("query":"id:c","limit":0,"ops":{"outer":{"query_facet":{
+        "buckets":{"near":)"
+        + knn(outer, false) + R"(},"ops":{"eligible":{"query_facet":{"buckets":{
+        "cheap":"price_i:<=2"},"ops":{
+          "inner":{"query_facet":{"buckets":{"near":)" + knn(1, false, true, {}, "[50,0,0,0]")
+        + R"(},"ops":{"members":{"top_docs":{"limit":-1,"fields":["id"],"document_format":"rows"}
+        ,"domain":{"query":"*:*"}}}}}
+        }}}}}}})", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    auto child = [](const api::FacetResult& parent, std::string_view name) -> const api::Val& {
+      return std::get<api::ArrVal>(parent.ops.at(name)->kind).v[0];
+    };
+    auto& first = *actual->docList()->ops.at("outer")->facetResult();
+    EXPECT_EQ(1, first.counts[0]);
+    auto& eligible = *child(first, "eligible").facetResult();
+    auto& inner = *child(eligible, "inner").facetResult();
+    EXPECT_EQ(1, inner.counts[0]);
+    auto& members = *child(inner, "members").docList();
+    EXPECT_EQ(outer == 1 ? 0 : 1, members.row_count);
+    if (members.row_count) { EXPECT_EQ("b", members.docs[0].fields.at("id")->asString()); }
+  }
+  for (bool groups : {false, true}) for (bool filter : {false, true}) for (int parallel : {1, -1}) {
+    std::string domain = filter ? R"("query":"*:*","filter":[)" + knn(2, false) + ']'
+        : R"("query":)" + knn(2, false);
+    auto actual = run("main", R"("fields":["id"],"query":)" + knn(1, groups)
+        + R"(,"collapse":{"field":"key_s","get_number":true,"ops":{"members":{
+        "top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}
+        ,"domain":{)"
+        + domain + R"(}},"inherited":{"top_docs":{"limit":-1,"fields":["id"]}
+        ,"domain":{"filter":[)"
+        + knn(2, false) + "]}}}}", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    auto& table = *actual->docList()->groups;
+    ASSERT_EQ(1u, table.counts.size());
+    EXPECT_EQ(1, table.counts[0]);
+    EXPECT_EQ(1, std::get<api::ArrVal>(table.ops.at("inherited")->kind).v[0].docList()->row_count);
+    const auto& members = *std::get<api::ArrVal>(table.ops.at("members")->kind).v[0].docList();
+    ASSERT_EQ(2, members.row_count);
+    EXPECT_EQ("b", members.docs[0].fields.at("id")->asString());
+    EXPECT_EQ("a", members.docs[1].fields.at("id")->asString());
+  }
+}
+
+TEST_F(GroupKnnTest, resetSelectionPreparesInsideEachBucketWithCacheEnabled) {
+  CollectionHelper helper;
+  schema(helper);
+  FilterCacheConfig config;
+  config.maxBytes = 4 * 1024 * 1024;
+  config.minSegmentDocs = 0;
+  config.admissionThreshold = 1;
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(config);
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int i = segment * 2; i < segment * 2 + 2; i++) docs.push_back(flatdoc(
+        "id", std::to_string(i), "key_s", i % 2 ? "y" : "x",
+        "vec_vs", std::vector<std::vector<float>>{{(float)i, 0, 0, 0}}));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  for (int parallel : {1, -1, 1}) {
+    auto actual = run("main", R"("query":"*:*","sort":"key_s asc","collapse":{
+        "field":"key_s","ops":{
+      "nearest":{"top_docs":{"fields":["id"],"document_format":"rows","limit":-1}
+        ,"domain":{"query":)"
+        + knn(1, false) + "}}}}", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    const auto& table = *actual->docList()->groups;
+    ASSERT_EQ(2u, table.keys.size());
+    for (size_t group = 0; group < table.keys.size(); group++) {
+      auto& nearest = *std::get<api::ArrVal>(table.ops.at("nearest")->kind).v[group].docList();
+      ASSERT_EQ(1, nearest.row_count);
+      EXPECT_EQ(std::to_string(group), nearest.docs[0].fields.at("id")->asString());
+    }
+  }
+}
+
+TEST_F(GroupKnnTest, selectionResetKeepsSharedPrefixStateAcrossBucketBlocks) {
+  CollectionHelper helper;
+  schema(helper);
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = segment * 8; i < (segment + 1) * 8; i++) docs.push_back(flatdoc(
+        "id", std::to_string(i), "title_t", "prefix" + std::to_string(i % 5),
+        "vec_vs", std::vector<std::vector<float>>{{(float)i, 0, 0, 0}}));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds({"2", "11"}, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFacetBucketBlockBuckets);
+  forcedFacetBucketBlockBuckets = 1;
+  std::string buckets;
+  for (int bucket = 0; bucket < 5; bucket++) {
+    if (bucket) buckets += ',';
+    buckets += '"' + std::to_string(bucket) + R"(":{"boolean":{"required":[)"
+        + knn(4, false) + R"(,"title_t:prefix*"]}})";
+  }
+  for (int parallel : {1, -1}) {
+    auto actual = run("main", R"("query":"id:7","limit":0,"ops":{"near":{"query_facet":{
+        "buckets":{)"
+        + buckets + R"(},"ops":{"ordinary":{"top_docs":{"limit":-1,"fields":["id"],
+        "document_format":"rows"}},
+          "reset":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"],"document_format":"rows"}
+        ,"domain":{"query":"*:*"}}}}}})", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    const auto& facet = *actual->docList()->ops.at("near")->facetResult();
+    ASSERT_EQ(5u, facet.counts.size());
+    for (size_t bucket = 0; bucket < facet.counts.size(); bucket++) {
+      EXPECT_EQ(1, facet.counts[bucket]);
+      const auto& ordinary = *std::get<api::ArrVal>(facet.ops.at("ordinary")->kind).v[bucket].docList();
+      ASSERT_EQ(1, ordinary.row_count);
+      EXPECT_EQ("7", ordinary.docs[0].fields.at("id")->asString());
+      const auto& reset = *std::get<api::ArrVal>(facet.ops.at("reset")->kind).v[bucket].docList();
+      ASSERT_EQ(4, reset.row_count);
+      std::set<std::string> ids;
+      for (const auto& doc : reset.docs) ids.emplace(doc.fields.at("id")->asString());
+      EXPECT_EQ((std::set<std::string>{"0", "1", "3", "4"}), ids);
+    }
+  }
+}
+
+TEST_F(GroupKnnTest, selectionAndPredicateBucketsShareResetBlock) {
+  CollectionHelper helper;
+  schema(helper);
+  for (int i = 0; i < 2; i++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", i ? "b" : "a", "vec_vs",
+        std::vector<std::vector<float>>{{(float)i, 0, 0, 0}}), UpdateMessage::COMMIT).success);
+  }
+  SearchOverridesGuard guard(forcedFacetBucketBlockBuckets);
+  forcedFacetBucketBlockBuckets = 2;
+  for (int parallel : {1, -1}) {
+    auto actual = run("main", R"("query":"id:b","limit":0,"ops":{"qf":{"query_facet":{
+      "buckets":{"both":"id:a OR id:b","near":)" + knn(1, false) + R"(},"ops":{
+        "members":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"],
+          "document_format":"rows"},"domain":{"query":"*:*"}}
+      }}}})", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    const auto& facet = *actual->docList()->ops.at("qf")->facetResult();
+    auto labels = std::get<api::ColStr>(facet.bucket_ids->kind).v;
+    ASSERT_EQ(2u, labels.size());
+    for (size_t bucket = 0; bucket < labels.size(); bucket++) {
+      EXPECT_EQ(1, facet.counts[bucket]);
+      const auto& members = *std::get<api::ArrVal>(facet.ops.at("members")->kind).v[bucket].docList();
+      ASSERT_EQ(labels[bucket] == "both" ? 2 : 1, members.row_count);
+      EXPECT_EQ("a", members.docs[0].fields.at("id")->asString());
+    }
+  }
+}
+
+TEST_F(GroupKnnTest, resetAllExtraKeepsItsScopedOwner) {
+  CollectionHelper helper;
+  schema(helper);
+  for (int i = 0; i < 2; i++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i), "vec_vs",
+        std::vector<std::vector<float>>{{(float)i, 0, 0, 0}}), UpdateMessage::COMMIT).success);
+  }
+  for (int parallel : {1, -1}) {
+    auto actual = run("main", R"("limit":0,"ops":{"f":{"query_facet":{"buckets":{"all":"*:*"},
+      "ops":{"t":{"top_docs":{"query":)" + knn(2, false) + R"(,"filter":["id:*"],"limit":0,
+        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},
+          "domain":{"query":"*:*","filter":["*:*"],"apply_parent_filters":true}},
+          "near":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":)"
+        + knn(1, false) + R"(}}}}}}}}})", parallel);
+    ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+    const auto& facet = *actual->docList()->ops.at("f")->facetResult();
+    const auto& top = *std::get<api::ArrVal>(facet.ops.at("t")->kind).v[0].docList();
+    EXPECT_EQ(2, top.ops.at("n")->docList()->found.value_or(-1));
+    EXPECT_EQ(1, top.ops.at("near")->docList()->found.value_or(-1));
+  }
 }

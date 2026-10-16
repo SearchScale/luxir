@@ -239,14 +239,42 @@ count documents by default, including nested facets; `count_distinct` can
 request another measure explicitly. An omitted child `top_docs.query` selects
 all members without relevance scores. Repeat the query in that child to rank
 members by relevance; the owning list's scores are not inherited. A child
-`knn.unit: "groups"` needs its own `collapse`.
+`knn.unit: "groups"` and explicit `count_unit: "groups"` resolve to the
+nearest enclosing collapse, including within one of its group buckets.
+Within one group these yield its best member and a count of one where it
+has members; the default facet unit inside a group remains documents.
 
 The names `val`, `count`, `rank`, `singleton` and `missing` are reserved in
-both group and facet bucket operations. A `domain` reset beneath a group or
-facet bucket is currently unsupported.
+both group and facet bucket operations.
 
-Members come from this list's matching documents, including its filters and
-deletes. For kNN, only documents admitted into that query's candidate window
+A child `domain` can search beyond the members that matched the list. For
+example, this returns every in-stock color of each page product, even when
+the list query matched only one color:
+
+```json
+"collapse": {
+  "field": "product_s",
+  "ops": {
+    "swatches": {
+      "field_facet": {"field": "color_s", "limit": -1},
+      "domain": {"query": {"all": true}, "filter": ["stock_i:>0"]}
+    }
+  }
+}
+```
+
+The reset keeps the group's key, including tuple null components or an
+expanded singleton's document identity, and every enclosing facet bucket.
+It drops the matching queries above it. Set `apply_parent_filters: true` to
+also keep the owning list's routed filters; this requires `domain.query`.
+Without `domain.query`, extra `domain.filter` clauses only narrow the
+ordinary member domain. See [bucket domain resets](faceting.md#bucket-domain-resets)
+for nesting. A reset below a kNN query-facet bucket re-evaluates its window
+in the reset scope, so child membership may differ from the parent's count;
+nested selections run outer to inner.
+
+Without a reset, members come from this list's matching documents, including
+its filters and deletes. For kNN, only documents admitted into that query's candidate window
 are members; enrichment does not run another neighbor search or find the
 other indexed documents with the same key. In group-unit kNN the window
 contains one witness per group, so every returned member count is one.
@@ -901,7 +929,8 @@ preparation without collecting results. See
   Per-group `collapse.ops` uses the page's matching member domains.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets, metric facet sorts with
-  distinct counts, and fusion beneath collapse are unsupported.
+  distinct counts, and fusion directly in a collapsed list's list-level `ops`
+  are unsupported.
 - Document-unit kNN selects `k` documents before collapse, so repeated keys
   can produce fewer than `k` groups. Group-unit kNN selects groups, with ANN
   recall and underfill subject to candidate and IVF effort limits.

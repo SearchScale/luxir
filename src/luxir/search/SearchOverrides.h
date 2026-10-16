@@ -41,6 +41,12 @@ inline bool disableFieldSortBulk = false;
 // force bucket chunking.
 inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 
+// Observe unexpected structural-prefix lifetime recomputation in tests.
+inline size_t* structuralPrefixRecomputations = nullptr;
+
+// Force identity producer chunks independently of the binding block width.
+inline std::size_t forcedFacetBucketDomainByteBudget = 0;
+
 // Test override for the range-facet result-child state chunk. Zero selects the
 // production ceiling.
 inline std::size_t forcedRangeFacetBindingStateChunkBytes = 0;
