@@ -1626,7 +1626,7 @@ public:
     }
     // Recorded from the terms actually written, so flush and merge (where
     // deletes may drop the last long value) both derive the flag exactly.
-    if (termList.back().size() >= PackedTerm::MIN_FITTED_LEN) mayHaveFitted = true;
+    if (PackedTerm::mayBeFitted(std::string_view(termList.back()))) mayHaveFitted = true;
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
       assert(posdeltas.size() == (hasPositions ? 1u : 0u));
@@ -1780,7 +1780,7 @@ public:
     fieldInfo->nTerms = result.nTerms;
     fieldInfo->sumDocFreq = result.sumDocFreq;
     fieldInfo->sumTotalTermFreq = result.sumTotalTermFreq;
-    fieldInfo->flags &= ~(FieldType::TERM_RANGES | FieldType::MAY_HAVE_FITTED);
+    fieldInfo->flags &= ~FieldType::SEGMENT_MARKERS;
     if (result.mayHaveFitted) fieldInfo->flags |= FieldType::MAY_HAVE_FITTED;
     fieldInfo->rangeTableLoc = {0, 0};
 

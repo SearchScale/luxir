@@ -75,6 +75,9 @@ public:
   // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
   // may be a truncated or hashed (fitted) form of a longer value.
   static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
+  // Every segment-format marker. A writer derives them from what it writes,
+  // so merges never carry them over from source segments.
+  static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
 
   const FieldType::Type type_;
   const std::string name_;

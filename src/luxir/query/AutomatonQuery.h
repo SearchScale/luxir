@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include <format>
 #include <optional>
 #include <string_view>
 
+#include "FittedTerms.h"
 #include "MultiTermQuery.h"
 #include "luxir/reader/DfaIntersectEnum.h"
 #include "luxir/util/automaton/ByteDfa.h"
@@ -41,8 +41,6 @@ private:
   std::optional<TermPolicy> fittedPolicy;
 
 public:
-  static constexpr std::string_view FITTED_TERMS_WARNING = "fitted_terms_pattern";
-
   AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
                  std::string_view exactOrPrefix, DfaScanPlan scanPlan,
@@ -92,22 +90,12 @@ public:
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 
 protected:
-  // Warn once per request and field when a segment holds possibly fitted
-  // terms the pattern can reach. The reader's cached header flags rule out
-  // nearly every field before the DFA is walked.
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     checkedBoostProduct(multiplier, 1.0f);
-    if (!fittedPolicy || context.warnings == nullptr) return;
-    if ((context.topReader.field(field).flagsUnion() & FieldType::MAY_HAVE_FITTED) == 0) return;
-    if (dfa.maxAcceptedLength() < (int32_t)PackedTerm::MIN_FITTED_LEN) return;
-    std::string message = std::format(
-        "pattern on field {} may miss or falsely match values longer than {} bytes ({})",
-        field, PackedTerm::MAX_LEN,
-        *fittedPolicy == TermPolicy::HASH128 ? "stored as prefix+hash" : "stored truncated");
-    for (const auto& warning : *context.warnings) {
-      if (warning.code == FITTED_TERMS_WARNING && warning.message == message) return;
-    }
-    context.warn(FITTED_TERMS_WARNING, message);
+    if (!fittedPolicy) return;
+    warnIfFittedTermsReachable(context, field, *fittedPolicy, [&] {
+      return dfa.maxAcceptedLength() >= (int32_t)PackedTerm::MIN_FITTED_LEN;
+    });
   }
 };
 

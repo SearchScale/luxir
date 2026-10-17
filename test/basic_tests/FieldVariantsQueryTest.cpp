@@ -434,11 +434,11 @@ TEST_F(FieldVariantsQueryTest, hash128LongPatternsUseKeptLiteralPrefix) {
       R"({{"regex":{{"field":"value_s","pattern":"{}.*"}}}})", utf8.substr(0, 234))));
 }
 
-TEST_F(FieldVariantsQueryTest, fittedTermPatternsWarn) {
+TEST_F(FieldVariantsQueryTest, fittedTermsWarn) {
   auto warnings = [&](std::string_view query) {
     auto req = run(std::format(R"({{"query":{},"fields":["id"],"limit":-1}})", query));
     EXPECT_TRUE(req->ok()) << req->errorMsg();
-    return std::ranges::count(req->respWarnings(), std::string_view("fitted_terms_pattern"),
+    return std::ranges::count(req->respWarnings(), std::string_view("fitted_terms"),
                               &api::Warning::code);
   };
   auto infix = R"({"wildcard":{"field":"value_s","pattern":"*tail*"}})";
@@ -454,6 +454,13 @@ TEST_F(FieldVariantsQueryTest, fittedTermPatternsWarn) {
   // Prefixes see fitted terms correctly, and bounded patterns cannot reach them.
   EXPECT_EQ(0, warnings(R"({"wildcard":{"field":"value_s","pattern":"xx*"}})"));
   EXPECT_EQ(0, warnings(R"({"wildcard":{"field":"value_s","pattern":"?tail"}})"));
+  // Fuzzy edits can reach a fitted term; zero edits is an exact lookup.
+  auto fuzzy = [](std::string_view term, int edits) {
+    return std::format(R"({{"fuzzy":{{"field":"value_s","term":"{}","max_edits":{}}}}})", term, edits);
+  };
+  EXPECT_EQ(1, warnings(fuzzy(std::string(300, 'x') + "tial", 1)));
+  EXPECT_EQ(0, warnings(fuzzy(std::string(300, 'x') + "tail", 0)));
+  EXPECT_EQ(0, warnings(fuzzy("tial", 2)));
 
   CollectionHelper::UpdateBuilder merge;
   merge.commit(true, 1);

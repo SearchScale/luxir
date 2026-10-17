@@ -704,6 +704,7 @@ public:
       default:
         throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
     }
+    size_t sourceLen = term.size();
     term = fitTerm(target, term); // Edit distance is measured in indexed term bytes.
     int resolvedEdits;
     if (!maxEdits) {
@@ -724,7 +725,16 @@ public:
       throw std::runtime_error(
         std::format("Fuzzy query max_expansions must not be negative (got {})", maxExpansions));
     }
-    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions);
+    // Edits can reach a fitted term, or the query term is fitted itself, and
+    // distance over kept bytes misses near long values. Zero edits is an
+    // exact lookup, which applies the same transform as ingest.
+    std::optional<TermPolicy> fittedPolicy;
+    if (fieldType.longTerms != TermPolicy::REJECT && resolvedEdits > 0
+        && sourceLen + (size_t)resolvedEdits >= PackedTerm::MIN_FITTED_LEN) {
+      fittedPolicy = fieldType.longTerms;
+    }
+    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions,
+                                 1.0f, fittedPolicy);
   }
 
   // Build a match query for `field` against raw value `value`.
@@ -931,19 +941,7 @@ public:
                     "op '{}', DATE field '{}': date granule '{}' skipped: "
                     "no such local granule in {}",
                     opName, field, text, coerceContext.timeZone.name());
-          bool duplicate = false;
-          for (const api::Warning& warning : *warnings) {
-            if (warning.code == "date_granule_skipped" && warning.message == message) {
-              duplicate = true;
-              break;
-            }
-          }
-          if (!duplicate) {
-            char* copy = pool.alloc(message.size());
-            std::memcpy(copy, message.data(), message.size());
-            warnings->push_back({"date_granule_skipped",
-                                 std::string_view(copy, message.size())});
-          }
+          addWarning(*warnings, pool, "date_granule_skipped", message);
         }
         return range;
       };

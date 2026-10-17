@@ -1454,9 +1454,7 @@ private:
         LOG_ERROR("Field types don't match! {} {}", (int)type, (int)field->segFieldInfo.type);
         // now what?
       }
-      // Segment-format markers are recomputed from what this merge writes.
-      allFlags |= field->segFieldInfo.flags
-          & ~(FieldType::TERM_RANGES | FieldType::MAY_HAVE_FITTED);
+      allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
     }
     bool isText = type == FieldType::Type::TEXT;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
