@@ -795,7 +795,7 @@ TEST_F(ReplicationFollowerTest, eofCommitsOnlyTouchedCollections) {
   auto join = scope_guard([&] { resume.count_down(); stopFollower(); });
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* { resume.wait(); return nullptr; });
   auto response = httpRequest(sourcePort, http::verb::post,
-      "/collections/main/_update?commit=true&wait_for_replicas=1&wait_for_replicas_timeout_ms=500",
+      "/collections/main/_update?commit=true&wait_for_replicas=1&wait_for_replicas_timeout_ms=10",
       "{\"_update_\":{\"collection\":\"other\"}}\n{\"id\":\"other\"}\n", "application/x-ndjson");
   ASSERT_EQ(200, response.result_int()) << response.body();
   auto end = response.body().find_last_not_of("\r\n ");
