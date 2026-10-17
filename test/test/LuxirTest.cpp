@@ -232,6 +232,13 @@ TEST(LuxirTestHarnessTest, effortScaling) {
   EXPECT_EQ(200, luxir::LuxirTest::scaleTestDimension(100, 3));
 }
 
+// Read by jemalloc when it is the process allocator (unused otherwise). The debug
+// preset links jemalloc's debug build, whose junk filling of every allocation and
+// free costs more than the tests themselves; its assertions stay on.
+extern "C" {
+const char* malloc_conf = "junk:false";
+}
+
 // global argc/argv
 int gArgc;
 char** gArgv;
