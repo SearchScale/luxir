@@ -164,6 +164,7 @@ defaults and constraints are described in the comments and guides.
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
 - [`StorageRamStats`](#message-luxir.storageramstats)
+- [`StoredResourceDef`](#message-luxir.storedresourcedef)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`UpdateRequest`](#message-luxir.updaterequest)
 - [`UpdateResponse`](#message-luxir.updateresponse)
@@ -835,7 +836,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.multi"></a>[`multi`](#field-luxir.fielddef.multi) | 5 | `bool` | optional | multi-valued |
 | <a id="field-luxir.fielddef.analyzer"></a>[`analyzer`](#field-luxir.fielddef.analyzer) | 6 | [`AnalyzerDef`](#message-luxir.analyzerdef) | singular | TEXT only. Unset or empty inherits; a nonempty definition replaces the entire analyzer. Without an inherited analyzer, defaults to whitespace. |
 | <a id="field-luxir.fielddef.stored"></a>[`stored`](#field-luxir.fielddef.stored) | 7 | `bool` | optional | Keep canonical source text before analysis/normalization for TEXT/STRING/ID retrieval. Defaults to true for TEXT, false otherwise; unused on other types. |
-| <a id="field-luxir.fielddef.stored_resource"></a>[`stored_resource`](#field-luxir.fielddef.stored_resource) | 8 | `string` | optional | Stored-field group for stored TEXT/STRING/ID values, e.g. "\_stored\_body\_". Empty or unset inherits the parent's group, falling back to "\_stored\_". |
+| <a id="field-luxir.fielddef.stored_resource"></a>[`stored_resource`](#field-luxir.fielddef.stored_resource) | 8 | `string` | optional | Stored-field group for stored TEXT/STRING/ID values, e.g. "\_stored\_body\_", declared in SchemaDef.stored\_resources. Empty or unset inherits the parent's group, falling back to "\_stored\_". |
 | <a id="field-luxir.fielddef.dims"></a>[`dims`](#field-luxir.fielddef.dims) | 9 | `int32` | optional | Vector dimensionality. Unset inherits, falling back to 0 (infer from the first indexed value). A positive value enforces dimensions at ingest. |
 | <a id="field-luxir.fielddef.metric"></a>[`metric`](#field-luxir.fielddef.metric) | 10 | [`VectorMetric`](#enum-luxir.vectormetric) | optional | Vector similarity metric. Absent means inherit, else NONE (storage-only). |
 | <a id="field-luxir.fielddef.normalized"></a>[`normalized`](#field-luxir.fielddef.normalized) | 11 | `bool` | optional | Caller asserts that all values for this field are already L2-normalized (unit length). For COSINE, this disables write-time and aux-build normalization. No effect on non-COSINE metrics. Trust-only: not validated at index time. |
@@ -1537,6 +1538,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 |---|---|---|---|---|
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
+| <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -1761,6 +1763,21 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.storageramstats.used_bytes"></a>[`used_bytes`](#field-luxir.storageramstats.used_bytes) | 1 | `uint64` | singular | Allocated RAM file buffers, including output and retained readers. |
 | <a id="field-luxir.storageramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.storageramstats.limit_bytes) | 2 | `uint64` | singular | Zero is unlimited. Independent of the indexing budget. |
 
+<a id="message-luxir.storedresourcedef"></a>
+
+### luxir.StoredResourceDef
+
+Chunk settings for one stored-field group (a FieldDef stored\_resource). Every setting is optional; absent selects the default. Changes apply to segments written afterwards. A merge recompresses its inputs unless their codec and chunk limits already match; the level alone does not count.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.storedresourcedef.codec"></a>[`codec`](#field-luxir.storedresourcedef.codec) | 1 | [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec) | optional | Chunk compression; absent selects lz4. |
+| <a id="field-luxir.storedresourcedef.zstd_level"></a>[`zstd_level`](#field-luxir.storedresourcedef.zstd_level) | 2 | `int32` | optional | ZSTD level from 1 (fastest) to 22 (smallest). Absent selects 3. Only valid with codec zstd. |
+| <a id="field-luxir.storedresourcedef.chunk_size_bytes"></a>[`chunk_size_bytes`](#field-luxir.storedresourcedef.chunk_size_bytes) | 3 | `int32` | optional | Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384, or 65536 with zstd. Larger chunks compress better, but each retrieval decompresses a whole chunk. |
+| <a id="field-luxir.storedresourcedef.max_docs_per_chunk"></a>[`max_docs_per_chunk`](#field-luxir.storedresourcedef.max_docs_per_chunk) | 4 | `int32` | optional | Most documents per chunk, 1 to 65536; absent selects 128, or 1024 with zstd. A chunk closes at whichever of the byte and document limits comes first. |
+
 <a id="message-luxir.topdocs"></a>
 
 ### luxir.TopDocs
@@ -1929,6 +1946,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
+- [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
@@ -2155,6 +2173,17 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.sortspec.sortdir.unknown"></a>[`UNKNOWN`](#value-luxir.sortspec.sortdir.unknown) | 0 |  |
 | <a id="value-luxir.sortspec.sortdir.asc"></a>[`ASC`](#value-luxir.sortspec.sortdir.asc) | 1 |  |
 | <a id="value-luxir.sortspec.sortdir.desc"></a>[`DESC`](#value-luxir.sortspec.sortdir.desc) | 2 |  |
+
+<a id="enum-luxir.storedresourcedef.codec"></a>
+
+### luxir.StoredResourceDef.Codec
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.storedresourcedef.codec.lz4"></a>[`LZ4`](#value-luxir.storedresourcedef.codec.lz4) | 0 | fast compression and decompression |
+| <a id="value-luxir.storedresourcedef.codec.zstd"></a>[`ZSTD`](#value-luxir.storedresourcedef.codec.zstd) | 1 | smaller chunks for repetitive text such as logs, at more CPU |
 
 <a id="enum-luxir.updateresponse.status"></a>
 

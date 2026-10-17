@@ -420,7 +420,8 @@ private:
                                               const StoredFieldType* config) {
     auto it = storedFields_.find(resourceName);
     if (it != storedFields_.end()) return *it->second;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, config);
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName,
+                                                       config ? config->format_ : StoredChunkFormat{});
     auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
     return *newIt->second;
   }
