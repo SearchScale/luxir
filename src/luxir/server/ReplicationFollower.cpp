@@ -257,6 +257,7 @@ struct ReplicationFollower::Impl {
     }
   };
   LuxirNode& node;
+  const std::chrono::milliseconds retryDelay; // reconnect, and first sync retry
   Source source;
   std::vector<Source> peers; // never resized after construction: clients reference them
   const std::vector<std::string> tenants;
@@ -275,7 +276,8 @@ struct ReplicationFollower::Impl {
   std::stop_source stopping;
   std::vector<std::jthread> threads;
 
-  explicit Impl(LuxirNode& node) : node(node), source(node.getConfig().replication.source),
+  explicit Impl(LuxirNode& node) : node(node), retryDelay(node.getConfig().replication.retry_ms),
+      source(node.getConfig().replication.source),
       tenants(node.getConfig().replication.tenantFilter()) {
     for (const auto& peer : node.getConfig().replication.peerList()) peers.emplace_back(peer);
     if (node.getConfig().replication.downloads < 1 || node.getConfig().replication.downloads > 64) {
@@ -461,7 +463,7 @@ struct ReplicationFollower::Impl {
         { std::lock_guard lock(mutex); connected = false; discoveryError = message; }
         LOG_WARN("Replication source {} unavailable: {}", binding.source, message);
         std::unique_lock lock(mutex);
-        changed.wait_for(lock, stopping.get_token(), 1s, [] { return false; });
+        changed.wait_for(lock, stopping.get_token(), retryDelay, [] { return false; });
       }
     }
   }
@@ -771,7 +773,11 @@ struct ReplicationFollower::Impl {
           selected->busy = true; progress = selected->progress;
           return true;
         };
-        changed.wait_for(lock, stopping.get_token(), 200ms, ready);
+        // Recheck at least every 200 ms, and when the next backed-off retry is due.
+        auto recheck = Clock::duration(200ms);
+        auto now = node.now();
+        for (const auto& [key, state] : states) if (state.retry > now) recheck = std::min(recheck, state.retry - now);
+        changed.wait_for(lock, stopping.get_token(), recheck, ready);
         if (stopping.stop_requested()) break;
         if (name.name.empty()) continue;
       }
@@ -820,7 +826,7 @@ struct ReplicationFollower::Impl {
         if (error.empty()) { state.failures = 0; state.retry = {}; }
         else {
           if (state.progress != progress) state.failures = 0;
-          auto delay = std::chrono::seconds(std::min(60u, 1u << std::min(6u, state.failures)));
+          auto delay = std::min<Clock::duration>(60s, retryDelay * (1 << std::min(6u, state.failures)));
           state.failures++; state.retry = node.now() + delay;
         }
         if (!state.unreadable && !state.advertised && !state.serving && !state.candidate && error.empty()) states.erase(name);

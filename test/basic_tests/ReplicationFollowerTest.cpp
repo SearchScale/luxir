@@ -46,6 +46,7 @@ protected:
     sourceConfig.store.data_dir = (path / "source").string();
     followerConfig.store.data_dir = (path / "follower").string();
     sourceConfig.replication.follower_timeout_ms = 1000;
+    followerConfig.replication.retry_ms = 10; // reconnect and retry without the production second
     followerConfig.server.http.port = 0; // no fixed listener: a name per process
   }
   void startSource() {

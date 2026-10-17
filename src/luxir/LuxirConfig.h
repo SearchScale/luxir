@@ -165,6 +165,9 @@ struct ReplicationConfig {
   int64_t pin_idle_timeout_ms = 60'000;
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
   int64_t follower_timeout_ms = 90'000;
+  // A follower's delay before reconnecting to a lost source, and before its first
+  // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
+  int64_t retry_ms = 1000;
   std::string source;
   std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant

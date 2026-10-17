@@ -93,6 +93,7 @@ void ReplicationConfig::validate() const {
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
+  if (retry_ms < 1) throw std::invalid_argument("replication.retry-ms must be positive");
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
@@ -154,6 +155,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(replication.pin_retained_bytes);
   app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
                  "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
+  app.add_option("--replication.retry-ms", replication.retry_ms,
+                 "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
+      ->default_val(replication.retry_ms);
 
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
