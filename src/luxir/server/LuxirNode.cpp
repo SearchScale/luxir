@@ -54,8 +54,8 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   }
 }
 
-LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
-  : config(std::move(config)), workers(std::max(1, this->config.server.resolveWorkers())),
+LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
+  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
@@ -69,8 +69,8 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
   replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
-      replicationConfig.follower_timeout_ms), ReplicationSource::Clock::now, replicationConfig.max_acknowledgments);
-  commitWaits = std::make_shared<CommitWaits>(*replication, following());
+      replicationConfig.follower_timeout_ms), this->clock, replicationConfig.max_acknowledgments);
+  commitWaits = std::make_shared<CommitWaits>(*replication, following(), this->clock);
   replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](const CollectionId* id) {
     if (auto waits = weak.lock()) waits->acknowledged(id);
   });

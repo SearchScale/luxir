@@ -242,7 +242,9 @@ struct ReplicationFollower::Impl {
     uint64_t advertisedDigest = 0; // manifest digest announced with `advertised`
     unsigned failures = 0;
     uint64_t progress = 0;
-    Clock::time_point readySince = Clock::now();
+    // Node-clock times: when the work became ready (unset until a commit is
+    // advertised), and when a failed sync may retry.
+    Clock::time_point readySince{};
     Clock::time_point retry{};
     uint64_t downloaded = 0, reused = 0, total = 0;
     // The incarnation `verified` describes, and its staged candidate when
@@ -405,7 +407,7 @@ struct ReplicationFollower::Impl {
     if (desired && (!state.advertised || desired->incarnation != state.advertised->incarnation))
       state.replaceEmpty = state.seenBoot == sourceBoot;
     if (desired != state.advertised) {
-      if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = Clock::now();
+      if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = node.now();
       state.advertised = std::move(desired); state.waiting = false;
     }
     state.advertisedDigest = announced ? announced->digest : 0;
@@ -761,7 +763,7 @@ struct ReplicationFollower::Impl {
             if (!includes(key)) continue;
             bool work = state.remove || (state.advertised && ((state.advertised != state.serving && !state.waiting)
                     || state.needsAck()));
-            if (!state.busy && !state.unavailable && work && Clock::now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
+            if (!state.busy && !state.unavailable && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               name = key; selected = &state;
             }
           }
@@ -814,12 +816,12 @@ struct ReplicationFollower::Impl {
         auto& state = states[name];
         // Discovery may have superseded a failed target while this job ran.
         if (state.serving && state.advertised == state.serving && state.acknowledged == state.serving) error.clear();
-        state.busy = false; state.error = error; state.readySince = Clock::now();
+        state.busy = false; state.error = error; state.readySince = node.now();
         if (error.empty()) { state.failures = 0; state.retry = {}; }
         else {
           if (state.progress != progress) state.failures = 0;
           auto delay = std::chrono::seconds(std::min(60u, 1u << std::min(6u, state.failures)));
-          state.failures++; state.retry = Clock::now() + delay;
+          state.failures++; state.retry = node.now() + delay;
         }
         if (!state.unreadable && !state.advertised && !state.serving && !state.candidate && error.empty()) states.erase(name);
       }
@@ -881,7 +883,7 @@ void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_re
     using State = api::ReplicationCollectionStatus::State;
     row.state = !impl->includes(id) ? State::ORPHAN : (!impl->connected || state.unavailable) ? State::STALE : !state.advertised ? State::ORPHAN : !state.error.empty() ? State::ERROR
         : state.waiting ? State::WAITING : state.advertised == state.serving ? State::SERVING : State::SYNCING;
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - Clock::now()).count();
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - impl->node.now()).count();
     if (!state.error.empty() && remaining > 0) row.next_retry = wallTime() + (uint64_t)remaining;
     row.bytes_downloaded = state.downloaded; row.bytes_total = state.total; row.last_error = str(state.error.empty() && !impl->connected ? impl->discoveryError : state.error);
   }

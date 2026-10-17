@@ -4,7 +4,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -37,12 +39,17 @@ public:
   static constexpr std::string_view kDefaultCollectionName = Collections::kDefaultCollectionName;
   using CollectionEntry = Collections::Entry;
 
+  using Clock = std::chrono::steady_clock;
+  using Now = std::function<Clock::time_point()>;
+
   LuxirNode() : LuxirNode(LuxirConfig{}) {}
   enum class Mode { SERVE, PULL };
-  explicit LuxirNode(LuxirConfig config, Mode mode = Mode::SERVE);
+  // `clock` times replication: commit waits, follower liveness and sync retries.
+  explicit LuxirNode(LuxirConfig config, Mode mode = Mode::SERVE, Now clock = Clock::now);
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
+  Clock::time_point now() const { return clock(); }
   ReplicationFollower* getFollower() { return follower.get(); }
   bool following() const { return !config.replication.source.empty(); }
   ReplicationSource& getReplication() { return *replication; }
@@ -132,6 +139,7 @@ private:
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
 
   LuxirConfig config;
+  Now clock;
 
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).
