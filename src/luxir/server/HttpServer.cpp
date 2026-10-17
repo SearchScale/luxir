@@ -176,9 +176,11 @@ struct HttpStreamBatchState {
   ~HttpStreamBatchState() { Signal::emit("httpBatchBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`
-  // Raw document records, copied into `resource` by the I/O thread, which only
-  // frames them.  decodeDocs() turns them into proto.docs on the task arena.
+  // Raw document records: views into the stream's NDJSON chunks, which
+  // `chunks` keeps alive until decodeDocs() has turned them into proto.docs on
+  // the task arena.  The I/O thread only frames them.
   luxir::api::build::SpanBuilder<std::string_view> records;
+  std::vector<std::shared_ptr<NdjsonChunk>> chunks;
   std::shared_ptr<HttpStreamControlRequest> requestOwner;
   std::string collectionName;
   std::size_t sourceBytes = 0;
@@ -194,12 +196,18 @@ struct HttpStreamBatchState {
     records.reserve(reserveDocs);
   }
 
+  void addRecord(std::string_view record, const std::shared_ptr<NdjsonChunk>& chunk) {
+    records.push_back(record);
+    if (chunks.empty() || chunks.back() != chunk) chunks.push_back(chunk);
+  }
+
   // Decodes the raw records into proto.docs.  Called from the update message's
   // handle() on an indexing worker, so a single connection's JSON decoding
   // scales with the task arena instead of its I/O thread.  The I/O thread no
   // longer touches the batch once it is submitted, and `resource` lives as long
-  // as the batch, which outlives the message.  A malformed record fails the
-  // whole batch before any of it is indexed.
+  // as the batch, which outlives the message.  Decoded strings are copied into
+  // `resource`, so the raw bytes go as soon as decoding succeeds.  A malformed
+  // record fails the whole batch before any of it is indexed.
   void decodeDocs() {
     auto raw = records.finish();
     if (raw.empty()) return;
@@ -215,6 +223,7 @@ struct HttpStreamBatchState {
       }
     }
     proto.docs = docs.finish();
+    chunks.clear();
   }
 };
 
@@ -287,10 +296,12 @@ struct UpdateUrlParams {
 };
 
 struct HttpStreamUpdateState {
+  // Most body bytes one read hands the framer.  Debug builds read less so
+  // records routinely span reads.
 #ifdef NDEBUG
-  static constexpr std::size_t kStreamReadBufBytes = 1024 * 1024;
+  static constexpr std::size_t kStreamReadBytes = 1024 * 1024;
 #else
-  static constexpr std::size_t kStreamReadBufBytes = 64 * 1024;
+  static constexpr std::size_t kStreamReadBytes = 64 * 1024;
 #endif
   static constexpr std::size_t kMaxRetainedErrors = 100;
   static constexpr std::size_t kMaxRetainedIds = 100;
@@ -301,7 +312,7 @@ struct HttpStreamUpdateState {
   std::size_t maxRequestBody;
 
   NdjsonFramer framer;
-  std::vector<char> readBuf;
+  std::size_t readSpace = 0;  // body bytes the read in flight may write into the framer
   std::string defaultCollectionName;
   HttpStreamGroup group;
   std::map<std::string, HttpStreamWriterTarget> writerCache;
@@ -340,8 +351,7 @@ struct HttpStreamUpdateState {
     : batchTargetBytes(batchTargetBytes),
       batchMaxDocs(batchMaxDocs),
       maxRequestBody(maxRequestBody),
-      framer(maxRecordBytes),
-      readBuf(kStreamReadBufBytes),
+      framer(maxRecordBytes, batchTargetBytes),
       batch(std::make_unique<HttpStreamBatchState>(batchMaxDocs)),
       maxInFlight(maxInFlight) {
     assert(maxInFlight > 0);
@@ -2685,13 +2695,17 @@ private:
       drainStreamRecords();
       return;
     }
-    parser_->get().body().data = state->readBuf.data();
-    parser_->get().body().size = state->readBuf.size();
+    // The parser writes the body straight into the framer's chunk, where the
+    // records stay until their batch has decoded them.
+    auto space = state->framer.writable(HttpStreamUpdateState::kStreamReadBytes);
+    state->readSpace = space.size();
+    parser_->get().body().data = space.data();
+    parser_->get().body().size = space.size();
     // async_read_SOME, not async_read: it delivers whatever bytes are available now
     // (one read), so a partial arrival is processed immediately. This is load-bearing
     // for checkpoints - a client that sends a small batch + a `{}` marker and then
     // blocks waiting for its ack must have those bytes framed+indexed+responded now.
-    // async_read would instead wait until readBuf fills or the body ends, so the `{}`
+    // async_read would instead wait until the read space fills or the body ends, so the `{}`
     // ack would never arrive before EOF and the client would deadlock. Do not "optimize"
     // this to async_read.
     state->readInFlight = true;
@@ -2716,14 +2730,7 @@ private:
       return;
     }
 
-    std::size_t produced = state->readBuf.size() - parser_->get().body().size;
-    if (produced > 0) {
-      state->framer.feed(std::string_view(state->readBuf.data(), produced));
-      if (state->framer.error()) {
-        failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large", state->framer.message()});
-        return;
-      }
-    }
+    state->framer.commit(state->readSpace - parser_->get().body().size);
 
     if (parser_->is_done()) state->bodyDone = true;
     drainStreamRecords();
@@ -3252,9 +3259,10 @@ private:
     assert(!state->batchReady);
 
     // Only a record that may be a control record is decoded here, in stream
-    // order; documents are copied raw into the batch and decoded on the task
-    // arena (HttpStreamBatchState::decodeDocs), where a malformed one fails
-    // its batch with the same invalid_json error.
+    // order; documents stay where the framer read them, the batch holds their
+    // chunk, and they are decoded on the task arena
+    // (HttpStreamBatchState::decodeDocs), where a malformed one fails its batch
+    // with the same invalid_json error.
     if (mayBeStreamControl(record)) {
       // The decoded map is only inspected here (a control payload is
       // re-decoded into its own request arena), so it needs no batch memory.
@@ -3297,7 +3305,7 @@ private:
       if (isControl) return beginStreamControlBarrier(std::move(control));
     }
     startImplicitStreamGroup();
-    state->batch->records.push_back(luxir::api::build::arenaStr(state->batch->resource, record));
+    state->batch->addRecord(record, state->framer.chunk());
     state->batch->sourceBytes += record.size();
     if (state->group.allOrNone()) {
       if (state->batch->sourceBytes > state->maxRequestBody) {
@@ -3423,6 +3431,10 @@ private:
     while (state->canAdmit() && state->framer.next(record)) {
       if (!processStreamRecord(record)) return;
       if (state->failed || state->barrierPending || state->batchReady) return;
+    }
+    if (state->framer.error()) {
+      failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large", state->framer.message()});
+      return;
     }
     if (!state->canAdmit()) return;
 
