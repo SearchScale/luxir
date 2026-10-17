@@ -244,6 +244,31 @@ TEST_P(CountShortcutTest, booleanBoundsAndSingletonsAgree) {
   }
 }
 
+TEST_P(CountShortcutTest, wholeMatchAllUsesOnlyCachedEffectiveCard) {
+  deleteSome();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  AllQuery query;
+  auto* weight = query.createWeight(context, 0);
+  QueryPrep::WholeMembershipPlan plan(*weight, nullptr, {});
+  auto& segment = reader->segments()[0];
+  RAMBitDocSet domain(segment.maxDoc());
+  domain.mutableBits().set(1);
+  EXPECT_EQ(-1, domain.cachedCard());
+  EXPECT_FALSE(resolveWholeMembershipForTests(plan, *reader, segment, &domain).available);
+  EXPECT_EQ(-1, domain.cachedCard());
+
+  DocSetBuilder builder(segment.maxDoc());
+  builder.add(1);
+  auto effective = builder.build();
+  ASSERT_EQ(1, effective->cachedCard());
+  EXPECT_EQ(Query::CountHow::ITERATE, weight->countShortcut(segment, effective.get()).how);
+  auto result = resolveWholeMembershipForTests(plan, *reader, segment, effective.get());
+  EXPECT_TRUE(result.available);
+  EXPECT_EQ(1, result.count);
+  EXPECT_EQ(nullptr, result.docs.get());
+}
+
 TEST_P(CountShortcutTest, probesStopBeforeIndexWalks) {
   MemPool pool;
   Query::Context context(pool, *reader);

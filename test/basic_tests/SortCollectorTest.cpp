@@ -2464,6 +2464,55 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
   }
 }
 
+TEST_F(SortCollectorTest, fieldSortConstantCountWithoutCacheIsPerSegment) {
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  writer->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kDocsPerSeg = 5000;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++) {
+      int32_t id = seg * kDocsPerSeg + i;
+      helper.index(flatdoc("id", std::to_string(id), "id_s", std::to_string(id),
+                           "body_w", (i & 1) == 0 ? "alpha" : "other",
+                           "sort_i", (int64_t)id), UpdateMessage::NO_COMMIT);
+    }
+    helper.commit();
+  }
+  ASSERT_TRUE(helper.deleteById("5000", UpdateMessage::COMMIT).success);
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  ASSERT_EQ(nullptr, reader->segments()[0].liveDocs());
+  ASSERT_NE(nullptr, reader->segments()[1].liveDocs());
+
+  auto run = [&](bool disablePlan) {
+    WholeMembershipPlanGuard planGuard(disablePlan);
+    BestFirstGuard bestFirstGuard(true, false);
+    FieldSortBulkGuard bulkGuard(true);
+    SortSkipStatsGuard stats;
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").matchQuery("body_w", "alpha")
+        .getNumber().limit(9).fields({"id_s"});
+    qb::sort(top, "sort_i", qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(kDocsPerSeg - 1, req->getMatchCount());
+    EXPECT_EQ(disablePlan ? 0 : 1, SkipStats::wholeFieldSortConstant);
+    int64_t skipped = SkipStats::fieldSortBlocksSkipped + SkipStats::fieldSortLeavesSkipped;
+    if (disablePlan) EXPECT_EQ(0, skipped);
+    else EXPECT_GT(skipped, 0);
+    EXPECT_EQ(0, SkipStats::wholeFieldSortHits + SkipStats::wholeFieldSortBuilds
+                     + SkipStats::wholeFieldSortBypasses
+                     + SkipStats::wholeFieldSortFallbackSuppliers);
+    EXPECT_EQ(0, SkipStats::cacheFirstFieldSortWeightSkips
+                     + SkipStats::cacheFirstQueryContextsOmitted);
+    EXPECT_EQ(1, SkipStats::queryContextsCreated);
+    return resultIds(*req);
+  };
+  EXPECT_EQ(run(true), run(false));
+}
+
 // Zone-based competitive pruning must return exactly what exhaustive
 // collection returns. The corpus spans multiple 4096-value zone blocks per
 // segment, includes deletes, ties, and a segment with missing values, and is
@@ -2526,6 +2575,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
                  bool domainBuilder = false, bool forcePrepare = false) {
     SortPruningGuard pruningGuard(disablePruning);
     FieldSortBulkGuard bulkGuard(forcePull);
+    BestFirstGuard bestFirstGuard(forcePull, false);
     TopDocsFilterFoldGuard foldGuard(true);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
@@ -2559,6 +2609,8 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
       int64_t blocksSkipped = 0;
       int64_t bulkCollections = 0;
       int64_t exactDomainRuns = 0;
+      int64_t wholeConstants = 0;
+      bool hasFound = false;
       int64_t externalActivations = 0;
       int64_t externalCandidates = 0;
       int64_t externalDomainRejects = 0;
@@ -2569,6 +2621,8 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
     result.ids = resultIds(*req);
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
+    result.hasFound = docs != nullptr && docs->found.has_value();
+    result.wholeConstants = SkipStats::wholeFieldSortConstant;
     result.blocksSkipped = SkipStats::fieldSortBlocksSkipped
         + SkipStats::fieldSortLeavesSkipped;
     result.bulkCollections = SkipStats::fieldSortBulkCollections;
@@ -2647,12 +2701,84 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   // proves nothing, so no blocks may be skipped.
   EXPECT_EQ(run(false, true, true, tiesThenRand, 5, false).blocksSkipped, 0);
 
-  // An exact hit count disables pruning and stays exact.
+  // An exact hit count disables pruning and stays exact without the plan.
   auto exactExhaustive = run(true, true, true, randAsc, 9, true);
   auto exactPruned = run(false, true, true, randAsc, 9, true);
   EXPECT_EQ(exactExhaustive.ids, exactPruned.ids);
   EXPECT_EQ(exactExhaustive.found, exactPruned.found);
   EXPECT_EQ(exactPruned.blocksSkipped, 0);
+
+  // The plan supplies match-all totals on both segments, and term metadata
+  // on the delete-free segment. Ranking can prune through either driver.
+  {
+    WholeMembershipPlanGuard planOn(false);
+    for (bool matchAll : {true, false}) {
+      for (bool forcePull : {false, true}) {
+        for (const Sorts& sorts : {monoAsc, revDesc, randAsc}) {
+          SCOPED_TRACE(std::format("matchAll={} pull={} sort={}",
+                                  matchAll, forcePull, sorts.clauses[0].first));
+          auto exhaustive = run(true, forcePull, matchAll, sorts, 9, true);
+          auto pruned = run(false, forcePull, matchAll, sorts, 9, true);
+          EXPECT_EQ(exhaustive.ids, pruned.ids);
+          EXPECT_EQ(exhaustive.found, pruned.found);
+          EXPECT_EQ(matchAll ? 2 : 1, pruned.wholeConstants);
+          if (matchAll) {
+            EXPECT_EQ(2 * kDocsPerSeg - (int64_t)deleted.size(), pruned.found);
+          }
+          if (forcePull) {
+            EXPECT_EQ(0, pruned.exactDomainRuns);
+            EXPECT_EQ(0, pruned.bulkCollections);
+          } else if (matchAll && sorts.clauses[0].first != "rand_i") {
+            EXPECT_EQ(2, pruned.exactDomainRuns);
+          }
+          if (sorts.clauses[0].first != "rand_i") {
+            EXPECT_GT(pruned.blocksSkipped, 0);
+          }
+        }
+      }
+    }
+    auto noCount = run(false, false, true, monoAsc, 9, false);
+    EXPECT_EQ(run(true, false, true, monoAsc, 9, false).ids, noCount.ids);
+    EXPECT_FALSE(noCount.hasFound);
+    EXPECT_EQ(2, noCount.wholeConstants);
+    EXPECT_GT(noCount.exactDomainRuns, 0);
+  }
+
+  // Ord-column bucket builders preserve cached cards for ARRAY and BITSET,
+  // including the deleted segment's effective domain.
+  {
+    SearchOverridesGuard guard(forcedFacetBucketDomainSource);
+    forcedFacetBucketDomainSource = FacetBucketDomainSource::ORD_COLUMN;
+    auto runBucket = [&](std::string_view field, bool disablePlan) {
+      WholeMembershipPlanGuard planGuard(disablePlan);
+      BestFirstGuard bestFirstGuard(false, true);
+      SortSkipStatsGuard stats;
+      auto req = localReq(helper.getSearchEngine());
+      auto& facet = req->collection("main").facet("f", field).limit(-1);
+      auto& hits = facet.topDocs("hits").allQuery().getNumber().limit(9).fields({"id_s"});
+      qb::sort(hits, "mono_i", qb::ASC);
+      req->execute(false);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+      EXPECT_EQ(1u, result.counts.size());
+      const auto& docs = *std::get<api::ArrVal>(result.ops.at("hits")->kind).v[0].docList();
+      EXPECT_EQ(result.counts[0], docs.found.value_or(-1));
+      EXPECT_EQ(disablePlan ? 0 : 2, SkipStats::wholeFieldSortConstant);
+      if (disablePlan) {
+        EXPECT_EQ(0, SkipStats::fieldSortBestFirstActivations);
+      } else {
+        EXPECT_GT(SkipStats::fieldSortBestFirstActivations, 0);
+        EXPECT_GT(SkipStats::fieldSortLeavesSkipped, 0);
+      }
+      std::vector<std::string> ids;
+      for (auto id : std::get<api::ColStr>(docs.columns.at("id_s").kind).v) ids.emplace_back(id);
+      return std::pair{ids, docs.found};
+    };
+    for (auto field : {"dense_s", "sparse_s"}) {
+      SCOPED_TRACE(field);
+      EXPECT_EQ(runBucket(field, true), runBucket(field, false));
+    }
+  }
 
   // External two-phase collection must preserve the exhaustive result for
   // exact and sloppy phrases across all numeric bound/tie shapes and outer

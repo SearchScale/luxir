@@ -1762,7 +1762,10 @@ public:
             return supplier;
           };
           QueryPrep::WholeMembershipResult wholeMembershipResult;
-          if (!exactDomain && !matchEverything
+          // Match-all identity needs no membership fact, but field ranking
+          // still needs the plan's constant count to prune with exact totals.
+          if (!exactDomain
+              && !(matchEverything && (rankFromDocOrder || data->topCount() == 0))
               && !op.wholeMembershipPlan.empty()) {
             wholeMembershipResult = op.wholeMembershipPlan.resolve(
                 *op.req.reader, seg, domain, preparedWeight.get(),
@@ -2033,16 +2036,14 @@ public:
                 if (wholeFieldSortAvailable
                     && wholeMembershipResult.docs.get() != nullptr) {
                   domainSet = wholeMembershipResult.docs.get();
-                } else if (collectorFilter == nullptr && supplier != nullptr) {
-                  domainSet = supplier->exactDocSet();
-                  // Match-all with no deletes and no filters: the domain is
-                  // every doc (deletes would have arrived as a liveDocs
-                  // domain in collectorFilter per the root domain contract).
-                  allDocs = domainSet == nullptr && op.weight != nullptr
-                      && op.weight->matchesAllDocs();
                 } else if (op.weight != nullptr
                            && op.weight->matchesAllDocs()) {
+                  // Match-all's domain is collectorFilter, or every doc.
+                  // Deletes arrive in collectorFilter under the root contract.
                   domainSet = collectorFilter;
+                  allDocs = collectorFilter == nullptr;
+                } else if (collectorFilter == nullptr && supplier != nullptr) {
+                  domainSet = supplier->exactDocSet();
                 }
                 if (allDocs
                     || (domainSet != nullptr

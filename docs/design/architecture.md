@@ -147,10 +147,12 @@ the same hook without changing dispatch or response assembly.
 Execution adapts to what the request actually consumes. A top-k request
 that does not ask for an exact total runs with block-max pruning: postings
 carry per-block score upper bounds, and a MaxScore-based scorer skips
-blocks and documents that cannot reach the current top k. A request that
-consumes an exact count runs exhaustively, because an exact count requires
-it. The choice is made per request from what the request asks for; there is
-no separate accuracy setting.
+blocks and documents that cannot reach the current top k. An exact count
+requires exhaustive counting unless it is already known. Ranking can still
+prune when completeness is supplied separately, including field-sorted ranking
+whose exact total comes from metadata or a materialized domain. The choice is
+made per request from what the request asks for; there is no separate accuracy
+setting.
 
 Vector search composes the same way. A kNN query is just a query, with a
 scorer that participates in the boolean tree like any term. Filters apply

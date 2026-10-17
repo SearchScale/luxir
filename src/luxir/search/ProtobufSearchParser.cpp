@@ -1957,8 +1957,11 @@ public:
                       *query, FilterCache::AdmissionLane::WHOLE);
           }
         }
+        // Field-sort constants are useful per segment even without a cache.
+        // Prepared membership still requires its reader-stable cache source.
         if (!everySegmentConstant && wholeMembershipUse == nullptr
-            && !fieldSortFullyRouted) {
+            && !fieldSortFullyRouted
+            && !(wholeFieldSort && !wholeMembershipWeight->needsPrepare())) {
           wholeMembershipWeight = nullptr;
           wholeFieldSortCacheRoutes = {};
         }
