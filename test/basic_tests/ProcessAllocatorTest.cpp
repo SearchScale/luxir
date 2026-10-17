@@ -392,7 +392,10 @@ TEST(ProcessAllocatorTest, wholeHugePagePurgeAndReuse) {
   arena.purge();
 }
 
-TEST(ProcessAllocatorTest, backgroundDecayAndReuse) {
+// Disabled: it waits on jemalloc's best-effort background decay in real time.
+// Larger benchmark runs that track memory catch decay regressions; run this with
+// --gtest_also_run_disabled_tests when changing arena setup or upgrading jemalloc.
+TEST(ProcessAllocatorTest, DISABLED_backgroundDecayAndReuse) {
   // Both huge-page arena kinds: one with a companion arena, and the big-buffer
   // arena's whole-page purge. Each at a short decay.
   AllocatorArena arena("test-background-decay", {.hugePages = true, .dirtyDecayMs = 250});
