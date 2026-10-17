@@ -853,7 +853,9 @@ private:
         return;
       }
       parser_->body_limit(boost::none);
-      startStreamingUpdate(std::move(route_.coll), std::move(updateUrl_));
+      continueThenReadBody([this, coll = std::move(route_.coll), url = std::move(updateUrl_)]() mutable {
+        startStreamingUpdate(std::move(coll), std::move(url));
+      });
       return;
     }
 
@@ -879,7 +881,28 @@ private:
       return;
     }
     parser_->body_limit(bodyLimit);
-    doBufferedBodyRead();
+    continueThenReadBody([this] { doBufferedBodyRead(); });
+  }
+
+  // A client that sent "Expect: 100-continue" holds its body until the server
+  // answers (curl waits a second), so a request about to have its body read is
+  // told to go ahead first.  One refused from its headers alone gets only its
+  // final status.  No other write is in flight: a request's headers are read
+  // only once the previous response is out.
+  template <class ReadBody>
+  void continueThenReadBody(ReadBody readBody) {
+    const auto& req = parser_->get();
+    if (parser_->is_done() || req.version() < 11 ||
+        !beast::iequals(req[http::field::expect], "100-continue")) {
+      readBody();
+      return;
+    }
+    auto res = std::make_shared<http::response<http::empty_body>>(http::status::continue_, req.version());
+    http::async_write(stream_, *res,
+        [self = shared_from_this(), res, readBody = std::move(readBody)](beast::error_code ec, std::size_t) mutable {
+          if (ec) { self->doClose(); return; }
+          readBody();
+        });
   }
 
   void doBufferedBodyRead() {

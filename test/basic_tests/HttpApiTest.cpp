@@ -1795,6 +1795,63 @@ TEST_F(HttpApiTest, ndjsonDisconnectDrainsPipelinedBatches) {
   EXPECT_NO_THROW(localServer.shutdown());
 }
 
+// A client that sends "Expect: 100-continue" holds its body until the server
+// answers.  Buffered and streaming updates get 100 Continue before their body
+// is read; a body refused from its headers alone gets only its final status.
+TEST_F(HttpApiTest, expectContinueReleasesTheBody) {
+  LuxirConfig config;
+  config.ingest.max_request_body = 4096;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  // The status of each response, sending the body only after a 100; 0 for a
+  // response that does not arrive.
+  auto exchange = [&](const char* contentType, std::string body) {
+    net::io_context cioc;
+    beast::tcp_stream stream(cioc);
+    tcp::resolver resolver(cioc);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(localServer.getPort())));
+    http::request<http::string_body> request{http::verb::post, "/collections/expect/_update", 11};
+    request.set(http::field::host, "127.0.0.1");
+    request.set(http::field::content_type, contentType);
+    request.set(http::field::expect, "100-continue");
+    request.body() = std::move(body);
+    request.prepare_payload();
+    http::request_serializer<http::string_body> serializer{request};
+    http::write_header(stream, serializer);
+
+    beast::flat_buffer buffer;
+    auto status = [&] {  // async, so the timeout applies
+      http::response<http::string_body> response;
+      beast::error_code readEc;
+      stream.expires_after(std::chrono::seconds(10));
+      http::async_read(stream, buffer, response, [&](beast::error_code ec, std::size_t) { readEc = ec; });
+      cioc.restart();
+      cioc.run();
+      return readEc ? 0u : response.result_int();
+    };
+    std::vector<unsigned> statuses{status()};
+    if (statuses[0] == 100) {
+      http::write(stream, serializer);
+      statuses.push_back(status());
+    }
+    return statuses;
+  };
+
+  EXPECT_EQ(std::vector<unsigned>({100, 200}),
+            exchange("application/json", R"({"docs":[{"id":"e1","title_w":"expectcontinue"}],"commit":{}})"));
+  EXPECT_EQ(std::vector<unsigned>({100, 200}),
+            exchange("application/x-ndjson", R"({"id":"e2","title_w":"expectcontinue"})" "\n"
+                                             R"({"_end_":{"commit":{}}})" "\n"));
+  EXPECT_EQ(std::vector<unsigned>({413}), exchange("application/json", std::string(8192, ' ')));
+
+  HttpReq query(localServer.getPort());
+  query.collection("expect").matchQuery("title_w", "expectcontinue").fields({"id"}).limit(10).withStats().execute();
+  EXPECT_EQ((int64_t)2, query.found()) << query.rawResponse();
+  localServer.shutdown();
+}
+
 TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
   std::string body =
       R"({"id":"bad1","title_w":"badtoken"})" "\n"
