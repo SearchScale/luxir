@@ -630,7 +630,9 @@ private:
   void finishUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
     bool doneWithMessage = true;
-    if (msg.commit != UpdateMessage::NO_COMMIT) {
+    // A failed request has no effects, including its commit.  Commit numbers are
+    // taken in initiateCommit, so skipping it leaves the commit sequencer dense.
+    if (msg.commit != UpdateMessage::NO_COMMIT && msg.result.ok()) {
       doneWithMessage = false;
       try {
         initiateCommit(msg);

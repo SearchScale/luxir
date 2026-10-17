@@ -730,7 +730,10 @@ private:
     // batches of one connection decode in parallel.  Submission order (and so
     // updateVersion order) was fixed on the shard before any decoding.
     void handle(IndexWriter& iw) override {
-      if (auto batch = batch_.lock()) batch->decodeDocs();
+      // The in-flight map owns the batch (and req) until done() has run.
+      auto batch = batch_.lock();
+      assert(batch != nullptr);
+      batch->decodeDocs();
       ProtoUpdateMessage::handle(iw);
     }
 
@@ -1720,15 +1723,20 @@ private:
       auto target = session;
       auto guard = pin;
       delete this;
-      completed->await(target->node_, [target, guard](auto result) {
-        net::post(target->stream_.get_executor(), [target, guard, result] {
-          try {
-            std::string out;
-            if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
-            target->respondJson(http::status::ok, std::move(out));
-          } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
-        });
-      }, target->waitCancellation.get_token());
+      // A replica wait watches the socket for a client disconnect, which is
+      // shard work, so the wait starts there (as for a streaming batch).
+      net::post(target->stream_.get_executor(), [target, guard, completed] {
+        if (completed->wait) target->watchWaitDisconnect();
+        completed->await(target->node_, [target, guard](auto result) {
+          net::post(target->stream_.get_executor(), [target, guard, result] {
+            try {
+              std::string out;
+              if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
+              target->respondJson(http::status::ok, std::move(out));
+            } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
+          });
+        }, target->waitCancellation.get_token());
+      });
     }
   };
 
@@ -1777,22 +1785,6 @@ private:
         }
         if (failure) {
           net::post(self->stream_.get_executor(), [self, shardPin, failure = std::move(*failure)] { self->respondError(failure); });
-          return;
-        }
-        // A replica wait watches the socket for a client disconnect, which is
-        // shard work: hop back once for it, then submit from the arena.
-        if (state->proto.commit && state->proto.commit->wait_for_replicas) {
-          net::post(self->stream_.get_executor(), [self, state = std::move(state), tenant, shardPin]() mutable {
-            self->requestId_ = std::string(state->proto.request_id);
-            self->watchWaitDisconnect();
-            try {
-              self->node_.getTaskArena().enqueue([self, slot = UpdateStateSlot{std::move(state)}, tenant, shardPin] {
-                submitBufferedUpdate(self, std::move(slot.state), tenant, shardPin);
-              });
-            } catch (const std::exception& e) {
-              self->respondException(e, ErrorKind::INTERNAL);
-            }
-          });
           return;
         }
         // The decoded request_id names the request in an error response.  This
@@ -2585,6 +2577,15 @@ private:
     return true;
   }
 
+  // The "_name_" meta/control key namespace, shared by extractStreamControl and
+  // the inline-decoding sniff (mayBeStreamControl).
+  static bool isControlKeyShape(std::string_view key) {
+    return key.size() >= 2 && key.front() == '_' && key.back() == '_';
+  }
+  static bool isReservedControlKey(std::string_view key) {
+    return key == "_header_" || key == "_update_" || key == "_end_";
+  }
+
   // A control record is `{}` or a JSON object whose sole field is "_update_" or
   // "_end_".  Sole-underscore-field records with OBJECT payloads are reserved
   // as the meta/control namespace: "_header_" (emitted by format=docs query
@@ -2616,9 +2617,8 @@ private:
       }
       return true;
     }
-    if (entry.first != "_update_" && entry.first != "_end_") {
-      if (entry.first.size() >= 2 && entry.first.front() == '_' && entry.first.back() == '_' &&
-          std::get_if<luxir::api::Map>(&(*entry.second).kind) != nullptr) {
+    if (!isReservedControlKey(entry.first)) {
+      if (isControlKeyShape(entry.first) && std::get_if<luxir::api::Map>(&(*entry.second).kind) != nullptr) {
         err = "unknown control record '" + std::string(entry.first) + "'";
         return false;
       }
@@ -3218,27 +3218,31 @@ private:
     return false;
   }
 
-  // Control records are `{}` or objects whose sole key is "_name_"
-  // (extractStreamControl).  So a record that opens as an object whose first
-  // key plainly does not have that shape is a document and can skip inline
-  // decoding.  Anything else - an underscore-delimited or escaped first key,
-  // an empty object, a non-object or garbage - is decoded inline, which also
-  // keeps the immediate error for input that is not an object at all.
+  // extractStreamControl acts only on `{}` or a sole "_name_" key that is
+  // reserved or carries an object.  So a record that opens as an object whose
+  // first key is not "_name_"-shaped, or is an unreserved "_name_" with a
+  // non-object value, is a document and can skip inline decoding.  Anything
+  // else - including an escaped first key, an empty object, a non-object or
+  // garbage - is decoded inline, which also keeps the immediate error for
+  // input that is not an object at all.
   static bool mayBeStreamControl(std::string_view record) {
-    auto isSpace = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-    std::size_t i = 0;
-    while (i < record.size() && isSpace(record[i])) i++;
+    auto skipSpace = [record](std::size_t i) {
+      while (i < record.size() && (record[i] == ' ' || record[i] == '\t' || record[i] == '\n' || record[i] == '\r')) i++;
+      return i;
+    };
+    std::size_t i = skipSpace(0);
     if (i == record.size() || record[i] != '{') return true;
-    i++;
-    while (i < record.size() && isSpace(record[i])) i++;
+    i = skipSpace(i + 1);
     if (i == record.size() || record[i] != '"') return true;
-    i++;
-    if (i == record.size() || record[i] != '_') return i == record.size() || record[i] == '\\';
-    for (std::size_t j = i + 1; j < record.size(); j++) {
-      if (record[j] == '\\') return true;
-      if (record[j] == '"') return record[j - 1] == '_' && j - 1 > i;
-    }
-    return true;
+    std::size_t end = record.find_first_of("\"\\", i + 1);
+    if (end == std::string_view::npos || record[end] == '\\') return true;
+    std::string_view key = record.substr(i + 1, end - i - 1);
+    if (!isControlKeyShape(key)) return false;
+    if (isReservedControlKey(key)) return true;
+    i = skipSpace(end + 1);
+    if (i == record.size() || record[i] != ':') return true;
+    i = skipSpace(i + 1);
+    return i == record.size() || record[i] == '{';
   }
 
   bool processStreamRecord(std::string_view record) {

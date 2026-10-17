@@ -1598,10 +1598,30 @@ TEST_F(HttpApiTest, ndjsonMalformedRecordInAllOrNoneGroup) {
   EXPECT_EQ((int64_t)0, query.found()) << query.rawResponse();
 }
 
+// The batch that fails to decode does not run the commit an _end_ attached to
+// it: an earlier, uncommitted update stays unpublished.
+TEST_F(HttpApiTest, ndjsonMalformedRecordSkipsItsCommit) {
+  ASSERT_EQ(200, httpRequest(port(), http::verb::post, "/collections/mfc/_update",
+      std::string(R"({"id":"mfc0","title_w":"malformedcommit"})") + "\n", "application/x-ndjson").result_int());
+  std::string body =
+      R"({"id":"mfc1","title_w":"malformedcommit"})" "\n"
+      R"({"id":"mfc2","title_w":})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+  auto update = httpRequest(port(), http::verb::post, "/collections/mfc/_update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find(R"("code":"invalid_json")")) << update.body();
+
+  HttpReq query(port());
+  query.collection("mfc").matchQuery("title_w", "malformedcommit").fields({"id"}).limit(10).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)0, query.found()) << query.rawResponse();
+}
+
 // Control records keep their stream position while documents around them are
 // decoded later and in parallel: each group's ids come back in stream order,
-// and documents whose first key merely starts with '_' or that open with
-// whitespace stay documents.
+// and documents that open with whitespace or with a scalar-valued "_name_"
+// key stay documents.
 TEST_F(HttpApiTest, ndjsonControlRecordsInterleavedWithDeferredDocs) {
   LuxirConfig config;
   config.ingest.stream_batch_docs = 1;
@@ -1613,13 +1633,15 @@ TEST_F(HttpApiTest, ndjsonControlRecordsInterleavedWithDeferredDocs) {
   std::string body;
   std::vector<std::string> expected[2];
   for (int g = 0; g < 2; g++) {
-    body += R"({"_update_":{"request_id":"ig)" + std::to_string(g) + R"(","return_ids":true}})" "\n";
+    body += R"({"_update_":{"request_id":"ig)" + std::to_string(g) +
+            R"(","return_ids":true,"field_map":{"_head_":"title_w"}}})" "\n";
     for (int i = 0; i < 12; i++) {
       std::string id = "ig" + std::to_string(g) + "-" + std::to_string(i);
       expected[g].push_back(id);
       if (i == 5) body += R"({"_header_":{"found":1}})" "\n";
-      body += i % 3 == 0 ? R"( { "id":")" + id + R"(","title_w":"interleaved"})" "\n"
-                         : R"({"id":")" + id + R"(","title_w":"interleaved"})" "\n";
+      if (i % 3 == 0) body += R"( { "id":")" + id + R"(","title_w":"interleaved"})" "\n";
+      else if (i % 3 == 1) body += R"({"_head_":"interleaved","id":")" + id + R"("})" "\n";
+      else body += R"({"id":")" + id + R"(","title_w":"interleaved"})" "\n";
     }
     body += R"({"_end_":{}})" "\n";
   }
