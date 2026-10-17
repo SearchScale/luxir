@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <format>
+#include <optional>
 #include <string_view>
 
 #include "MultiTermQuery.h"
@@ -33,15 +35,22 @@ private:
   automaton::ByteDfaKind classification;
   std::string_view exactOrPrefix;
   DfaScanPlan scanPlan;
+  // The field's long-term policy for a general pattern on a field that can
+  // hold fitted (hashed or truncated) long values, whose discarded bytes the
+  // pattern cannot see; nullopt means no warning applies.
+  std::optional<TermPolicy> fittedPolicy;
 
 public:
+  static constexpr std::string_view FITTED_TERMS_WARNING = "fitted_terms_pattern";
+
   AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
-                 std::string_view exactOrPrefix, DfaScanPlan scanPlan)
+                 std::string_view exactOrPrefix, DfaScanPlan scanPlan,
+                 std::optional<TermPolicy> fittedPolicy = std::nullopt)
       : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
         pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
-        scanPlan(scanPlan) {}
+        scanPlan(scanPlan), fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
@@ -81,6 +90,25 @@ public:
   }
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
+
+protected:
+  // Warn once per request and field when a segment holds possibly fitted
+  // terms the pattern can reach. The reader's cached header flags rule out
+  // nearly every field before the DFA is walked.
+  void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
+    checkedBoostProduct(multiplier, 1.0f);
+    if (!fittedPolicy || context.warnings == nullptr) return;
+    if ((context.topReader.field(field).flagsUnion() & FieldType::MAY_HAVE_FITTED) == 0) return;
+    if (dfa.maxAcceptedLength() < (int32_t)PackedTerm::MIN_FITTED_LEN) return;
+    std::string message = std::format(
+        "pattern on field {} may miss or falsely match values longer than {} bytes ({})",
+        field, PackedTerm::MAX_LEN,
+        *fittedPolicy == TermPolicy::HASH128 ? "stored as prefix+hash" : "stored truncated");
+    for (const auto& warning : *context.warnings) {
+      if (warning.code == FITTED_TERMS_WARNING && warning.message == message) return;
+    }
+    context.warn(FITTED_TERMS_WARNING, message);
+  }
 };
 
 } // namespace luxir

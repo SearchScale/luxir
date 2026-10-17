@@ -419,6 +419,7 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
   SegFieldInfo partitionedInfo = readBodyInfo(partitioned.pool, partitionedSegment);
   ASSERT_TRUE(serialInfo.rangeTableLoc.isNull());
   ASSERT_FALSE(partitionedInfo.rangeTableLoc.isNull());
+  EXPECT_EQ(0, partitionedInfo.flags & FieldType::MAY_HAVE_FITTED);
   ASSERT_EQ(4, checkedOut.load(std::memory_order_relaxed));
 
   InputStream table = partitionedSegment.postingsReader()
@@ -534,6 +535,7 @@ TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
     readers.push_back(&segment.postingsReader());
     liveDocs.push_back(nullptr);
     SegFieldInfo info = readBodyInfo(sources.pool, segment);
+    EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);
     docsWithField += info.docsWithField;
     dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset()
         - info.termsLoc.offset());
@@ -557,6 +559,8 @@ TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;
   EXPECT_FALSE(info.rangeTableLoc.isNull());
+  // Stitching keeps the marker that a range writer saw on its full-width terms.
+  EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);
 }
 
 TEST(TermPartitionMergeTest, DerivedRangeLimitExceedsEight) {
