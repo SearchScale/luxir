@@ -22,15 +22,24 @@ namespace luxir {
 /// even when the wrapper itself is unscored (a filter position, a count, or a
 /// field-sorted ranking), and the filter key is UNCACHEABLE.
 ///
-/// The scorer is a plain exact cursor: next()/advance() skip below-threshold
-/// child matches, so every consumer protocol (pull, window bits, candidate
-/// sweeps) inherits the cut-off through the Scorer defaults. It exposes no
-/// approximation enums, no docs-only or bulk products, and no constant count,
-/// so every count, domain, and ranking route executes it. The child is never
-/// switched into membership mode: verification always needs its score.
+/// The fixed child floor is exact for membership: anything pruned below it
+/// would fail verification anyway. Pull execution owns the child's two-phase
+/// protocol (or delegates its external approximation enums), retaining scores
+/// even during bounded membership fills. Bulk execution filters the child's
+/// scored windows in place; membership never uses a child's docs-only product.
 class MinScoreQuery final : public Query {
   Query* child;
   float minScore;
+
+  static float childFloor(float floor, float minScore, float multiplier,
+                          bool scored) {
+    if (!scored || multiplier == 0.0f) return minScore;
+    float translated = multiplier == 1.0f
+        ? floor
+        : std::nextafter(floor / multiplier,
+                         -std::numeric_limits<float>::infinity());
+    return std::max(translated, minScore);
+  }
 
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
@@ -40,18 +49,20 @@ class MinScoreQuery final : public Query {
     int32_t doc = -1;
     bool scored;
 
+    bool acceptScore() {
+      skipCount(SkipStats::minScoreChecks);
+      float childScore = child->score();
+      // NaN compares false and is excluded.
+      if (!(childScore >= minScore)) return false;
+      current = scored ? childScore * multiplier : 0.0f;
+      return true;
+    }
+
     int32_t accept(int32_t candidate) {
-      while (candidate != PostingsReader::END) {
-        float childScore = child->score();
-        // NaN compares false and is excluded.
-        if (childScore >= minScore) {
-          current = scored ? childScore * multiplier : 0.0f;
-          break;
-        }
-        candidate = child->next();
+      while (candidate != PostingsReader::END && !matches()) {
+        candidate = approximationNext();
       }
-      doc = candidate;
-      return doc;
+      return candidate;
     }
 
     // Matches are a subset of the child's, so its bounds stay valid. The
@@ -69,18 +80,81 @@ class MinScoreQuery final : public Query {
   public:
     Scorer(Query::Scorer* child, float minScore, float multiplier, bool scored)
       : child(child), minScore(minScore), multiplier(multiplier),
-        scored(scored) {}
+        scored(scored) {
+      child->setMinCompetitiveScore(minScore);
+    }
 
-    int32_t next() override { return accept(child->next()); }
+    int32_t next() override { return accept(approximationNext()); }
 
     int32_t advance(int32_t target) override {
       assert(doc < target);
-      return accept(child->advance(target));
+      return accept(approximationAdvance(target));
     }
 
     int32_t docId() override { return doc; }
 
-    float matchCost() override { return child->matchCost(); }
+    int32_t approximationNext() override {
+      return doc = child->approximationNext();
+    }
+
+    int32_t approximationAdvance(int32_t target) override {
+      return doc = child->approximationAdvance(target);
+    }
+
+    int32_t approximationDocId() override { return doc; }
+
+    std::span<DocsPosEnum*> approximationEnums() override {
+      return child->approximationEnums();
+    }
+
+    bool matches() override { return child->matches() && acceptScore(); }
+
+    bool matchesAt(int32_t target) override {
+      doc = target;
+      return child->matchesAt(target) && acceptScore();
+    }
+
+    // Approximate a scalar score evaluation (norm/frequency lookup and score
+    // arithmetic) in addition to the child's verifier.
+    float matchCost() override { return child->matchCost() + 10.0f; }
+
+    [[gnu::cold]] void prepareMembership() override {
+      // Keep the child's scoring state: membership still needs its score.
+    }
+
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      // An exact child approximation still follows its own single-phase rules.
+      if (doc < min) {
+        return min == doc + 1 ? approximationNext() : approximationAdvance(min);
+      }
+      return doc;
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      int32_t candidate = advanceApproximationWindow(min, max);
+      while (candidate < max) {
+        if (matches()) return candidate;
+        candidate = approximationNext();
+      }
+      return candidate;
+    }
+
+    int32_t applyToCandidates(int32_t* docs, float* scores,
+                              int32_t size, bool required) override {
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        int32_t target = docs[i];
+        bool matched = advanceWindow(target, target + 1) == target;
+        if (matched) scores[i] += current;
+        if (required && matched) {
+          docs[write] = target;
+          scores[write++] = scores[i];
+        }
+      }
+      return required ? write : size;
+    }
 
     float score() override { return current; }
 
@@ -89,11 +163,8 @@ class MinScoreQuery final : public Query {
     // below the cut-off it is going to be rejected by anyway.
     void setMinCompetitiveScore(float floor) override {
       if (!scored || multiplier == 0.0f) return;
-      float childFloor = multiplier == 1.0f
-          ? floor
-          : std::nextafter(floor / multiplier,
-                           -std::numeric_limits<float>::infinity());
-      child->setMinCompetitiveScore(std::max(childFloor, minScore));
+      child->setMinCompetitiveScore(
+          childFloor(floor, minScore, multiplier, scored));
     }
 
     float getMaxScore(int32_t upTo) override {
@@ -117,11 +188,92 @@ class MinScoreQuery final : public Query {
     }
   };
 
+  class BulkScorer final : public luxir::BulkScorer {
+    luxir::BulkScorer* child;
+    float minScore;
+    float multiplier;
+    bool scored;
+
+    void compact(ScoreWindow& out) {
+      skipCount(SkipStats::minScoreBulkWindows);
+      if (SkipStats::enabled) SkipStats::minScoreChecks += out.size;
+      int32_t write = 0;
+      for (int32_t i = 0; i < out.size; i++) {
+        float score = out.scores[(size_t)i];
+        // A bulk floor permits pruning, but need not filter individual docs.
+        if (!(score >= minScore)) continue;
+        out.docs[(size_t)write] = out.docs[(size_t)i];
+        out.scores[(size_t)write++] = scored ? score * multiplier : 0.0f;
+      }
+      out.size = write;
+    }
+
+  public:
+    BulkScorer(luxir::BulkScorer* child, float minScore, float multiplier,
+               bool scored)
+      : child(child), minScore(minScore), multiplier(multiplier),
+        scored(scored) {}
+
+    void setTopKDepth(int32_t topK, bool allowPruning) override {
+      unused(allowPruning);
+      // The fixed floor licenses pruning even for exact counts. Fresh
+      // membership products get no depth call; child scored-window defaults
+      // already honor the floor (conjunction competitivePruning starts true).
+      child->setTopKDepth(topK, true);
+    }
+
+    [[gnu::cold]] void prepareMembership() override {
+      // Membership continues consuming scored child windows.
+    }
+
+    bool supportsMatchWindows() const override { return true; }
+
+    bool attachWindowFilter(WindowFilter* filter) override {
+      return child->attachWindowFilter(filter);
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max, float theta) override {
+      int32_t next = child->scoreNextWindow(
+          out, filter, min, max,
+          childFloor(theta, minScore, multiplier, scored));
+      compact(out);
+      return next;
+    }
+
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
+      int32_t next = child->scoreNextWindow(out, filter, min, max, minScore);
+      compact(out);
+      return next;
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      ScoreWindow out;
+      int32_t next = matchNextWindow(out, filter, min, max);
+      count += out.size;
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+        domainOut->addSorted(out.docs.first((size_t)out.size));
+      }
+      return next;
+    }
+  };
+
   class Supplier final : public Query::ScorerSupplier {
+    MemPool& pool;
     Query::ScorerSupplier* childSupplier;
     float minScore;
     float multiplier;
     bool scored;
+
+    struct BulkState : BulkBuildState {
+      BulkPlan childPlan;
+
+      BulkState(Supplier* supplier, const BulkPlan& childPlan)
+        : BulkBuildState{supplier}, childPlan(childPlan) {}
+    };
 
     class Plan final : public Query::ScorerPlan {
       Query::ScorerPlan* childPlan;
@@ -147,9 +299,9 @@ class MinScoreQuery final : public Query {
     };
 
   public:
-    Supplier(Query::ScorerSupplier* childSupplier, float minScore,
+    Supplier(MemPool& pool, Query::ScorerSupplier* childSupplier, float minScore,
              float multiplier, bool scored)
-      : childSupplier(childSupplier), minScore(minScore),
+      : pool(pool), childSupplier(childSupplier), minScore(minScore),
         multiplier(multiplier), scored(scored) {}
 
     int64_t cost() override { return childSupplier->cost(); }
@@ -160,7 +312,7 @@ class MinScoreQuery final : public Query {
       return {
         .matchState = child.matchState,
         .directKind = Query::DirectScorerKind::OTHER,
-        .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+        .reportedTwoPhase = Query::ReportedTwoPhase::YES,
         .windowFillClause = Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
         .termConjunctionClause = Query::ClauseShape::NONE,
@@ -194,7 +346,7 @@ class MinScoreQuery final : public Query {
     Query::ScorerPlan* resolve(
         MemPool& planPool,
         const Query::PlanContext& planContext) override {
-      // The child is always consumed through exact scored pull iteration.
+      // The child retains scoring even when our consumer requests membership.
       Query::PlanContext childContext = planContext;
       childContext.demand.horizon = Query::ExecutionUse::PULL;
       Query::ScorerPlan* childPlan =
@@ -203,6 +355,48 @@ class MinScoreQuery final : public Query {
       return planPool.make<Plan>(
           planContext, describeScorer(planContext), childPlan->cost(),
           childPlan, minScore, multiplier, scored);
+    }
+
+    BulkPlan planBulk(
+        BulkUse use, const BulkScorerContext& bulkContext) override {
+      if (bulkContext.requireConstantCount
+          || (use != BulkUse::SCORED_WINDOWS
+              && use != BulkUse::MATCH_WINDOWS
+              && use != BulkUse::COUNT_WINDOWS)) return {};
+      BulkPlan childPlan = childSupplier->planBulk(
+          BulkUse::SCORED_WINDOWS, bulkContext);
+      auto* state = pool.make<BulkState>(this, childPlan);
+      BulkPlan plan;
+      plan.buildState = state;
+      if (childPlan.available == BulkAnswer::YES
+          && !childPlan.hasConstantCount()) {
+        plan.available = BulkAnswer::YES;
+        plan.supportsMatchWindows = BulkAnswer::YES;
+        plan.consumesFilters = childPlan.consumesFilters;
+        plan.acceptsWindowFilter = childPlan.acceptsWindowFilter;
+      }
+      return plan;
+    }
+
+    void recordBulkPlanCommitment(
+        BulkUse use, const BulkScorerContext& bulkContext,
+        const BulkPlan& plan) override {
+      unused(use);
+      if (plan.buildState == nullptr) return;
+      assert(plan.buildState->owner == this);
+      const auto& state = *static_cast<const BulkState*>(plan.buildState);
+      childSupplier->recordBulkPlanCommitment(
+          BulkUse::SCORED_WINDOWS, bulkContext, state.childPlan);
+    }
+
+    luxir::BulkScorer* buildBulk(
+        MemPool& targetPool, const BulkPlan& plan) override {
+      assert(plan.available == BulkAnswer::YES
+             && plan.buildState != nullptr && plan.buildState->owner == this);
+      const auto& state = *static_cast<const BulkState*>(plan.buildState);
+      auto* child = childSupplier->buildBulk(targetPool, state.childPlan);
+      if (child == nullptr) return nullptr;
+      return targetPool.make<BulkScorer>(child, minScore, multiplier, scored);
     }
   };
 
@@ -213,7 +407,7 @@ class MinScoreQuery final : public Query {
     Query::ScorerSupplier* childSupplier =
         childSource.scorerSupplier(targetPool, segment, executionMode);
     if (childSupplier == nullptr) return nullptr;
-    return targetPool.make<Supplier>(childSupplier, minScore, multiplier,
+    return targetPool.make<Supplier>(targetPool, childSupplier, minScore, multiplier,
                                      scored);
   }
 
@@ -323,7 +517,8 @@ public:
       : Query::Weight(context, query, flags), minScore(query.minScore),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0) {
       childWeight = query.child->createWeight(
-          context, flags | NEED_SCORES, 1.0f);
+          context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
+          1.0f);
       // Only the prepare requirement carries over: match-all, constant
       // counts, and count/top-k composition all describe the child's
       // unfiltered membership.

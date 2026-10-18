@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <bit>
 #include <format>
 #include <limits>
 #include <type_traits>
@@ -10,7 +11,13 @@
 
 #include <gtest/gtest.h>
 
+#include "luxir/query/MinScoreQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/RescoreQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/Collector.h"
 #include "luxir/server/JsonRequest.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -376,4 +383,355 @@ TEST_F(MinScoreTest, jsonAndWireKnnSimilarity) {
   v.commit();
   checkJsonAndWire(v.getSearchEngine(), R"json({"query":{"knn":{"field":"embedding_v","query":[0,0],
     "k":4,"unit":"docs","similarity":1.5}},"fields":["id"],"limit":-1})json", {"v0", "v1"});
+}
+
+TEST_F(MinScoreTest, bulkTopKCountAndDomain) {
+  CollectionHelper h;
+  constexpr int32_t nDocs = 8192;
+  const char* bodies[] = {"alpha pad pad pad", "beta beta pad pad",
+                         "alpha beta pad pad", "alpha alpha alpha beta"};
+  for (int32_t i = 0; i < nDocs; i++) {
+    h.index(flatdoc("id", std::to_string(i), "body_w", bodies[i % 4],
+                    "pop_i", (int64_t)i, "tag_s", i % 3 == 0 ? "x" : "y"));
+  }
+  h.commit();
+
+  auto run = [&](std::optional<float> floor, int32_t limit, bool exact,
+                  bool filtered, bool domain = false) {
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q")
+        .fields({"id"}).getScores().getNumber(exact)
+        .limit(limit < 0 ? nDocs : limit).batchSize(nDocs);
+    cur.rawQuery() = qb::boolean(cur.mr(), {}, {
+        qb::match(cur.mr(), "body_w", "alpha"),
+        qb::match(cur.mr(), "body_w", "beta")});
+    if (floor) cur.minScore(*floor);
+    if (filtered) cur.matchFilter("tag_s", "x");
+    if (domain) cur.sum("s", "pop_i");
+    req->execute(1);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  auto results = [](const LocalReq& req) {
+    std::pair<std::vector<std::string>, std::vector<float>> out;
+    // Emission can split even an explicitly large batch into responses.
+    for (auto* response : req.responses) {
+      const auto* docs = response->proto.ops.at("q")->docList();
+      const auto* ids = docs->columns.find("id");
+      if (ids == nullptr) continue;
+      for (auto id : std::get<api::ColStr>(ids->kind).v) out.first.emplace_back(id);
+      const auto& scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+      out.second.insert(out.second.end(), scores.begin(), scores.end());
+    }
+    return out;
+  };
+
+  SkipStatsScope stats;
+  for (bool filtered : {false, true}) {
+    SCOPED_TRACE(filtered);
+    SkipStats::reset();
+    auto all = run(std::nullopt, -1, true, filtered);
+    ASSERT_OK(all);
+    EXPECT_GT(SkipStats::maxScoreInnerWindows, 0);
+    auto [allIds, allScores] = results(*all);
+    ASSERT_EQ(filtered ? (nDocs + 2) / 3 : nDocs, allScores.size());
+    // Include the entire tied score group at the boundary, then exclude it.
+    for (float floor : {allScores[allScores.size() / 2], std::nextafter(
+             allScores[allScores.size() / 2], std::numeric_limits<float>::infinity())}) {
+      std::vector<std::string> expectedIds;
+      std::vector<float> expectedScores;
+      int64_t expectedSum = 0;
+      for (size_t i = 0; i < allScores.size(); i++) {
+        if (allScores[i] < floor) continue;
+        expectedIds.push_back(allIds[i]);
+        expectedScores.push_back(allScores[i]);
+        expectedSum += std::stoll(allIds[i]);
+      }
+      ASSERT_FALSE(expectedIds.empty());
+      ASSERT_LT(expectedIds.size(), allIds.size());
+      for (auto [limit, exact] : {std::pair{-1, true}, {17, false},
+                                  {17, true}, {0, true}}) {
+        SCOPED_TRACE(std::format("floor={} limit={} exact={}", floor, limit, exact));
+        SkipStats::reset();
+        auto cut = run(floor, limit, exact, filtered, limit == 0);
+        ASSERT_OK(cut);
+        // Filtered count-only uses the root's exhaustive conjunction.
+        if (!filtered || limit != 0) {
+          EXPECT_GT(SkipStats::minScoreBulkWindows, 0);
+        }
+        if (exact) {
+          EXPECT_EQ(expectedIds.size(), cut->getMatchCount());
+        }
+        size_t size = limit < 0 ? expectedIds.size()
+            : std::min((size_t)limit, expectedIds.size());
+        auto [actualIds, actualScores] = results(*cut);
+        EXPECT_EQ(std::vector<std::string>(expectedIds.begin(), expectedIds.begin() + size),
+                  actualIds);
+        if (limit != 0) {
+          ASSERT_EQ(size, actualScores.size());
+          for (size_t i = 0; i < size; i++) {
+            EXPECT_EQ(std::bit_cast<uint32_t>(expectedScores[i]),
+                      std::bit_cast<uint32_t>(actualScores[i])) << i;
+          }
+        } else {
+          EXPECT_EQ((double)expectedSum, sumPop(*cut));
+          if (!filtered) {
+            EXPECT_GT(SkipStats::bulkDomainWindowsFed, 0);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(MinScoreTest, selectiveConjunctionAndProhibitionBoundVerification) {
+  CollectionHelper h;
+  constexpr int32_t nDocs = 4096;
+  int32_t candidates = 0;
+  std::vector<std::string> accepted;
+  std::vector<std::string> rejected;
+  for (int32_t i = 0; i < nDocs; i++) {
+    auto doc = flatdoc("id", std::to_string(i), "body_w", "alpha");
+    if (i % 257 == 0) {
+      candidates++;
+      doc.push_back({"tag_s", "rare"});
+      doc.push_back({"pop_i", (int64_t)(i % 4)});
+      (i % 4 >= 2 ? accepted : rejected).push_back(std::to_string(i));
+    }
+    // Scoring any non-candidate throws: the expression is missing there.
+    h.index(doc);
+  }
+  h.commit();
+
+  for (bool prohibited : {false, true}) {
+    SkipStatsScope stats;
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q")
+        .fields({"id"}).getNumber().limit(-1);
+    auto cutoff = exprQuery(cur.mr(),
+        "rescore(body_w:alpha, pop_i, min_score=2)");
+    auto rare = qb::match(cur.mr(), "tag_s", "rare");
+    cur.rawQuery() = prohibited
+        ? qb::boolean(cur.mr(), {rare}, {}, {cutoff})
+        : qb::boolean(cur.mr(), {rare, cutoff});
+    req->execute(1);
+    ASSERT_OK(req);
+    auto actual = ids(*req);
+    auto expected = prohibited ? rejected : accepted;
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(expected.size(), req->getMatchCount());
+    EXPECT_GT(SkipStats::minScoreChecks, 0);
+    EXPECT_LE(SkipStats::minScoreChecks, 2 * candidates);
+  }
+}
+
+TEST_F(MinScoreTest, boundedScorerProtocolsKeepChildScores) {
+  CollectionHelper h;
+  for (int32_t i = 0; i < 6; i++) {
+    auto doc = flatdoc("body_w", "alpha beta");
+    if (i % 2 == 0) doc.push_back({"pop_i", (int64_t)i});
+    h.index(doc);
+  }
+  h.commit();
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = h.collection().getSchema();
+  google::protobuf::Arena arena;
+  auto* program = ValueExprParser({schema.get(), {}}, arena).parse("def(pop_i, 0)");
+  std::string_view terms[] = {"alpha", "beta"};
+  int32_t positions[] = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  RescoreQuery rescore(&phrase, program);
+  MinScoreQuery query(&rescore, 2.0f);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES, 0.5f);
+  auto fresh = [&] { return weight->createScorer(pool, reader->segments()[0]); };
+  {
+    auto* scorer = fresh();
+    SkipStatsScope stats;
+    auto enums = scorer->approximationEnums();
+    ASSERT_FALSE(enums.empty());
+    for (int32_t doc : {0, 2, 4}) {
+      for (auto* e : enums) EXPECT_EQ(doc, e->advance(doc));
+      EXPECT_EQ(doc >= 2, scorer->matchesAt(doc));
+      if (doc >= 2) {
+        EXPECT_EQ(doc, scorer->docId());
+        EXPECT_EQ((float)doc * 0.5f, scorer->score());
+      }
+    }
+    EXPECT_EQ(3, SkipStats::minScoreChecks);
+  }
+  for (bool required : {false, true}) {
+    auto* scorer = fresh();
+    SkipStatsScope stats;
+    scorer->prepareMembership();
+    int32_t docs[] = {0, 2, 4};
+    float scores[] = {7, 7, 7};
+    EXPECT_EQ(required ? 2 : 3,
+              scorer->applyToCandidates(docs, scores, 3, required));
+    if (required) {
+      EXPECT_EQ(2, docs[0]); EXPECT_EQ(4, docs[1]);
+      EXPECT_EQ(8.0f, scores[0]); EXPECT_EQ(9.0f, scores[1]);
+    } else {
+      EXPECT_EQ(0, docs[0]); EXPECT_EQ(2, docs[1]); EXPECT_EQ(4, docs[2]);
+      EXPECT_EQ(7.0f, scores[0]); EXPECT_EQ(8.0f, scores[1]); EXPECT_EQ(9.0f, scores[2]);
+    }
+    EXPECT_EQ(3, SkipStats::minScoreChecks);
+  }
+  {
+    auto* scorer = fresh();
+    SkipStatsScope stats;
+    scorer->prepareMembership();
+    EXPECT_EQ(0, scorer->advanceApproximationWindow(0, 1));
+    EXPECT_EQ(0, SkipStats::minScoreChecks);
+    EXPECT_GE(scorer->advanceWindow(0, 1), 1);
+    EXPECT_EQ(1, SkipStats::minScoreChecks);
+    uint64_t words[] = {0};
+    scorer->fillWindowBits(words, 2, 3);
+    EXPECT_EQ(1u, words[0]);
+    EXPECT_EQ(2, SkipStats::minScoreChecks);
+    EXPECT_GE(scorer->advanceWindow(3, 4), 4);
+    EXPECT_EQ(3, SkipStats::minScoreChecks);
+  }
+  {
+    auto* scorer = fresh();
+    EXPECT_EQ(2, scorer->next());
+    int32_t docs[1]; float scores[1];
+    EXPECT_EQ(1, scorer->fillScoreBlock(docs, scores, 1, 3));
+    EXPECT_EQ(2, docs[0]); EXPECT_EQ(1.0f, scores[0]);
+    EXPECT_EQ(4, scorer->docId());
+    EXPECT_EQ(2.0f, scorer->score());
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+  {
+    auto* scorer = fresh();
+    uint64_t words[] = {0};
+    scorer->fillScoredWindowBits(words, 0, 3);
+    EXPECT_EQ(1u << 2, words[0]);
+    EXPECT_EQ(4, scorer->docId());
+    EXPECT_EQ(2.0f, scorer->score());
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+}
+
+TEST_F(MinScoreTest, bulkPlansAndScoreScalingMatchPull) {
+  CollectionHelper h;
+  for (int32_t i = 0; i < 256; i++) {
+    h.index(flatdoc("body_w", i % 2 ? "alpha alpha" : "alpha pad"));
+  }
+  h.commit();
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+  TermQuery term("body_w", "alpha");
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* childWeight = term.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  auto* child = childWeight->createScorer(pool, segment);
+  ASSERT_EQ(0, child->next());
+  MinScoreQuery query(&term, child->score());
+  ASSERT_EQ(1, child->next());
+  float highScore = child->score();
+  using Use = Query::ExecutionUse;
+  using Answer = Query::ScorerSupplier::BulkAnswer;
+  auto childPlan = childWeight->scorerSupplier(pool, segment)->planBulk(Use::SCORED_WINDOWS, {});
+  for (bool scored : {false, true}) {
+    for (float multiplier : {0.0f, 0.37f, 2.0f}) {
+      auto* supplier = query.createWeight(
+          context, scored ? Query::NEED_SCORES : 0, multiplier)
+          ->scorerSupplier(pool, segment);
+      EXPECT_EQ(Answer::NO, supplier->planBulk(
+          Use::EXACT_CANDIDATE_SCORING, {}).available);
+      Query::ScorerSupplier::BulkScorerContext countContext;
+      countContext.requireConstantCount = true;
+      EXPECT_EQ(Answer::NO, supplier->planBulk(
+          Use::COUNT_WINDOWS, countContext).available);
+      for (Use use : {Use::SCORED_WINDOWS, Use::MATCH_WINDOWS, Use::COUNT_WINDOWS}) {
+        auto plan = supplier->planBulk(use, {});
+        ASSERT_EQ(Answer::YES, plan.available);
+        EXPECT_EQ(Answer::YES, plan.supportsMatchWindows);
+        EXPECT_EQ(Answer::NO, plan.supportsExactCandidateScoring);
+        EXPECT_EQ(childPlan.acceptsWindowFilter, plan.acceptsWindowFilter);
+        EXPECT_EQ(Answer::NO, plan.supportsReposition());
+        EXPECT_EQ(-1, plan.constantCount);
+        auto* bulk = supplier->buildBulk(pool, plan);
+        ASSERT_NE(nullptr, bulk);
+        auto* pull = supplier->resolve(pool, supplier->makePlanContext(
+            Query::Demand::fromLeadCost(segment.maxDoc())))->build(pool);
+        ASSERT_NE(nullptr, pull);
+        if (use != Use::SCORED_WINDOWS) {
+          bulk->prepareMembership();
+          pull->prepareMembership();
+        }
+        if (use == Use::COUNT_WINDOWS) {
+          EXPECT_EQ(256, countMatchesWindowed(
+              bulk, nullptr, nullptr, segment.maxDoc()));
+          continue;
+        }
+        // Small bounded ranges exercise continuation after a bounded END.
+        for (int32_t min = 0; min < segment.maxDoc();) {
+          int32_t max = std::min(min + 7, segment.maxDoc());
+          ScoreWindow out;
+          int32_t next = use == Use::MATCH_WINDOWS
+              ? bulk->matchNextWindow(out, nullptr, min, max)
+              : bulk->scoreNextWindow(out, nullptr, min, max,
+                                      std::numeric_limits<float>::lowest());
+          for (int32_t i = 0; i < out.size; i++) {
+            EXPECT_EQ(pull->next(), out.docs[(size_t)i]);
+            EXPECT_EQ(std::bit_cast<uint32_t>(pull->score()),
+                      std::bit_cast<uint32_t>(out.scores[(size_t)i]));
+          }
+          min = std::min(next, max);
+        }
+        EXPECT_EQ(PostingsReader::END, pull->next());
+        if (use == Use::SCORED_WINDOWS && scored && multiplier != 0.0f) {
+          auto* competitive = supplier->buildBulk(pool, supplier->planBulk(use, {}));
+          competitive->setTopKDepth(1, true);
+          float theta = highScore * multiplier;
+          int32_t count = 0;
+          for (int32_t min = 0; min < segment.maxDoc();) {
+            ScoreWindow out;
+            min = competitive->scoreNextWindow(out, nullptr, min, segment.maxDoc(), theta);
+            count += out.size;
+            for (int32_t i = 0; i < out.size; i++) {
+              EXPECT_EQ(1, out.docs[(size_t)i] % 2);
+              EXPECT_EQ(std::bit_cast<uint32_t>(theta),
+                        std::bit_cast<uint32_t>(out.scores[(size_t)i]));
+            }
+          }
+          EXPECT_EQ(128, count);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(MinScoreTest, unreachableTermFloorSkipsImpactsForCount) {
+  CollectionHelper h;
+  constexpr int32_t nDocs = 8192;
+  for (int32_t i = 0; i < nDocs; i++) h.index(flatdoc("body_w", "alpha pad"));
+  h.commit();
+  SkipStatsScope stats;
+  // Check constructor seeding independently of the bulk adapter's floor.
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery term("body_w", "alpha");
+  MinScoreQuery query(&term, 100000.0f);
+  auto* scorer = query.createWeight(context, 0)->createScorer(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_EQ(PostingsReader::END, scorer->next());
+  EXPECT_GT(SkipStats::impactCompetitiveColdLookups, 0);
+  EXPECT_LT(SkipStats::minScoreChecks, nDocs / 100);
+  SkipStats::reset();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("body_w", "alpha")
+      .minScore(100000.0f).getNumber().limit(0);
+  req->execute(1);
+  ASSERT_OK(req);
+  EXPECT_EQ(0, req->getMatchCount());
+  EXPECT_GT(SkipStats::impactCompetitiveColdLookups, 0);
+  EXPECT_LT(SkipStats::docBlocksDecoded, nDocs / Postings::DOCS_BLOCK_SIZE / 4);
+  EXPECT_LT(SkipStats::minScoreChecks, nDocs / 100);
 }
