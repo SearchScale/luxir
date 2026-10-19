@@ -253,6 +253,8 @@ POST /collections/main/_schema?mode=replace_all
 ```
 
 The reserved `id` and `_version_` fields are added automatically if omitted.
+`_version_` is valid in the schema, but its values are assigned by the engine;
+setting it in document input is rejected. Optimistic concurrency is not supported.
 Omitting templates removes them, leaving a schema with only explicit fields.
 To edit the existing schema, start from `GET` output. Each successful
 publication advances the schema generation.

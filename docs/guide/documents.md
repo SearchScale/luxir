@@ -178,8 +178,11 @@ are known to be new and unique, see
 
 An ID is not required. A document with an absent or null ID can be searched,
 but it cannot be overwritten or deleted by ID and has no useful external
-identity.  `_version_` is reserved for internal overwrite ordering and is not
-an application field.
+identity.
+
+`_version_` is assigned by the engine for internal overwrite ordering.
+Documents that supply it, directly or through field mapping, are rejected
+with a document error. Optimistic concurrency is not supported.
 
 ## Multi-valued fields
 

@@ -3583,19 +3583,19 @@ TEST_F(HttpApiTest, docsFormatErrorBeforeFlushIsHttpError) {
 
 // Object-valued sole-underscore-field records are the reserved meta/control
 // namespace in streaming ingest: unknown names are an error, never indexed as
-// documents.  Scalar-valued ones stay documents ({"_version_":42} is a
-// legitimate one-field export; every real control carries an object).
+// documents. Scalar-valued ones stay documents and undergo document validation.
 TEST_F(HttpApiTest, ndjsonUnknownUnderscoreRecordIs400) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
       std::string(R"({"_bogus_":{"x":1}})") + "\n", "application/x-ndjson");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("_bogus_")) << res.body();
 
-  // Scalar payload: classified as a document, not an unknown control (it may
-  // still fail schema-level checks, but never as a control record).
+  // Scalar payload: a document error for an engine field, not an unknown control.
   auto scalar = httpRequest(port(), http::verb::post, "/collections/main/_update",
       std::string(R"({"_version_":42})") + "\n", "application/x-ndjson");
   EXPECT_EQ(std::string::npos, scalar.body().find("unknown control record")) << scalar.body();
+  EXPECT_NE(std::string::npos, scalar.body().find("assigned by the engine")) << scalar.body();
+  EXPECT_NE(std::string::npos, scalar.body().find("optimistic concurrency is not supported")) << scalar.body();
 
   // _header_ itself must carry an object.
   auto malformed = httpRequest(port(), http::verb::post, "/collections/main/_update",

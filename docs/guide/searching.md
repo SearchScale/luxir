@@ -1052,6 +1052,11 @@ header markers to name the following operation. The output pipes directly into
 the [NDJSON update endpoint](indexing.md#unbounded-ndjson-ingest), which
 recognizes and skips header lines.
 
+For re-import, omit `_version_` from the projection or remove it from the
+exported documents. It is returned only when explicitly named and is rejected
+as document input; the engine assigns it and does not support optimistic
+concurrency.
+
 A clean HTTP chunk terminator means the result set completed; a failure after
 output began aborts the chunked body so a conforming client sees truncation
 rather than a plausible partial success.

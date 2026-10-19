@@ -96,6 +96,36 @@ TEST_F(UpdateErrorTest, partialFailureMarksDocDeleted) {
   EXPECT_EQ(0u, matchDocs(helper, "zzzbadcontent").size());
 }
 
+TEST_F(UpdateErrorTest, engineVersionInputIsRejected) {
+  CollectionHelper helper;
+  for (bool mapped : {false, true}) {
+    CollectionHelper::UpdateBuilder b;
+    b.add(flatdoc("id", "bad", mapped ? "client_version" : "_version_", (int64_t)42))
+        .overwrite().commit();
+    if (mapped) b.fieldMap({{"client_version", "_version_"}});
+    auto result = helper.submit(b);
+    EXPECT_FALSE(result.success);
+    ASSERT_EQ(1u, result.errors.size());
+    EXPECT_EQ("Field '_version_' is assigned by the engine; optimistic concurrency is not supported",
+              result.errors[0].error_message);
+    EXPECT_TRUE(allDocs(helper).empty());
+  }
+}
+
+TEST_F(UpdateErrorTest, engineVersionInputRollsBackAllOrNone) {
+  CollectionHelper helper;
+  Doc docs[] = {flatdoc("id", "before"),
+                flatdoc("id", "bad", "_version_", (int64_t)42),
+                flatdoc("id", "after")};
+  SubmitOpts opts;
+  opts.allOrNone = true;
+  auto result = submitDocs(helper, docs, opts);
+  EXPECT_FALSE(result.success);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ(1, result.errors[0].index);
+  EXPECT_TRUE(allDocs(helper).empty());
+}
+
 
 TEST_F(UpdateErrorTest, failedOverwriteKeepsOldVersion) {
   CollectionHelper helper("main");

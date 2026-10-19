@@ -2713,11 +2713,10 @@ private:
   // A control record is `{}` or a JSON object whose sole field is "_update_" or
   // "_end_".  Sole-underscore-field records with OBJECT payloads are reserved
   // as the meta/control namespace: "_header_" (emitted by format=docs query
-  // responses, so exported output pipes straight back into /update) is a
-  // recognized no-op, and any other object-valued _name_ is an error rather
-  // than silently indexed as a document (a control-record typo must not become
-  // data).  Scalar-valued sole-underscore fields stay documents - {"_version_":42}
-  // is a legitimate one-field export, and every real control carries an object.
+  // responses) is a recognized no-op, and any other object-valued _name_ is an
+  // error rather than silently indexed as a document (a control-record typo
+  // must not become data). Scalar-valued sole-underscore fields stay documents:
+  // {"_version_":42} reaches document validation, which rejects engine fields.
   // The control payload is decoded as a full UpdateRequest through the canonical JSON
   // codec so the streaming path accepts the same fields as buffered /update.
   static bool extractStreamControl(const luxir::api::Map& map, HttpStreamControl& control,
