@@ -23,6 +23,17 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
 }
 
+void SearchRequest::replyCallback(SearchResponse& response) {
+  bool last = response.last;
+  // if this response used a different Arena, release it.
+  if (&response.arena != &arena) {
+    releaseArena(&response.arena);
+  }
+  if (last) {
+    done();
+  }
+}
+
 void SearchRequest::warnOnce(std::string_view code, std::string_view message) {
   std::lock_guard<std::mutex> lock(mutex);
   for (const api::Warning& warning : warnings) {

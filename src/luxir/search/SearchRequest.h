@@ -286,17 +286,6 @@ public:
 };
 
 
-inline void SearchRequest::replyCallback(SearchResponse& response) {
-  bool last = response.last;
-  // if this response used a different Arena, release it.
-  if (&response.arena != &arena) {
-    releaseArena(&response.arena);
-  }
-  if (last) {
-    done();
-  }
-};
-
 inline void SearchRequest::fillExecutionProfile(SearchResponse& response) {
   if (!proto.profile) return;
 
