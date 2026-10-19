@@ -204,8 +204,12 @@ The negative filter excludes the slow vector families. For a quick path/code
 coverage pass over the small unit-test corpus, use:
 
 ```bash
-./build/gcc-debug/bin/luxir_test --gtest_filter='Benchmarks.all'
+./build/gcc-release/bin/luxir_test --gtest_filter='Benchmarks.all'
 ```
+
+Debug builds, including ASan, leave the benchmarks out of `luxir_test` to keep
+the edit-build-test loop short. Configure with `-DLUXIR_TEST_BENCHMARKS=ON` to
+include them.
 
 Test runs default to `--effort=1`. Scalable fuzz loops and benchmark unit
 corpora can derive linear work with `LuxirTest::scaleTestWork()` or scale each

@@ -9,7 +9,23 @@ find_package(benchmark REQUIRED)
 file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 list(FILTER Test_SOURCES EXCLUDE REGEX "/allocation_tests/")
 
+# The benchmarks (bench/) are about a tenth of the test build. Debug builds
+# serve edit-build-test and the ASan gate, so they leave them out unless asked;
+# optimized builds keep luxir_test --bench.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(_luxir_bench_default OFF)
+else()
+  set(_luxir_bench_default ON)
+endif()
+option(LUXIR_TEST_BENCHMARKS "Compile the benchmarks (test/bench) into luxir_test"
+       ${_luxir_bench_default})
+if(NOT LUXIR_TEST_BENCHMARKS)
+  list(FILTER Test_SOURCES EXCLUDE REGEX "/bench/[^/]*\\.cpp$")
+endif()
+
 add_executable(luxir_test ${Test_SOURCES})
+set_source_files_properties(test/LuxirTest.cpp PROPERTIES
+  COMPILE_DEFINITIONS "LUXIR_TEST_BENCHMARKS=$<BOOL:${LUXIR_TEST_BENCHMARKS}>")
 target_include_directories(luxir_test PRIVATE .)
 target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest)
 # HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via luxir_lib) and
