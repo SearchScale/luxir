@@ -18,6 +18,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 
 namespace fs = std::filesystem;
 

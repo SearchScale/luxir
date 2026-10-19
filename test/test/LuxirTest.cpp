@@ -16,6 +16,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/luxir_main.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "benchmark/benchmark.h"
 
 

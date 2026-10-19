@@ -24,6 +24,7 @@
 #include <future>
 #include <deque>
 #include <unistd.h>
+#include <CLI/CLI.hpp>
 
 namespace luxir::test {
 using namespace std::chrono_literals;
