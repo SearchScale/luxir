@@ -319,3 +319,47 @@ TEST_F(UpdateErrorTest, crossRequestDuplicateOverwrite) {
   EXPECT_EQ(1u, matchDocs(helper, "second").size());
   EXPECT_EQ(0u, matchDocs(helper, "first").size());
 }
+
+TEST_F(UpdateErrorTest, rollbackRestoresLocalOccupantAndWatermark) {
+  for (bool allOrNone : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto original = helper.index(flatdoc("id", "x", "text_w", "original"), UpdateMessage::NO_COMMIT, true);
+    ASSERT_TRUE(original.success);
+    CollectionHelper::UpdateBuilder request;
+    if (allOrNone) {
+      request.remove("x").add(flatdoc("id", "x", "text_w", "changed"))
+          .add(flatdoc("id", "bad", BAD_FIELD, "fail")).allOrNone();
+    } else {
+      request.add(flatdoc("id", "x", "text_w", "changed", "int_i", "invalid"));
+    }
+    request.overwrite();
+    EXPECT_FALSE(helper.submit(request).success);
+    auto& inverter = iw->obtainInverter();
+    iw->releaseInverter(inverter, true);
+    iw->updateGraph->wait_for_all();
+    ASSERT_EQ(1, iw->pendingDeletes.size());
+    const auto& packet = **iw->pendingDeletes.deletes.begin();
+    ASSERT_EQ(1, packet.lists().size());
+    ASSERT_EQ(1, packet.lists()[0].size());
+    EXPECT_EQ(original.updateVersion, packet.lists()[0][0].val().deleteWatermark);
+    helper.commit();
+    EXPECT_EQ(1, allDocs(helper).size());
+    EXPECT_EQ(1, matchDocs(helper, "original").size());
+    EXPECT_TRUE(matchDocs(helper, "changed").empty());
+  }
+}
+
+TEST_F(UpdateErrorTest, deleteAndRepeatedOverwriteInOneRequestKeepLastDocument) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "old"), UpdateMessage::NO_COMMIT, true).success);
+  CollectionHelper::UpdateBuilder request;
+  request.remove("x").add(flatdoc("id", "x", "text_w", "first"))
+      .add(flatdoc("id", "x", "text_w", "last")).overwrite().commit();
+  ASSERT_TRUE(helper.submit(request).success);
+  EXPECT_EQ(1, allDocs(helper).size());
+  EXPECT_EQ(1, matchDocs(helper, "last").size());
+  EXPECT_TRUE(matchDocs(helper, "first").empty());
+  EXPECT_TRUE(matchDocs(helper, "old").empty());
+}

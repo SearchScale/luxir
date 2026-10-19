@@ -383,7 +383,7 @@ public:
 
   // Rollback support for failed documents / failed all_or_none requests.
   // A mark captures the undo state at a point in time; rollbackTo restores the
-  // id map (termsHash / deleteHash mutations are undone) and un-marks docs
+  // id map (occupancy and watermarks are restored) and un-marks docs
   // deleted after the mark (in-inverter overwrites mark superseded docs deleted;
   // a rolled-back update must resurrect them).  Postings and column data of
   // rolled-back docs stay in the segment; callers mark those docs deleted.

@@ -17,29 +17,28 @@
 namespace luxir {
 
 /// Entry stored in the TermValHash for the id field.
-/// Each unique id maps to exactly one document and its version.
-/// For explicit delete-by-id entries, docId is -1.
+/// Each unique id has an optional local document and a delete watermark.
+/// An unoccupied entry has docId -1; a zero watermark contributes no delete fact.
 LUXIR_UNALIGNED_START
 struct IdEntry {
   int32_t docId;
-  uint64_t version;
+  uint64_t deleteWatermark;
 
-  IdEntry(int32_t docId, uint64_t version) : docId(docId), version(version) {}
+  IdEntry(int32_t docId, uint64_t deleteWatermark) : docId(docId), deleteWatermark(deleteWatermark) {}
 
   friend std::ostream& operator<<(std::ostream& out, const IdEntry& e) {
-    return out << "(doc=" << e.docId << " ver=" << e.version << ")";
+    return out << "(doc=" << e.docId << " watermark=" << e.deleteWatermark << ")";
   }
 } LUXIR_UNALIGNED_END;
 
 
-/// A sorted list of (id, version) pairs for applying deletes to segments.
+/// A sorted list of (id, watermark) pairs for applying deletes to segments.
 ///
 /// Each SortedDeletes owns a MemPool (the id string bytes) and exposes
-/// 1 or 2 sorted spans of entries:
-///   - overwrite list: ids from documents indexed with overwrite=true
-///   - delete-by-id list: explicit delete_ids from the update request
+/// sorted spans of nonzero-watermark entries. An inverter produces one span
+/// combining overwrites and explicit deletes.
 ///
-/// Both lists are sorted by id, enabling efficient k-way merge
+/// Lists are sorted by id, enabling efficient k-way merge
 /// when applying deletes across multiple inverters.
 class SortedDeletes {
 public:
@@ -101,7 +100,7 @@ public:
         if (shown > 0) s += ",";
         s += (std::string_view)e;
         s += ':';
-        s += std::to_string(e.val().version);
+        s += std::to_string(e.val().deleteWatermark);
         shown++;
       }
     }

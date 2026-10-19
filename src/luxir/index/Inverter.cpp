@@ -45,7 +45,7 @@ Inverter::UndoMark Inverter::undoMark() const {
 
 void Inverter::rollbackTo(const UndoMark& mark) {
   if (idHandler_ != nullptr) {
-    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(mark.idUndoSize);
+    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(*this, mark.idUndoSize);
   }
   assert(deleted.size() >= mark.numDeleted);
   deleted.resize(mark.numDeleted);

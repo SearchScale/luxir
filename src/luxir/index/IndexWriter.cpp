@@ -2922,7 +2922,7 @@ struct DeletesCursorGreater {
 };
 
 /// K-way merge of pre-sorted entry spans into a single sorted, deduped vector.
-/// Drops unversioned adds (version==0). Deduplicates by id, keeping highest version.
+/// Drops inert facts (watermark==0). Deduplicates by id, keeping the highest watermark.
 /// If there's only one input span, returns it directly (no allocation).
 SortedDeletes::EntrySpan mergeDeleteSpans(
     std::span<const SortedDeletes::EntrySpan> spans,
@@ -2968,10 +2968,10 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
       pq.updateTop();
     }
 
-    // Drain any duplicates with the same id from other cursors, keeping highest version
+    // Drain any duplicates with the same id from other cursors, keeping the highest watermark.
     while (pq.size() > 0 && (std::string_view)pq.top().current() == (std::string_view)entry) {
       const auto& candidate = pq.top().current();
-      if (candidate.val().version > entry.val().version) entry = candidate;
+      if (candidate.val().deleteWatermark > entry.val().deleteWatermark) entry = candidate;
 
       pq.top().advance();
       if (pq.top().exhausted()) {
@@ -2981,8 +2981,8 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
       }
     }
 
-    // version==0 marks ids indexed without overwrite - not deletes
-    if (entry.val().version > 0) {
+    // A zero watermark is inert.
+    if (entry.val().deleteWatermark > 0) {
       out.push_back(entry);
     }
   }
@@ -3096,8 +3096,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   // for each delete entry.
   // The span is sorted by id, so we use seekForward() to scan the segment's terms
   // in order, avoiding redundant binary searches across blocks.
-  // version==0 entries (non-overwrite adds) are filtered during merge, but can still
-  // appear in the single-span fast path which skips the merge.
+  // Zero watermarks are inert, including in the single-span fast path.
   struct DeleteCandidate {
     int32_t docId;
     uint64_t deleteVersion;
@@ -3105,7 +3104,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   std::vector<DeleteCandidate> candidates;
 
   for (auto& entry : deleteSpan) {
-    uint64_t deleteVersion = entry.val().version;
+    uint64_t deleteVersion = entry.val().deleteWatermark;
     if (deleteVersion == 0) continue;
     std::string_view deleteId = (std::string_view)entry;
 

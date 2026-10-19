@@ -2172,7 +2172,8 @@ TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
   dupReq.collection("main").matchQuery("title_w", "fulldecode").fields({"id"})
       .limit(10).withStats().execute();
   ASSERT_EQ(200, dupReq.status()) << dupReq.rawResponse();
-  EXPECT_EQ((int64_t)2, dupReq.found()) << dupReq.rawResponse();
+  // Local id collisions keep the later document, including with allow_dups.
+  EXPECT_EQ((int64_t)1, dupReq.found()) << dupReq.rawResponse();
 
   HttpReq delReq(port());
   delReq.collection("main").matchQuery("title_w", "deletestream").fields({"id"})

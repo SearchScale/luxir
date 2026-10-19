@@ -155,15 +155,24 @@ TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
 }
 
 TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
-  for (bool overwrite : {false, true}) {
+  for (int shape : {0, 1, 2, 3}) {
+    SCOPED_TRACE(shape); // overwrite-only, delete-only, allow_dups+delete, mixed
     LuxirNode node;
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     auto& budget = node.getIndexRamBudget();
-    ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, false).success);
-    ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT, overwrite).success);
-    ASSERT_TRUE(helper.deleteById("absent").success);
-    auto& inverter = iw->obtainInverter(2);
+    if (shape != 1) {
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, shape == 0).success);
+    }
+    if (shape == 3) {
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT, true).success);
+    }
+    if (shape != 0) {
+      ASSERT_TRUE(helper.deleteById("absent").success);
+    }
+    iw->updateGraph->wait_for_all();
+    ASSERT_EQ(1, iw->idleInverters.size());
+    auto& inverter = iw->obtainInverter(iw->idleInverters.begin()->first->currVersion);
     int64_t packetBytes = (int64_t)inverter.retainedDeleteBytes();
     int64_t before = budget.reservedBytes();
     std::latch started(1), release(1);
@@ -184,7 +193,11 @@ TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
     iw->updateGraph->wait_for_all();
     Signal::unlisten("segmentFlushBody");
     ASSERT_EQ(1, iw->pendingDeletes.size());
-    EXPECT_EQ(packetBytes, (*iw->pendingDeletes.deletes.begin())->memSize());
+    const auto& packet = **iw->pendingDeletes.deletes.begin();
+    ASSERT_EQ(1, packet.lists().size());
+    EXPECT_EQ(shape == 3 ? 2 : 1, packet.lists()[0].size());
+    EXPECT_GT(packet.getSmallestVersion(), 0);
+    EXPECT_EQ(packetBytes, packet.memSize());
     EXPECT_EQ(packetBytes, budget.retainedDeleteBytesCount());
     EXPECT_EQ(packetBytes, budget.reservedBytes());
     EXPECT_EQ(packetBytes, iw->stats(false).retainedDeleteBytes);
@@ -208,7 +221,7 @@ TEST_F(AutoFlushTest, rollbackRetainedDeleteAccounting) {
     CollectionHelper::UpdateBuilder request;
     request.add(flatdoc("id", "new")).add(flatdoc("id", "old"))
         .add(flatdoc("id", "bad", "no_such_field", "fail"))
-        .overwrite(overwrite).allOrNone();
+        .overwrite().allOrNone();
     if (overwrite) request.remove("absent").remove("rolled-back");
     EXPECT_FALSE(helper.submit(request).success);
     auto& inverter = iw->obtainInverter();
@@ -255,8 +268,8 @@ TEST_F(AutoFlushTest, pressureChoosesReliefInsteadOfRetainedDeletes) {
   docs.startDoc();
   text.index(docs, "reclaimable text");
   docs.finishDoc();
-  docs.pool.alloc(16384);
   size_t relief = deletes.memSize() - deletes.retainedDeleteBytes();
+  docs.pool.alloc(relief + 16384);
   iw->pressureFlushFloorBytes = relief + 1;
   ASSERT_GT(docs.memSize(), iw->pressureFlushFloorBytes);
   ASSERT_GT(deletes.memSize(), docs.memSize());

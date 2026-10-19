@@ -1094,6 +1094,78 @@ TEST_F(IndexWriterTest, deleteThenAllowDupsInSameInverter) {
   EXPECT_EQ(2, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
 }
 
+TEST_F(IndexWriterTest, localDeleteThenAllowDupsRemovesOlderContent) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "old"), UpdateMessage::NO_COMMIT, true).success);
+  ASSERT_TRUE(helper.deleteById("x").success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "new"), UpdateMessage::COMMIT, false).success);
+  EXPECT_EQ(1, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("text_w", "old").fields({"id"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_TRUE(req->getDocs().empty());
+}
+
+TEST_F(IndexWriterTest, localDeletePreservesNewerArrivalBeforeOlderOverwrite) {
+  using namespace luxir::test;
+  class SignaledUpdate : public ProtoUpdateMessage {
+  public:
+    using ProtoUpdateMessage::ProtoUpdateMessage;
+    void handle(IndexWriter& iw) override {
+      Signal::emit("localIdHandlerEnter", this);
+      ProtoUpdateMessage::handle(iw);
+      Signal::emit("localIdHandlerComplete", this);
+    }
+    void done(IndexWriter&) override {}
+  };
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  CollectionHelper::UpdateBuilder oldRequest, deleteRequest, newRequest;
+  oldRequest.add(flatdoc("id", "x", "text_w", "old")).overwrite();
+  deleteRequest.remove("x");
+  newRequest.add(flatdoc("id", "x", "text_w", "new")).allowDups();
+  SignaledUpdate older(&oldRequest.finish()), deletion(&deleteRequest.finish()), newer(&newRequest.finish());
+  std::latch releaseOlder(1);
+  std::promise<void> olderEntered, deleteComplete, newerComplete;
+  auto cleanup = scope_guard([&] {
+    if (!releaseOlder.try_wait()) releaseOlder.count_down();
+    iw->updateGraph->wait_for_all();
+    Signal::unlisten("localIdHandlerEnter");
+    Signal::unlisten("localIdHandlerComplete");
+  });
+  Signal::listen("localIdHandlerEnter", [&](void* msg, void*, void*) -> void* {
+    if (msg == &older) { olderEntered.set_value(); releaseOlder.wait(); }
+    return nullptr;
+  });
+  Signal::listen("localIdHandlerComplete", [&](void* msg, void*, void*) -> void* {
+    if (msg == &deletion) deleteComplete.set_value();
+    if (msg == &newer) newerComplete.set_value();
+    return nullptr;
+  });
+  ASSERT_TRUE(iw->submitUpdate(&older));
+  ASSERT_EQ(std::future_status::ready, olderEntered.get_future().wait_for(5s));
+  ASSERT_TRUE(iw->submitUpdate(&deletion));
+  ASSERT_EQ(std::future_status::ready, deleteComplete.get_future().wait_for(5s));
+  ASSERT_TRUE(iw->submitUpdate(&newer));
+  ASSERT_EQ(std::future_status::ready, newerComplete.get_future().wait_for(5s));
+  releaseOlder.count_down();
+  iw->updateGraph->wait_for_all();
+  ASSERT_FALSE(older.result.errored());
+  ASSERT_FALSE(deletion.result.errored());
+  ASSERT_FALSE(newer.result.errored());
+  helper.commit();
+  EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("text_w", "new").fields({"id"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(1, req->getDocs().size());
+}
+
 TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
   using namespace luxir::test;
   LuxirNode node;
@@ -2521,8 +2593,8 @@ TEST_F(IndexWriterTest, mergingDeleteListsPreservesSharedInputs) {
     helper.commit();
     EXPECT_EQ(0, iw->snapshots.readers.getReader()->liveDocs());
     // These inputs can be shared by other segments' parallel delete tasks.
-    EXPECT_EQ(versions[0], deletes->lists()[0][0].val().version);
-    EXPECT_EQ(versions[1], deletes->lists()[1][0].val().version);
+    EXPECT_EQ(versions[0], deletes->lists()[0][0].val().deleteWatermark);
+    EXPECT_EQ(versions[1], deletes->lists()[1][0].val().deleteWatermark);
     EXPECT_EQ(2, deletes->getSmallestVersion());
     EXPECT_EQ(3, deletes->getLargestVersion());
   }
