@@ -63,6 +63,16 @@ locations, browse `src/luxir/<area>/`.
    [`Query.h`](../../src/luxir/query/Query.h) is the authoritative hierarchy and
    planning-contract description.
 
+   Each query defines `createWeight` (a `MultiTermQuery` subclass,
+   `createFilteredEnum`) out of line. That virtual is the class's key
+   function, so its vtable and the Weight and scorer code reached from it
+   compile once rather than in every translation unit that constructs the
+   query. `BooleanQuery` and `KnnQuery` define it in their own `.cpp`; the
+   other queries share `QueryWeights.cpp` rather than each paying a
+   translation unit's header parsing for a few lines of code. `BooleanQuery`'s
+   Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
+   and white-box tests include.
+
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
