@@ -83,6 +83,8 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
     previous = fileNum;
   }
 
+  auto versionsLoc = seg_location::read(firstIS);
+  uint32_t versionCount = firstIS.readVint();
   files.resize((size_t) physicalFileNums.back() + 1);
   inputStreams.resize((size_t) physicalFileNums.back() + 1);
 
@@ -100,6 +102,22 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
     }
     validateSegmentFileHeader(*files[fileNum], fileName);
     inputStreams[fileNum] = files[fileNum]->getInputStream();
+  }
+  if (maxdoc > 0) {
+    uint32_t fileNum = versionsLoc.filenum();
+    uint64_t bytes = sizeof(uint32_t) + (uint64_t)versionCount * sizeof(VersionRun);
+    if (versionCount == 0 || versionsLoc.isNull() || fileNum >= inputStreams.size()
+        || !files[fileNum] || versionsLoc.offset() > (uint64_t)inputStreams[fileNum].size()
+        || bytes > (uint64_t)inputStreams[fileNum].size() - versionsLoc.offset()) {
+      throw std::runtime_error("Segment has invalid request birth versions");
+    }
+    auto input = getInputStreamSeek(versionsLoc);
+    if ((uint32_t)input.readInt() != VersionRuns::PACKED) {
+      throw std::runtime_error("Unsupported request-version run encoding");
+    }
+    versions = VersionRuns({(const VersionRun*)input.ptr(), versionCount}, maxdoc);
+  } else if (maxdoc != 0 || versionCount != 0 || !versionsLoc.isNull()) {
+    throw std::runtime_error("Segment has invalid request birth versions");
   }
   auto fields = inputStreams[0];
   fields.seek(segInfoOffset - sizeof(int32_t));

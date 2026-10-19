@@ -23,8 +23,14 @@ std::string ReaderManager::resolvedSchema() {
   result["fields"] = Json::object_t{};
   for (const auto& [name, signature] : fields) {
     auto& logical = result["fields"][signature.logicalName];
-    logical["bindings"]["search"] = schema->resolveFor(signature.logicalName, OpClass::SEARCH).physicalName;
-    logical["bindings"]["value"] = schema->resolveFor(signature.logicalName, OpClass::VALUE).physicalName;
+    for (auto [name, op] : {std::pair{"search", OpClass::SEARCH}, {"value", OpClass::VALUE}}) {
+      try {
+        logical["bindings"][name] = schema->resolveFor(signature.logicalName, op).physicalName;
+      } catch (const RequestError& e) {
+        if (e.code != "retrieval_only") throw;
+        logical["bindings"][name] = nullptr;
+      }
+    }
     auto& rep = logical["representations"][signature.label];
     rep["name"] = name;
     for (const auto& [property, value] : signature.properties) {

@@ -614,9 +614,11 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
     auto newInverter = std::make_unique<Inverter>(
         dir, ++lastSegId, pinned, indexRamBudget);
     inverter = newInverter.get();
+    inverter->updateVersions(updateVersion);
     busyInverters.emplace(inverter, std::move(newInverter));
   }
   else {
+    inverter->updateVersions(updateVersion);
     auto it = idleInverters.find(inverter);
     busyInverters.emplace(inverter, std::move(it->second));
     idleInverters.erase(it);
@@ -625,7 +627,6 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   // normal protobuf path immediately installs its request clock; custom/test
   // messages without one fall back to call-time DATE coercion.
   inverter->coerceContext = {};
-  inverter->updateVersions(updateVersion);
   return *inverter;
 }
 
@@ -3091,13 +3092,6 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
 
   TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
-  // Also get the "_version_" field for version comparison
-  std::optional<IntColReader> versionColReader;
-  if (auto* versionFieldInfo = reader.fieldInfo("_version_")) {
-    versionColReader.emplace(reader, *versionFieldInfo);
-    assert(!versionColReader->multiValued());
-  }
-
   // Phase 1: walk the merged delete span and collect the live candidate doc
   // for each delete entry.
   // The span is sorted by id, so we use seekForward() to scan the segment's terms
@@ -3131,33 +3125,12 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     } // end if termsEnum.seek()
   }
 
-  // Phase 2: version-gate the candidates in docId order so the _version_
-  // column can be read with a single forward iterator.  The column can be
-  // sparse - docs indexed with overwrite=false, or failed docs that never
-  // reached their id field, have no version value - so values must be read by
-  // rank, not docId.  A doc with no version value gates as version 0 and is
-  // always deleted.
+  // Gate in docId order with a forward cursor over request births.
   std::sort(candidates.begin(), candidates.end(),
             [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
-
-  std::optional<IntColReader::SparseIterator> versionIter;
-  if (versionColReader) {
-    versionIter.emplace(*versionColReader);
-  }
-
-  int32_t foundDoc = -1;
+  VersionRuns::Cursor versions(reader.versionRuns());
   for (const auto& candidate : candidates) {
-    uint64_t docVersion = 0;
-    if (versionIter) {
-      if (foundDoc < candidate.docId) {
-        foundDoc = versionIter->advance(candidate.docId);
-      }
-      if (foundDoc == candidate.docId) {
-        docVersion = (uint64_t)versionIter->value();
-      }
-      INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
-               docVersion, candidate.docId, seg.segId);
-    }
+    uint64_t docVersion = versions.birth(candidate.docId);
 
     if (docVersion < candidate.deleteVersion) {
       if (!liveBits) {

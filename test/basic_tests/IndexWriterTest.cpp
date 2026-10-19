@@ -1084,14 +1084,156 @@ TEST_F(IndexWriterTest, multiThreaded) {
 }
 
 
-// Test that _version_ field is present when overwrite=true and absent otherwise
+TEST_F(IndexWriterTest, deleteThenAllowDupsInSameInverter) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  ASSERT_TRUE(helper.index(flatdoc("id", "older"), UpdateMessage::NO_COMMIT, false).success);
+  ASSERT_TRUE(helper.deleteById("x").success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x"), UpdateMessage::COMMIT, false).success);
+  EXPECT_EQ(2, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->perInverterRamBytes = 1;
+  ASSERT_TRUE(helper.deleteById("x").success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->pendingDeletes.size());
+  iw->perInverterRamBytes = SIZE_MAX;
+  ASSERT_TRUE(helper.index(flatdoc("id", "x"), UpdateMessage::NO_COMMIT, false).success);
+  ASSERT_TRUE(helper.deleteById("y", UpdateMessage::COMMIT).success);
+  EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, requestBirthsValidateOnOpen) {
+  RAMDir dir;
+  PostingsWriter writer(dir, 1, 3);
+  PostingsWriter::VersionRunsWriter versions(writer);
+  versions.add(0, 5);
+  versions.add(3, 7); // The last boundary is outside maxDoc.
+  versions.finish();
+  ASSERT_TRUE(writer.finish());
+  EXPECT_THROW(PostingsReader::create(dir, 1), std::runtime_error);
+  PostingsWriter missing(dir, 2, 1);
+  EXPECT_THROW(missing.finish(), std::runtime_error);
+}
+
+TEST_F(IndexWriterTest, requestBirthsPreserveFieldlessDocuments) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto result = helper.index(Doc{}, UpdateMessage::COMMIT, false);
+  ASSERT_TRUE(result.success);
+  ASSERT_TRUE(helper.index(Doc{}, UpdateMessage::COMMIT, false).success);
+  helper.getIndexWriter()->mergeSegments();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"_version_"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("_version_", (int64_t)result.updateVersion)));
+}
+
+TEST_F(IndexWriterTest, requestBirthsCoverRollbackAndEmptyAcquisitions) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto first = helper.index(flatdoc("id", "keep"), UpdateMessage::NO_COMMIT, false);
+  ASSERT_TRUE(first.success);
+  auto previousVersion = first.updateVersion;
+  for (int i = 0; i < 20; i++) {
+    auto empty = helper.deleteById("absent");
+    ASSERT_TRUE(empty.success);
+    EXPECT_GT(empty.updateVersion, previousVersion);
+    previousVersion = empty.updateVersion;
+    iw->updateGraph->wait_for_all();
+    ASSERT_EQ(1, iw->idleInverters.size());
+    EXPECT_EQ(2, iw->idleInverters.begin()->first->versionRuns.size());
+  }
+  CollectionHelper::UpdateBuilder request;
+  request.add(flatdoc("id", "rolled-back")).add(flatdoc("no_such_field", "fail")).allOrNone();
+  auto failed = helper.submit(request);
+  EXPECT_FALSE(failed.success);
+  auto last = helper.index(flatdoc("text_w", "anonymous"), UpdateMessage::COMMIT, false);
+  ASSERT_TRUE(last.success);
+  auto reader = iw->snapshots.readers.getReader();
+  ASSERT_EQ(1, reader->segments().size());
+  auto& postings = reader->segments()[0].postingsReader();
+  EXPECT_EQ(3, postings.versionRuns().runs().size());
+  VersionRuns::Cursor versions(postings.versionRuns());
+  EXPECT_EQ(first.updateVersion, versions.birth(0));
+  EXPECT_EQ(failed.updateVersion, versions.birth(1));
+  EXPECT_EQ(failed.updateVersion, versions.birth(2));
+  EXPECT_EQ(last.updateVersion, versions.birth(3));
+  EXPECT_EQ(first.updateVersion, versions.birth(0));
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"_version_"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(2, docs.size());
+  EXPECT_TRUE(containsDoc(docs, flatdoc("_version_", (int64_t)first.updateVersion)));
+  EXPECT_TRUE(containsDoc(docs, flatdoc("_version_", (int64_t)last.updateVersion)));
+}
+
+TEST_F(IndexWriterTest, requestBirthsMergeDeletedRuns) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  auto first = helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT, false);
+  ASSERT_TRUE(first.success);
+  ASSERT_TRUE(helper.deleteById("a").success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::NO_COMMIT, false).success);
+  auto last = helper.index(flatdoc("id", "d"), UpdateMessage::COMMIT, false);
+  ASSERT_TRUE(last.success);
+  ASSERT_TRUE(helper.deleteById("c", UpdateMessage::COMMIT).success);
+  iw->mergeSegments();
+  auto reader = iw->snapshots.readers.getReader();
+  ASSERT_EQ(1, reader->segments().size());
+  EXPECT_EQ(2, reader->liveDocs());
+  auto& runs = reader->segments()[0].postingsReader().versionRuns();
+  ASSERT_EQ(2, runs.runs().size());
+  VersionRuns::Cursor cursor(runs);
+  EXPECT_EQ(first.updateVersion, cursor.birth(0));
+  EXPECT_EQ(last.updateVersion, cursor.birth(1));
+}
+
+TEST_F(IndexWriterTest, versionIsRetrievalOnly) {
+  using namespace luxir::test;
+  CollectionHelper helper;
+  for (int use = 0; use < 7; use++) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").allQuery();
+    if (use == 0) {
+      auto& doc = std::get<api::TopDocs>(top.rawOp().kind);
+      auto* sort = api::build::allocArray(doc.sort, 1, top.mr());
+      sort[0].expr = "_version_";
+    } else if (use == 1) top.matchFilter("_version_", "1");
+    else if (use == 2) req->facet("f", "_version_");
+    else if (use == 3) req->sum("sum", "_version_");
+    else if (use == 4) top.exprQuery("_version_:>=1");
+    else if (use == 5) top.simpleQuery("_version_:1", {"text_w"});
+    else req->expr("value", "sum(add(_version_, 1))");
+    req->execute();
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("Field '_version_' is retrieval-only"));
+  }
+}
+
+// Every document exposes its request birth, including allow_dups documents.
 TEST_F(IndexWriterTest, versionFieldOverwrite) {
   using namespace luxir::test;
   
   CollectionHelper helper("main");
 
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
-  helper.index(doc1, UpdateMessage::COMMIT, false);
+  auto result1 = helper.index(doc1, UpdateMessage::COMMIT, false);
 
   Doc doc2 = flatdoc("id", "doc2", "text_w", "hello version world");
   auto result2 = helper.index(doc2, UpdateMessage::COMMIT, true);
@@ -1110,9 +1252,8 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   ASSERT_EQ(3, docs.size());
 
   // text_w is STORED by default, so the raw value comes back with the doc.
-  // doc1 was indexed without overwrite, so it has no _version_ value and the
-  // field is absent from the returned doc.
-  Doc expectedDoc1 = flatdoc("id", "doc1", "text_w", std::string("hello world"));
+  Doc expectedDoc1 = flatdoc("id", "doc1", "text_w", std::string("hello world"),
+                             "_version_", (int64_t)result1.updateVersion);
   Doc expectedDoc2 = flatdoc("id", "doc2", "text_w", std::string("hello version world"),
                              "_version_", (int64_t)(result2.updateVersion));
   Doc expectedDoc3 = flatdoc("id", "doc3", "text_w", std::string("hello third world"),
@@ -1145,18 +1286,13 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   */
 }
 
-// _version_ columns can be sparse within a segment: docs indexed without an id
-// field get no version value.  applyDeletes must read versions by rank, not
-// docid - it used to index the dense decoder by docid, reading the wrong doc's
-// version past a gap (and asserting past the end of the column).
-TEST_F(IndexWriterTest, sparseVersionColumnDeletes) {
+// Id-less slots have births too; the following id still gates at its own birth.
+TEST_F(IndexWriterTest, requestBirthsCoverIdlessSlots) {
   using namespace luxir::test;
 
   CollectionHelper helper("main");
 
-  // One batch -> one segment: doc 0 has no id (no _version_ value), doc 1 has
-  // an id and an overwrite version.  The column holds 1 value but maxDoc is 2,
-  // so reading doc 1's version by docid lands past the end.
+  // One request covers both the anonymous slot and the id-bearing slot.
   std::vector<Doc> docs = {
     flatdoc("text_w", "anonymous filler"),
     flatdoc("id", "sv1", "text_w", "versioned target"),
@@ -2170,6 +2306,10 @@ TEST_F(IndexWriterTest, overwriteKeepsNewestVersionWithinInverter) {
     iw->releaseInverter(inv);
   }
   helper.commit();
+  auto& runs = iw->snapshots.readers.getReader()->segments()[0].postingsReader().versionRuns();
+  VersionRuns::Cursor cursor(runs);
+  EXPECT_EQ(3, cursor.birth(1));
+  EXPECT_EQ(2, cursor.birth(2));
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("id", "dup").fields({"_version_"});
   req->execute();
@@ -2648,6 +2788,8 @@ TEST_F(IndexWriterTest, manifestInventorySurvivesReopenAndMerge) {
     {
       CommitSnapshotRegistry reopenedSnapshots(*dir);
       IndexWriter reopened(reopenedSnapshots);
+      auto& reopenedRuns = reopened.snapshots.readers.getReader()->segments()[0].postingsReader().versionRuns();
+      EXPECT_EQ(0, VersionRuns::Cursor(reopenedRuns).birth(0));
       reopened.commit();
       EXPECT_EQ(before, verify());
       reopened.mergeSegments();

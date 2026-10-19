@@ -64,6 +64,10 @@ private:
   Directory& directory;
   int32_t maxDoc;  // set by caller
   int64_t sizeInBytes = 0; // total size of all files written
+  // Immutable request births, referenced from segment metadata rather than a field.
+  seg_location versionRunsLoc;
+  uint32_t versionRunCount = 0;
+  bool finished = false;
 
   // Files available for use, sorted so largest are at the back. Reusing the
   // largest keeps residual streams small enough to fold into file 0 at finish.
@@ -214,6 +218,46 @@ public:
 
   typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
 
+  class VersionRunsWriter {
+    PostingsWriter& writer;
+    OutputStreamPtr output;
+    std::optional<VersionRun> pending;
+    uint32_t count = 0;
+    uint32_t lastStart = 0;
+
+    void emitPending() {
+      output->write(&*pending, sizeof(VersionRun));
+      count++;
+    }
+
+  public:
+    explicit VersionRunsWriter(PostingsWriter& writer) : writer(writer) {}
+
+    void add(uint32_t firstDocId, uint64_t version) {
+      if (!pending) {
+        if (firstDocId != 0) throw std::runtime_error("Request-version runs must start at document zero");
+        output = writer.getOutputStream();
+        writer.versionRunsLoc = output->slocation();
+        output->writeInt(VersionRuns::PACKED);
+      } else {
+        if (firstDocId <= lastStart) throw std::runtime_error("Request-version runs must increase");
+        lastStart = firstDocId;
+        if (pending->version == version) return;
+        emitPending();
+      }
+      pending = VersionRun{firstDocId, version};
+    }
+
+    void finish() {
+      if (pending) {
+        emitPending();
+        pending.reset();
+      }
+      writer.versionRunCount = count;
+      output.reset();
+    }
+  };
+
   // Thread-safe.  A checked-out stream is exclusively owned until released.
   OutputStreamPtr getOutputStream() {
     return std::move(getOutputStreams<1>()[0]);
@@ -269,8 +313,12 @@ public:
   // If filenames is non-null, appends the names of files written (for fsync at commit time).
   bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
-    if (fieldInfos.empty()) {
+    if (finished || (fieldInfos.empty() && maxDoc <= 0)) {
       return false;  // already called, or no data added.
+    }
+
+    if (maxDoc > 0 && (versionRunsLoc.isNull() || versionRunCount == 0)) {
+      throw std::runtime_error("Segment has no request birth versions");
     }
 
     // make sure we have at least one file
@@ -313,6 +361,7 @@ public:
       }
     }
 
+    finished = true;
     freeFiles.clear();
     fieldInfos.resize(0);
     files.resize(0);
@@ -365,6 +414,7 @@ private:
     // appended like any other stream (the reader must be able to open the
     // location's file even to read zero bytes).
     std::vector<bool> referenced(files.size(), false);
+    if (!versionRunsLoc.isNull()) referenced[versionRunsLoc.filenum()] = true;
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations([&](seg_location location) {
         if (location.filenum() < referenced.size()) {
@@ -411,6 +461,7 @@ private:
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations(relocate);
     }
+    if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
 
     std::vector<uint32_t> survivors;
     survivors.reserve(files.size());
@@ -432,6 +483,8 @@ private:
     // object-store copy.  Readers keep a filenum-indexed table with holes.
     out.writeVint((uint32_t) survivorFileNums.size());
     for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
+    out.writeVal(versionRunsLoc);
+    out.writeVint(versionRunCount);
     auto segInfoSize = out.size() - outStart;
     out.writeInt(segInfoSize);
   }

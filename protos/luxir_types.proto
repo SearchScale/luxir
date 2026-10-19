@@ -2201,7 +2201,9 @@ message SchemaDef {
   // Concrete fields, keyed by field name.  Exact-name lookup consults only this
   // map.  The reserved "id" and "_version_" fields are always materialized: a
   // REPLACE_ALL that omits them gets the defaults; redefining them incompatibly, or
-  // defining a second ID-class field, is an error.
+  // defining a second ID-class field, is an error. _version_ is fixed and
+  // retrieval-only: it returns the update version of the request that indexed
+  // each document, including allow_dups and documents without an ID.
   map<string, FieldDef> fields = 1;
 
   // Abstract definitions, keyed by template name.  Never directly usable as a

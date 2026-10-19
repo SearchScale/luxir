@@ -497,8 +497,8 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
     else geo.index(inv, 10.0, 20.0);
     inv.finishDoc();
   }
-  EXPECT_TRUE(inv.inputHandlers.contains("_version_"));
-  EXPECT_TRUE(inv.indexHandlers.contains("_version_"));
+  EXPECT_FALSE(inv.inputHandlers.contains("_version_"));
+  EXPECT_FALSE(inv.indexHandlers.contains("_version_"));
   EXPECT_FALSE(inv.inputHandlers.contains("a__s"));
   writer->releaseInverter(inv, true);
   helper.commit();

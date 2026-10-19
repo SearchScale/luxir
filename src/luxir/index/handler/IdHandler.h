@@ -18,7 +18,6 @@ namespace luxir::handler {
 ///
 /// When inverter.overwrite is true, indexing an id automatically:
 ///   - queues a delete for previous versions of this id in other segments
-///   - indexes currVersion into the _version_ int column
 ///
 /// Owns its own MemPool (idPool) so the id string bytes can be transferred
 /// to SortedDeletes after flush, outliving the inverter.
@@ -43,8 +42,6 @@ class IdHandler final : public Inverter::IndexHandler {
     bool inserted;
   };
   std::vector<UndoEntry> undoLog_;
-
-  Inverter::InputHandler* versionHandler = nullptr; // lazily resolved on first overwrite
 
 public:
   IdHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
@@ -156,7 +153,6 @@ private:
     if (inverter.overwrite) {
       hadOverwrites_ = true;
       version = inverter.currVersion;
-      getVersionHandler(inverter).index(inverter, (int64_t)version);
     }
 
     auto [entry, inserted] = termsHash.try_emplace(id, inverter.getDoc(), version);
@@ -193,13 +189,6 @@ private:
   size_t idExtraBytes() const {
     return idPool->capacity() + termsHash.memSize() + (deleteHash ? deleteHash->memSize() : 0)
         + (producesPacket() ? sizeof(SortedDeletes) : 0);
-  }
-
-  Inverter::InputHandler& getVersionHandler(Inverter& inverter) {
-    if (versionHandler == nullptr) {
-      versionHandler = &inverter.getIndexHandler("_version_");
-    }
-    return *versionHandler;
   }
 
   /// Sort a TermValHash, detach its table, and compute version range.

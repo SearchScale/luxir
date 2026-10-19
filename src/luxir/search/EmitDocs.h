@@ -427,6 +427,23 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   });
 }
 
+inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs, SegmentRuns runs,
+                            luxir::api::Column& fieldCol, FieldLoaders* loaders,
+                            PendingCols& pendingCols, std::pmr::memory_resource& mr) {
+  auto& col = fieldCol.kind.emplace<luxir::api::ColInt>();
+  auto* target = build::allocArray(col.v, segDocs.size(), mr);
+  auto& pending = pendingCols.emplace_back();
+  pending.present.assign(segDocs.size(), 1);
+  pending.finish = [&col](std::span<const uint8_t> present) {
+    col.missing_val = pickMissingVal<IntColEmit>(col.v, present);
+  };
+  addFieldLoader(loaders, runs, [&req, segDocs, target](std::span<RowIndex> indices) {
+    auto segment = segDocs[indices[0]].segment();
+    VersionRuns::Cursor cursor(req.reader->segments()[segment].postingsReader().versionRuns());
+    for (auto index : indices) target[index] = (int64_t)cursor.birth(segDocs[index].docId());
+  });
+}
+
 // Copy raw column bytes into a Vector.f32's arena float buffer.  memcpy
 // sidesteps alignment of the source bytes (column storage is byte-packed
 // and not guaranteed 4-byte aligned).
@@ -681,15 +698,18 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; null marks the _score_ pseudo-field.  discovered:
-// from an empty or wildcard selector (COLUMNS leaves such a column out of a
-// batch where it has no value).  infos and storedInfos are bound with the
+// per-batch schema lookups; kind selects the physical, score, or version source.
+// discovered: from an empty or wildcard selector (COLUMNS leaves such a column
+// out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
 // looks them up.
 struct ReturnField {
+  enum class Kind { PHYSICAL, SCORE, VERSION };
+
   std::string_view outputKey;
   std::string_view physicalName;
   FieldType* fieldType;
+  Kind kind;
   bool discovered;
   IndexReader::FieldSegments infos;
   IndexReader::FieldSegments storedInfos;
@@ -698,7 +718,7 @@ struct ReturnField {
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
   boost::unordered_flat_map<std::string_view, IndexReader::FieldSegments, PackedTermHash, PackedTermEqual> resources;
   for (auto& rf : fields) {
-    if (!rf.fieldType) continue;
+    if (rf.kind != ReturnField::Kind::PHYSICAL) continue;
     if (rf.fieldType->type() != FieldType::TEXT) rf.infos = reader.field(rf.physicalName);
     if (rf.fieldType->isStored()) {
       auto [it, inserted] = resources.try_emplace(rf.fieldType->storedResource_);
@@ -1081,18 +1101,32 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     columnFields.clear();
     columnPresent.clear();
     for (const ReturnField& rf : fields) {
-      // should we allow _scores_ as a field name?
-      if (rf.fieldType == nullptr) {  // the _score_ pseudo-field
-        returnScores = true;
-        continue;
-      }
       size_t columnsBefore = docListProto.columns.size();
       size_t pendingBefore = pendingCols.size();
-      std::string_view field = rf.physicalName;
-      FieldType& fieldType = *rf.fieldType;
       auto outputColumn = [&]() -> luxir::api::Column& {
         return build::columnSlot(docListProto.columns, colCap, rf.outputKey, mr);
       };
+      auto registerColumn = [&] {
+        if (docListProto.columns.size() > columnsBefore) {
+          // A field registers at most one PendingCol, for its own column.
+          columnFields.push_back(&rf);
+          columnPresent.push_back(pendingCols.size() > pendingBefore ? pendingCols.back().present.data() : nullptr);
+        }
+      };
+
+      switch (rf.kind) {
+        case ReturnField::Kind::SCORE:
+          returnScores = true;
+          continue;
+        case ReturnField::Kind::VERSION:
+          loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          registerColumn();
+          continue;
+        case ReturnField::Kind::PHYSICAL:
+          break;
+      }
+      std::string_view field = rf.physicalName;
+      FieldType& fieldType = *rf.fieldType;
 
       // Group stored fields by resource. The group can use columns only
       // when every column preserves the source value; otherwise decompress
@@ -1152,11 +1186,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         default:
           break;
       }
-      if (docListProto.columns.size() > columnsBefore) {
-        // A field registers at most one PendingCol, for its own column.
-        columnFields.push_back(&rf);
-        columnPresent.push_back(pendingCols.size() > pendingBefore ? pendingCols.back().present.data() : nullptr);
-      }
+      registerColumn();
     }
 
     for (auto& [resourceName, group] : storedByResource) {
@@ -1327,14 +1357,14 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
-    picked.push_back({field.name, field.name, field.type, true});
+    picked.push_back({field.name, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
   };
   auto pushExplicit = [&](std::string_view f) {
     for (auto& rf : picked) {
       if (rf.outputKey == f) return;  // explicit lists are small; linear scan
     }
     if (f == "_score_") {
-      picked.push_back({f, {}, nullptr, false});
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
@@ -1350,7 +1380,8 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       }
       throw RequestError(message, "invalid_field");
     }
-    picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, false});
+    auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
+    picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
   };
   if (fields.empty()) {
     auto catalog = req.reader->retrievableFields();
@@ -1449,7 +1480,7 @@ void emitDocsResponse(SearchRequest& req,
   // plus the synthetic _score_.
   size_t colCap = 1;
   for (const auto& rf : rfields) {
-    if (rf.fieldType != nullptr) colCap++;  // not the _score_ pseudo-field
+    if (rf.kind != ReturnField::Kind::SCORE) colCap++;
   }
 
   using Impl = DocEmitterImpl<std::decay_t<GetDocList>, std::decay_t<GetDoc>,

@@ -317,6 +317,8 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   writer.finish();
 
   PostingsReader outputReader(outputDir, 900);
+  EXPECT_EQ(1, outputReader.versionRuns().runs().size());
+  EXPECT_EQ(0, VersionRuns::Cursor(outputReader.versionRuns()).birth(outputReader.maxDoc() - 1));
   MemPool pool;
   auto* fields = outputReader.fieldInfo("body");
   EXPECT_NE(nullptr, fields);

@@ -297,6 +297,12 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     fieldHandler->flush(*this);
   }
 
+  PostingsWriter::VersionRunsWriter versions(postingsWriter);
+  for (const auto& run : versionRuns) {
+    if (run.firstDocId < (uint32_t)getMaxDoc()) versions.add(run.firstDocId, run.version);
+  }
+  versions.finish();
+
   // Handle deleted documents if any
   if (!deleted.empty()) {
     // Create a FixedBitSet with all bits initially set (all docs are live)

@@ -74,6 +74,8 @@ public:
   // when the inverter is destroyed (after its flush completes, or at writer close), so
   // flushing inverters stay counted until their RAM is actually freed.
   IndexRamBudget::Guard ramGuard;
+  // Unversioned direct indexing starts at zero; acquisitions replace empty runs.
+  std::vector<VersionRun> versionRuns{{0, 0}};
 
   // High-water mark of transient flush memory charged to ramGuard.
   size_t flushWorkspaceBytes = 0;
@@ -91,7 +93,7 @@ public:
   uint64_t maxVersion = 0;
 
   // When true, indexing an id field will automatically queue a delete for previous
-  // versions and index the _version_ field. Set via setOverwrite() before indexing docs.
+  // versions. Set before indexing docs.
   bool overwrite = false;
 
   // Populated by IdHandler::flush() with sorted delete lists.
@@ -133,6 +135,15 @@ public:
   // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
+    uint32_t start = (uint32_t)getMaxDoc();
+    if (versionRuns.back().firstDocId == start) {
+      versionRuns.back().version = version;
+      if (versionRuns.size() > 1 && versionRuns[versionRuns.size() - 2].version == version) {
+        versionRuns.pop_back();
+      }
+    } else if (versionRuns.back().version != version) {
+      versionRuns.push_back({start, version});
+    }
     minVersion = std::min(minVersion, version);
     maxVersion = std::max(maxVersion, version);
     currVersion = version;
@@ -390,7 +401,7 @@ public:
   // hold outside it (extraRamBytes). O(1) - no walk. Over-estimates slightly (pool
   // capacity steps by chunk), so a size-based flush trips a touch early, never late.
   size_t memSize() {
-    return pool.size() + extraRamBytes;
+    return pool.size() + extraRamBytes + versionRuns.capacity() * sizeof(VersionRun);
   }
 
   // True when this inverter has grown past a size cap and should be flushed to a

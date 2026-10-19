@@ -312,7 +312,7 @@ TEST(EmitDocsPlacement, valueColumnPlacement) {
   api::Val vals[3];
   vals[0].kind = true;
   vals[2].kind = false;
-  ReturnField rf{"flag_b", "flag_b", nullptr, true, {}, {}};
+  ReturnField rf{"flag_b", "flag_b", nullptr, ReturnField::Kind::PHYSICAL, true, {}, {}};
   std::array<const ReturnField*, 1> fields{&rf};
   std::array<const uint8_t*, 1> present{nullptr};
   std::vector<uint8_t> fate;

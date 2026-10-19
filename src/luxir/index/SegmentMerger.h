@@ -607,17 +607,9 @@ public:
       fieldReaders.emplace_back(*preader);
       FieldReader& fieldReader = fieldReaders.back();
 
-      // position fieldReader on first field and add to segs if it's non-empty
-      if (fieldReader.readNextField()) {
-        // Calculate number of live documents
-        int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
-        
-        segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)segs.size());
-        MERGER_DEBUG("SegmentMerger: added segment to merge, base={}, numLive={}", totalLive, numLive);
-        totalLive += numLive; // Count only live documents for base offset
-      } else {
-        LOG_ERROR("Empty fieldReader!");
-      }
+      int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
+      segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)i);
+      totalLive += numLive;
     }
     // Set maxDoc to total number of live documents
     postingsWriter.setMaxDoc(totalLive);
@@ -626,16 +618,22 @@ public:
                  totalLive, estimatedOutputBytes, streamBudget);
 
     // Now build the docId maps based on liveDocs, then release the liveDocs.
+    PostingsWriter::VersionRunsWriter versions(postingsWriter);
     for (size_t i = 0; i < segs.size(); i++) {
       auto& seg = segs[i];
-      buildDocIdMapping(seg, liveDocs[i], seg.remap);
+      buildDocIdMapping(seg, liveDocs[i], seg.remap, versions);
       // TODO: pass the actual liveDocs shared_ptr into the merger so we can release them.
     }
 
+    versions.finish();
+
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
-    std::vector<Segment*> segPtrs(segs.size());
-    // IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
-    IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs);
+    std::vector<Segment*> segPtrs;
+    segPtrs.reserve(segs.size());
+    for (auto& seg : segs) {
+      if (seg.fieldReader->readNextField()) segPtrs.push_back(&seg);
+    }
+    IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segPtrs);
 
     std::vector<MergeAdmissionDriver::Batch> batches;
     while (fieldPQ.size() > 0) {
@@ -806,9 +804,13 @@ private:
   // Helper to build mapping from old doc IDs to new doc IDs for a segment, accounting for deletes
   // Returns a vector where vector[oldDocId] = newDocId, or -1 if deleted.
   // This is still 0 based, so add the base in both cases.
-  void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target) {
+  void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target,
+                         PostingsWriter::VersionRunsWriter& versions) {
     if (liveDocs == nullptr) {
-      return; // no deletes, so nothing to do.
+      for (const auto& run : seg.postingsReader->versionRuns().runs()) {
+        versions.add((uint32_t)seg.base + run.firstDocId, run.version);
+      }
+      return;
     }
     int32_t maxDoc = seg.postingsReader->maxDoc();
     assert(liveDocs->size() == maxDoc); // make sure this is the right liveDocs for the segment.
@@ -816,8 +818,19 @@ private:
     int32_t newDocId = 0;
     const FixedBitSet& bitset = liveDocs->bitset();
     
+    auto runs = seg.postingsReader->versionRuns().runs();
+    size_t run = 0;
+    bool emitted = false;
     for (int32_t oldDocId = 0; oldDocId < maxDoc; oldDocId++) {
+      if (run + 1 < runs.size() && runs[run + 1].firstDocId == (uint32_t)oldDocId) {
+        run++;
+        emitted = false;
+      }
       if (bitset.get(oldDocId)) {
+        if (!emitted) {
+          versions.add((uint32_t)(seg.base + newDocId), runs[run].version);
+          emitted = true;
+        }
         target[oldDocId] = newDocId++;
       } else {
         target[oldDocId] = -1; // Document is deleted

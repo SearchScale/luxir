@@ -126,6 +126,33 @@ TEST_F(DocFormatTest, rowsCarryScorePerDocument) {
   }
 }
 
+TEST_F(DocFormatTest, mixedReturnFieldKindsPreserveSelectors) {
+  CollectionHelper ch;
+  auto indexed = ch.index(flatdoc("id", "one"), UpdateMessage::COMMIT);
+  ASSERT_TRUE(indexed.success);
+  for (auto fmt : {api::DocFormat::ROWS, api::DocFormat::COLUMNS}) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().documentFormat(fmt)
+        .fields({"id", "_score_", "_version_", "_version___self",
+                 "id", "_score_", "_version_", "_version___self"});
+    req->execute();
+    ASSERT_OK(req);
+    const auto* dl = req->docList("q");
+    EXPECT_EQ(fmt == api::DocFormat::ROWS ? 0u : 4u, dl->columns.size());
+    if (fmt == api::DocFormat::ROWS) {
+      ASSERT_EQ(1u, dl->docs.size());
+      EXPECT_EQ(4u, dl->docs[0].fields.size());
+      EXPECT_NE(nullptr, dl->docs[0].fields.find("_score_"));
+    } else {
+      EXPECT_NE(nullptr, dl->columns.find("_score_"));
+    }
+    auto docs = req->getDocs();
+    ASSERT_EQ(1u, docs.size());
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "one", "_version_", (int64_t)indexed.updateVersion,
+                                    "_version___self", (int64_t)indexed.updateVersion));
+  }
+}
+
 TEST_F(DocFormatTest, rowCountWithoutColumnsOrDocs) {
   CollectionHelper ch;
   indexBooks(ch);
@@ -182,8 +209,8 @@ TEST_F(DocFormatTest, defaultProjectionReturnsEveryRetrievableField) {
                                       "year_i", (int64_t)1951));
   }
 
-  // _version_ is written for documents indexed with overwrite.  The default
-  // projection still leaves it out; named, it comes back like any column.
+  // Every document has a request birth. The default projection leaves it out;
+  // an explicit name retrieves it.
   ch.index(flatdoc("id", std::string("b4"), "title_t", std::string("versioned")),
            UpdateMessage::COMMIT, /*overwrite=*/true);
   auto req = localReq(ch.getSearchEngine());
@@ -276,7 +303,7 @@ TEST_F(DocFormatTest, wildcardFieldsFollowDocumentFormat) {
   indexBooks(ch);
   ch.index(flatdoc("id", std::string("b5"), "title_t", std::string("wildcards"),
                    "emb_v", std::vector<float>{1, 0}),
-           UpdateMessage::COMMIT, /*overwrite=*/true);  // overwrite writes _version_
+           UpdateMessage::COMMIT, /*overwrite=*/true);
 
   auto req = localReq(ch.getSearchEngine());
   req->collection("main").topDocs("q").allQuery()

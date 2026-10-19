@@ -439,8 +439,10 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
         throw SchemaError("reserved field '_version_' must have type 'int'");
       }
       if (logical.hasMulti && logical.multi) throw SchemaError("reserved field '_version_' cannot be multi-valued");
-      if (r.hasColumn && !r.column) {
-        throw SchemaError("reserved field '_version_' requires column=true");
+      if ((r.hasColumn && r.column) || (r.hasIndex && r.index != IndexMode::NONE)
+          || logical.stored || logical.hasStoredResource || r.analyzer || r.normalizer
+          || r.longTerms || logical.defaults) {
+        throw SchemaError("reserved field '_version_' is retrieval-only and cannot be configured");
       }
     } else if (r.hasType && r.type == FieldClass::ID) {
       throw SchemaError("type 'id' is reserved for the 'id' field (field: " + std::string(name) +
@@ -463,6 +465,7 @@ struct FieldCompiler {
 
     // Apply defaults based on type if properties were not explicitly set
     IndexMode index = r.index;
+    if (name == "_version_") return std::make_shared<IntFieldType>(name, 0);
     bool column = r.column;
     bool multi = logical.multi;
     bool stored = logical.stored;
@@ -1045,6 +1048,9 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   if (!validFieldName(rootName)) {
     throw RequestError("Invalid field or selector root: " + std::string(name), "invalid_field_name");
   }
+  if (rootName == "_version_" && op != OpClass::RETRIEVE) {
+    throw RequestError("Field '_version_' is retrieval-only", "retrieval_only");
+  }
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
   std::string_view label = "self";
@@ -1109,7 +1115,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
     for (size_t i = 0; i < filters.size(); i++) fl[i].name = filters[i];
   };
 
-  // Concrete fields (id defaults to MATCH+column, _version_ to NONE+column).
+  // Concrete fields (id defaults to MATCH+column, _version_ is virtual retrieval).
   add(fields, "id", FieldClass::ID);
   add(fields, "_version_", FieldClass::INT);
 

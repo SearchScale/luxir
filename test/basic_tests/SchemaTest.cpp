@@ -285,11 +285,21 @@ TEST_F(SchemaTest, replaceMaterializesReservedFields) {
   auto* version = schema->getFieldTypePtr("_version_");
   ASSERT_NE(nullptr, version);
   EXPECT_EQ(FieldType::INT, version->type());
-  EXPECT_TRUE(version->hasColumn());
+  EXPECT_FALSE(version->hasColumn());
 }
 
 
 TEST_F(SchemaTest, reservedFieldValidation) {
+  for (int setting = 0; setting < 3; setting++) {
+    SchemaBuilder b;
+    auto& version = b.field("_version_");
+    version.type = FieldClass::INT;
+    if (setting == 0) version.column = true;
+    else if (setting == 1) version.stored = true;
+    else version.index = api::FieldDef::IndexMode::RANGE;
+    EXPECT_THROW(b.build(), SchemaError);
+  }
+
   {
     SchemaBuilder b;
     b.field("id").type = FieldClass::STRING;  // id must be type id
@@ -1310,7 +1320,8 @@ TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
     EXPECT_EQ(FieldRole::VARIANT, variant.role);
     EXPECT_EQ(input.owner, variant.owner);
     EXPECT_EQ(variant.fieldType, variant.owner->variants.at("s").get());
-    EXPECT_EQ("_version_", s->resolveFor("_version___self", op).physicalName);
+    if (op == OpClass::RETRIEVE) EXPECT_EQ("_version_", s->resolveFor("_version___self", op).physicalName);
+    else EXPECT_THROW(s->resolveFor("_version___self", op), RequestError);
     EXPECT_EQ("self", s->resolveFor("self__self", op).physicalName);
     EXPECT_EQ("f___s", s->resolveFor("f___s", op).physicalName);
   }
