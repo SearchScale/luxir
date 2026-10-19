@@ -179,6 +179,13 @@ bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
   return true;
 }
 
+auto failFileCreation(Directory& dir, std::string filename) {
+  Signal::listen("checkedCreateFile", [&dir, filename = std::move(filename)](void* source, void* name, void*) -> void* {
+    return source == &dir && *(std::string_view*)name == filename ? source : nullptr;
+  });
+  return scope_guard([] { Signal::unlisten("checkedCreateFile"); });
+}
+
 } // namespace
 
 
@@ -2231,6 +2238,74 @@ TEST_F(IndexWriterTest, failedDeleteApplicationRetainsDeletesForRetry) {
   helper.commit();
   EXPECT_EQ(0, iw->snapshots.readers.getReader()->liveDocs());
   EXPECT_TRUE(iw->pendingDeletes.empty());
+}
+
+TEST_F(IndexWriterTest, liveDocsCreationFailureRetainsDeletesForRetry) {
+  using namespace luxir::test;
+  LuxirConfig config;
+  config.store.checked_dir.sync = "throw";
+  LuxirNode node(config);
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "keep")},
+                             UpdateMessage::COMMIT, true).success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->segInfos.size());
+  auto& seg = *iw->segInfos.begin()->second;
+  auto reader = iw->snapshots.readers.getReader();
+  auto failedName = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), 2);
+  {
+    auto fault = failFileCreation(iw->dir, failedName);
+    ExpectLog quiet("Failed to create liveDocs file");
+    auto result = helper.deleteById("dup", UpdateMessage::COMMIT);
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(std::string::npos, result.error_message.find(failedName));
+    iw->updateGraph->wait_for_all();
+  }
+  EXPECT_FALSE(iw->pendingDeletes.empty());
+  EXPECT_EQ(reader, iw->snapshots.readers.getReader());
+  EXPECT_EQ(2, reader->liveDocs());
+  EXPECT_EQ(1, seg.liveGen);
+  EXPECT_EQ(nullptr, iw->dir.openFile(failedName));
+  helper.commit();
+  EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
+  expectValidInventory(iw->dir, *readDurableIndexInfo(iw->dir));
+}
+
+TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
+  using namespace luxir::test;
+  LuxirConfig config;
+  config.store.checked_dir.sync = "throw";
+  LuxirNode node(config);
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  ASSERT_TRUE(helper.index(flatdoc("id", "keep"), UpdateMessage::COMMIT, true).success);
+  iw->updateGraph->wait_for_all();
+  int64_t reserved = node.getIndexRamBudget().reservedBytes();
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup")},
+                             UpdateMessage::NO_COMMIT, true).success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  uint64_t segId = iw->idleInverters.begin()->second->getPostingsWriter().segId;
+  auto failedName = Postings::getLiveDocsFileName(Postings::getSortableString(segId), 1);
+  {
+    auto fault = failFileCreation(iw->dir, failedName);
+    ExpectLog quiet("Failed to create liveDocs file");
+    CollectionHelper::UpdateBuilder commit;
+    commit.commit();
+    auto result = helper.submit(commit);
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(std::string::npos, result.error_message.find(failedName));
+    iw->updateGraph->wait_for_all();
+  }
+  EXPECT_FALSE(iw->segInfos.contains(segId));
+  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, segId));
+  EXPECT_EQ(reserved, node.getIndexRamBudget().reservedBytes());
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup")},
+                             UpdateMessage::COMMIT, true).success);
+  expectValidInventory(iw->dir, *readDurableIndexInfo(iw->dir));
 }
 
 TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {

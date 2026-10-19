@@ -3165,12 +3165,8 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     numLiveDocs -= newDeletesCount;
 
     std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), seg.liveGen);
-    bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
-    if (success) std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
-    if (!success) {
-      LOG_ERROR("Failed to write liveDocs file for segment {} with liveGen {}", seg.segId, newLiveGen);
-      return;
-    }
+    LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
+    std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
                 newDeletesCount, seg.segId, newLiveGen, numLiveDocs);
