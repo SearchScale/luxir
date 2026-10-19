@@ -177,6 +177,10 @@ Before committing memory-sensitive work, run the ASan build:
 
 The ASan presets use the instrumented dependencies in
 `/opt/vcpkg/installed-native-asan`, built by the same setup script.
+`gcc-debug-asan` compiles Luxir with `-g1`: backtraces keep functions, inlined
+frames, and line numbers, but a debugger cannot show local variables. To
+inspect locals under ASan, configure with
+`-DCMAKE_CXX_FLAGS_DEBUG="-g -Og -ftrivial-auto-var-init=pattern"`.
 
 ```bash
 cmake --preset gcc-debug-asan
