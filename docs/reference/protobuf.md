@@ -87,6 +87,7 @@ defaults and constraints are described in the comments and guides.
 - [`ColFloat`](#message-luxir.colfloat)
 - [`ColInt`](#message-luxir.colint)
 - [`ColStr`](#message-luxir.colstr)
+- [`ColVal`](#message-luxir.colval)
 - [`ColVector`](#message-luxir.colvector)
 - [`Collapse`](#message-luxir.collapse)
 - [`CollectionActivityStats`](#message-luxir.collectionactivitystats)
@@ -589,6 +590,18 @@ This process's cgroup v2. Limits are local to the cgroup; ancestors may impose s
 | <a id="field-luxir.colstr.missing_val"></a>[`missing_val`](#field-luxir.colstr.missing_val) | 1 | `string` | singular | "" unless a real empty string occurs in the batch, in which case a string greater than every batch value is used (see the ColInt.missing\_val sentinel note; the check is exact). |
 | <a id="field-luxir.colstr.v"></a>[`v`](#field-luxir.colstr.v) | 2 | `string` | repeated |  |
 
+<a id="message-luxir.colval"></a>
+
+### luxir.ColVal
+
+Column of a field type that has no typed arm (an object, an interval, a boolean): v\[i\] holds what document i's row entry would. An unset kind means missing.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.colval.v"></a>[`v`](#field-luxir.colval.v) | 1 | [`Val`](#message-luxir.val) | repeated |  |
+
 <a id="message-luxir.colvector"></a>
 
 ### luxir.ColVector
@@ -680,7 +693,7 @@ Engine work that reached this collection since it was opened. The node's Service
 
 ### luxir.Column
 
-One slot per document, including missing values, aligned with DocList rows. Scalar columns use missing\_val; multi-valued columns use empty arrays. Vector columns use the missing-value rules described on their fields.
+One slot per document, including missing values, aligned with DocList rows. Scalar columns use missing\_val; multi-valued columns use empty arrays. Vector and value columns use the missing-value rules described on their fields. Every returned field type has a column form: a type with no typed arm uses col\_val.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -698,6 +711,7 @@ One slot per document, including missing values, aligned with DocList rows. Scal
 | <a id="field-luxir.column.multi_i"></a>[`multi_i`](#field-luxir.column.multi_i) | 6 | [`ArrArrInt`](#message-luxir.arrarrint) | oneof [`kind`](#oneof-luxir.column.kind) |  |
 | <a id="field-luxir.column.multi_f"></a>[`multi_f`](#field-luxir.column.multi_f) | 7 | [`ArrArrFloat`](#message-luxir.arrarrfloat) | oneof [`kind`](#oneof-luxir.column.kind) |  |
 | <a id="field-luxir.column.multi_d"></a>[`multi_d`](#field-luxir.column.multi_d) | 8 | [`ArrArrDouble`](#message-luxir.arrarrdouble) | oneof [`kind`](#oneof-luxir.column.kind) |  |
+| <a id="field-luxir.column.col_val"></a>[`col_val`](#field-luxir.column.col_val) | 9 | [`ColVal`](#message-luxir.colval) | oneof [`kind`](#oneof-luxir.column.kind) | any other value type: one Val per doc; missing = unset kind |
 | <a id="field-luxir.column.col_vec"></a>[`col_vec`](#field-luxir.column.col_vec) | 16 | [`ColVector`](#message-luxir.colvector) | oneof [`kind`](#oneof-luxir.column.kind) | single-valued vector column: one Vector per doc; missing = unset oneof |
 | <a id="field-luxir.column.multi_vec"></a>[`multi_vec`](#field-luxir.column.multi_vec) | 17 | [`MultiVector`](#message-luxir.multivector) | oneof [`kind`](#oneof-luxir.column.kind) | multi-valued vector column: one ArrVector per doc; missing = empty list |
 
@@ -839,7 +853,7 @@ A document cap, applied before paging in the list's ordinary rank order.
 
 ### luxir.DocList
 
-A batch of returned documents. Document i is the merge of columns row i and docs\[i\]; all-columns (docs absent) and all-docs (columns empty) are just the degenerate cases. Which fields land where is a function of the request (see DocFormat), never of the data.
+A batch of returned documents. Document i is the merge of columns row i and docs\[i\]; all-columns (docs absent) and all-docs (columns empty) are just the degenerate cases. Which fields land where follows the request's DocFormat; under COLUMNS an all-missing discovered column is left out of the batch, under ADAPTIVE placement is per batch and field.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1140,7 +1154,7 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
 | <a id="field-luxir.fusion.fields"></a>[`fields`](#field-luxir.fusion.fields) | 7 | `string` | repeated | as TopDocs.fields: empty returns every retrievable field, '\*' patterns expand |
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
-| <a id="field-luxir.fusion.document_format"></a>[`document_format`](#field-luxir.fusion.document_format) | 9 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
+| <a id="field-luxir.fusion.document_format"></a>[`document_format`](#field-luxir.fusion.document_format) | 9 | [`DocFormat`](#enum-luxir.docformat) | singular | placement of returned fields: rows, columns, or adaptive (see DocFormat) |
 | <a id="field-luxir.fusion.collapse"></a>[`collapse`](#field-luxir.fusion.collapse) | 17 | [`Collapse`](#message-luxir.collapse) | singular | Collapse the fused document list before paging. Source windows never refill. found counts eligible groups; found\_docs counts eligible fused documents. |
 | <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, even with collapse. Fusion limit and offset do not affect this candidate domain. |
 | <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite, &gt;= 0, and within float range, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
@@ -2283,10 +2297,10 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.topdocs.get_number"></a>[`get_number`](#field-luxir.topdocs.get_number) | 5 | `bool` | singular | return the number of matching documents |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
-| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index and placed in per-document rows (DocList.docs). A name containing '\*' is a pattern expanded the same way: the matching retrievable fields, in rows; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
+| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
-| <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
+| <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | placement of returned fields: rows, columns, or adaptive (see DocFormat) |
 | <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
 | <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
@@ -2530,15 +2544,16 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 
 ### luxir.DocFormat
 
-Placement preference for returned document fields: dense columns (DocList.columns) vs per-document maps (DocList.docs). DEFAULT resolves per transport: HTTP/JSON -&gt; ROWS, gRPC -&gt; COLUMNS. Under COLUMNS, explicitly named fields are returned as dense columns while discovered fields (empty or wildcard selectors) use docs; under ROWS everything is returned in docs.
+Placement of returned document fields: dense columns (DocList.columns) or per-document maps (DocList.docs). A document is the merge of columns row i and docs\[i\]; a field is never in both. A missing value is an absent key in docs\[i\] or the column's missing sentinel. A field with no value in a batch is left out of that batch, except a named field under COLUMNS, whose column is present in every batch. DEFAULT resolves per transport: HTTP/JSON -&gt; ROWS, gRPC -&gt; COLUMNS.
 
 [Source](../../protos/luxir_types.proto)
 
 | Value | Number | Description |
 |---|---|---|
 | <a id="value-luxir.docformat.default"></a>[`DEFAULT`](#value-luxir.docformat.default) | 0 |  |
-| <a id="value-luxir.docformat.rows"></a>[`ROWS`](#value-luxir.docformat.rows) | 1 |  |
-| <a id="value-luxir.docformat.columns"></a>[`COLUMNS`](#value-luxir.docformat.columns) | 2 |  |
+| <a id="value-luxir.docformat.rows"></a>[`ROWS`](#value-luxir.docformat.rows) | 1 | every field in docs |
+| <a id="value-luxir.docformat.columns"></a>[`COLUMNS`](#value-luxir.docformat.columns) | 2 | every field as a column |
+| <a id="value-luxir.docformat.adaptive"></a>[`ADAPTIVE`](#value-luxir.docformat.adaptive) | 3 | per batch and field, whichever encodes the batch more compactly |
 
 <a id="enum-luxir.error.kind"></a>
 

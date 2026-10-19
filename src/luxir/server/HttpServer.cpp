@@ -1352,8 +1352,8 @@ private:
       return false;
     }
     if (const std::string* text = findParam(params, "document_format")) {
-      if (*text != "default" && *text != "rows" && *text != "columns") {
-        err = "invalid URL parameter 'document_format': expected default, rows, or columns, got '" +
+      if (*text != "default" && *text != "rows" && *text != "columns" && *text != "adaptive") {
+        err = "invalid URL parameter 'document_format': expected default, rows, columns, or adaptive, got '" +
               *text + "'";
         return false;
       }
@@ -1712,6 +1712,9 @@ private:
         if (td->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
+        if (td->document_format == luxir::api::DocFormat::ADAPTIVE) {
+          return "format=docs emits row documents; document_format ADAPTIVE conflicts";
+        }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
         if (!f->ops.empty()) return "format=docs does not support nested ops";
         for (const auto& [srcName, src] : f->sources) {
@@ -1719,6 +1722,9 @@ private:
         }
         if (f->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
+        }
+        if (f->document_format == luxir::api::DocFormat::ADAPTIVE) {
+          return "format=docs emits row documents; document_format ADAPTIVE conflicts";
         }
       } else {
         return "format=docs requires top_docs or fusion ops";

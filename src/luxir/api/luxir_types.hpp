@@ -75,7 +75,7 @@ struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
 struct ArrArrDouble; struct Vector; struct ArrVector;
-struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
+struct ColStr; struct Column; struct ColVal; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorAnnDef; struct StoredResourceDef;
 struct SchemaRequest; struct SchemaResponse;
@@ -114,7 +114,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
-enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
+enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
@@ -787,6 +787,7 @@ struct SchemaDef {                                                // needs Store
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
   map_view<std::string_view, StoredResourceDef> stored_resources;
 };
+struct ColVal { std::span<const Val> v; };                        // span<incomplete Val> OK
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
 struct SchemaResponse {
@@ -814,7 +815,7 @@ struct ArrVal { std::span<const Val> v; };                       // span<incompl
 
 struct Column {                                                  // variant arms all complete above
   std::variant<std::monostate, ColStr, ColInt, ColFloat, ColDouble, ArrArrStr, ArrArrInt,
-               ArrArrFloat, ArrArrDouble, ColVector, MultiVector>
+               ArrArrFloat, ArrArrDouble, ColVal, ColVector, MultiVector>
       kind;
 };
 
@@ -1118,7 +1119,7 @@ LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
 LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
-LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
+LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVal) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
@@ -1166,7 +1167,7 @@ LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUX
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)
 LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(Vector)
 LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
-LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
+LUXIR_ENTRY(ColVal) LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef) LUXIR_ENTRY(StoredResourceDef)
 LUXIR_ENTRY(VectorAnnDef)

@@ -58,7 +58,9 @@ for the whitelist and value grammars.
 Search responses use `application/x-ndjson` with HTTP chunked transfer coding.
 Each normal line is one complete response batch. A small default-limit search
 usually has one line and therefore also parses as an ordinary JSON object. Use
-`?format=docs` for document-per-line export without response envelopes.
+`?format=docs` for document-per-line export without response envelopes; it
+emits row documents, so `document_format` `columns` or `adaptive` is rejected
+with it.
 
 Explicit request `ops` return named results under response `ops`, preserving
 their hierarchy in every batch. Root query shorthand returns its implicit
