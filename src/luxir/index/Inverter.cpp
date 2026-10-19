@@ -25,7 +25,7 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
     getIndexHandler("id");
     assert(idHandler_ != nullptr);
   }
-  static_cast<handler::IdHandler&>(*idHandler_).addDelete(id, version);
+  static_cast<handler::IdHandler&>(*idHandler_).addDelete(*this, id, version);
 }
 
 

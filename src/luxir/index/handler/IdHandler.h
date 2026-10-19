@@ -79,7 +79,7 @@ public:
   }
 
   /// Record an explicit delete-by-id (not an overwrite).
-  void addDelete(std::string_view id, uint64_t version) {
+  void addDelete(Inverter& inverter, std::string_view id, uint64_t version) {
     PackedTerm::TermBuffer scratch;
     id = fitId(id, scratch);
     if (deleteHash == nullptr) {
@@ -95,6 +95,7 @@ public:
     } else {
       undoLog_.push_back({*entry, IdEntry(-1, 0), true});
     }
+    accountExtraRam(inverter, idExtraBytes());
   }
 
   size_t undoSize() const {

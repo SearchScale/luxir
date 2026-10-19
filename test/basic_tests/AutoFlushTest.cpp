@@ -126,6 +126,32 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   EXPECT_EQ(req->getMatchCount("q"), nDocs);
 }
 
+TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  ASSERT_TRUE(helper.deleteById("repeat").success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  auto* inverter = iw->idleInverters.begin()->first;
+  size_t initialSize = inverter->memSize();
+  int64_t initialReserved = budget.reservedBytes();
+  for (int i = 0; i < 32; i++) {
+    ASSERT_TRUE(helper.deleteByIds({"repeat", std::string(100, 'x') + std::to_string(i)}).success);
+  }
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  EXPECT_EQ(inverter, iw->idleInverters.begin()->first);
+  EXPECT_GT(inverter->memSize(), initialSize);
+  EXPECT_GT(budget.reservedBytes(), initialReserved);
+  iw->perInverterRamBytes = inverter->memSize();
+  ASSERT_TRUE(helper.deleteById(std::string(100, 'y')).success);
+  iw->updateGraph->wait_for_all();
+  EXPECT_FALSE(iw->pendingDeletes.empty());
+  EXPECT_TRUE(iw->segInfos.empty());
+}
+
 // Waits for the budget's reservations to drain back to at most `bound` (the
 // last inverter is destroyed shortly AFTER its flush is observable, so a
 // post-commit check must poll).
