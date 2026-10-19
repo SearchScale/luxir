@@ -140,6 +140,16 @@ else()
   message(STATUS "Luxir: using default system linker (no faster linker usable)")
 endif()
 
+# Thin static archives: the project's libraries only feed this build's own
+# links, so an archive can index its objects in place instead of copying them.
+# Rewriting the full luxir_lib archive after each engine edit took seconds.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  foreach(_lang C CXX)
+    set(CMAKE_${_lang}_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_${_lang}_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  endforeach()
+endif()
+
 # This keeps dlls and executables together, which makes windows happy.
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
