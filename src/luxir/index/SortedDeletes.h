@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/TermValHash.h"
 #include "luxir/util/luxir_util.h"
@@ -46,6 +47,9 @@ public:
   using EntrySpan = std::span<const Entry>;
   using Table = TermValHash<IdEntry>::Table;
 
+  // Declared before storage so the last owner's destruction frees storage first.
+  IndexRamBudget::Guard ramGuard;
+
 private:
   std::unique_ptr<MemPool> pool_;
   boost::container::small_vector<EntrySpan, 2> lists_;
@@ -59,8 +63,8 @@ public:
 
   SortedDeletes(const SortedDeletes&) = delete;
   SortedDeletes& operator=(const SortedDeletes&) = delete;
-  SortedDeletes(SortedDeletes&&) = default;
-  SortedDeletes& operator=(SortedDeletes&&) = default;
+  SortedDeletes(SortedDeletes&&) = delete;
+  SortedDeletes& operator=(SortedDeletes&&) = delete;
 
   /// Take ownership of a sorted table, keeping its original allocation size.
   void addList(Table table, int32_t count, uint64_t minVersion, uint64_t maxVersion) {
@@ -78,6 +82,12 @@ public:
   }
 
   std::span<const EntrySpan> lists() const { return lists_; }
+
+  size_t memSize() const {
+    size_t bytes = sizeof(SortedDeletes) + (pool_ ? pool_->capacity() : 0);
+    for (const auto& table : ownedTables_) bytes += table.get_deleter().bytes;
+    return bytes;
+  }
 
   uint64_t getLargestVersion() const { return maxVersion_; }
   uint64_t getSmallestVersion() const { return minVersion_; }

@@ -2288,10 +2288,16 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
                              UpdateMessage::NO_COMMIT, true).success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->idleInverters.size());
-  uint64_t segId = iw->idleInverters.begin()->second->getPostingsWriter().segId;
+  auto* inverter = iw->idleInverters.begin()->first;
+  uint64_t segId = inverter->getPostingsWriter().segId;
   auto failedName = Postings::getLiveDocsFileName(Postings::getSortableString(segId), 1);
   {
-    auto fault = failFileCreation(iw->dir, failedName);
+    Signal::listen("checkedCreateFile", [&](void* source, void* name, void*) -> void* {
+      if (source != &iw->dir || *(std::string_view*)name != failedName) return nullptr;
+      EXPECT_NE(nullptr, inverter->sortedDeletes);
+      return source;
+    });
+    auto fault = scope_guard([] { Signal::unlisten("checkedCreateFile"); });
     ExpectLog quiet("Failed to create liveDocs file");
     CollectionHelper::UpdateBuilder commit;
     commit.commit();
@@ -2303,6 +2309,8 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
   EXPECT_FALSE(iw->segInfos.contains(segId));
   EXPECT_TRUE(segmentPrefixAbsent(iw->dir, segId));
   EXPECT_EQ(reserved, node.getIndexRamBudget().reservedBytes());
+  EXPECT_EQ(0, node.getIndexRamBudget().drainingBytesCount());
+  EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup")},
                              UpdateMessage::COMMIT, true).success);
   expectValidInventory(iw->dir, *readDurableIndexInfo(iw->dir));
@@ -3073,7 +3081,8 @@ TEST_F(IndexWriterTest, admittedMergePublishesDuringClose) {
 }
 
 TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
-  test::CollectionHelper helper("merge_live_docs");
+  LuxirNode node;
+  test::CollectionHelper helper(node, "merge_live_docs");
   auto writer = helper.getIndexWriter();
   ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b"),
                                test::flatdoc("id", "c"), test::flatdoc("id", "e"),
@@ -3093,6 +3102,10 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
   auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
   started.wait();
   EXPECT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  EXPECT_TRUE(writer->pendingDeletes.empty());
+  auto retained = writer->stats(false).retainedDeleteBytes;
+  EXPECT_GT(retained, 0);
+  EXPECT_EQ(retained, node.getIndexRamBudget().retainedDeleteBytesCount());
   auto intermediate = test::readDurableIndexInfo(writer->dir);
   auto intermediateLiveDocs = Postings::getLiveDocsFileName(
       Postings::getSortableString(seg.seg_id), intermediate->segments.front().live_gen);
@@ -3102,6 +3115,8 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
   EXPECT_NE(nullptr, writer->dir.openFile(oldLiveDocs));
   release.count_down();
   EXPECT_NO_THROW(merge.get());
+  writer->updateGraph->wait_for_all();
+  EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
   EXPECT_EQ(3, writer->snapshots.readers.getReader()->liveDocs());
   EXPECT_EQ(nullptr, writer->dir.openFile(oldLiveDocs));
 }

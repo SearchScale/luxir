@@ -319,6 +319,7 @@ struct IndexRamStats {
   uint64_t reserved_bytes = 0;
   uint64_t draining_bytes = 0;
   uint64_t pending_merge_bytes = 0;
+  uint64_t retained_delete_bytes = 0;
 };
 struct ArenaStats {
   uint64_t allocated_bytes = 0;
@@ -398,6 +399,7 @@ struct IndexStats {
   uint64_t inverters_idle = 0;
   uint64_t inverters_flushing = 0;
   uint64_t commits = 0;
+  uint64_t retained_delete_bytes = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;

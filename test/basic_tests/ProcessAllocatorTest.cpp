@@ -303,6 +303,7 @@ TEST(ProcessAllocatorTest, abortedFlushAndDestructionFreeArenaMemory) {
       EXPECT_GT(arena.stats()->allocated, start.allocated + 1024 * 1024);
       if (abortFlush) {
         inverter.fail(std::make_exception_ptr(std::runtime_error("aborted indexing")));
+        EXPECT_EQ(0, inverter.retainedDeleteBytes());
         writer.releaseInverter(inverter, true);
         writer.updateGraph->wait_for_all();
         EXPECT_EQ(arena.stats()->allocated, start.allocated);

@@ -1801,6 +1801,10 @@ message IndexStats {
   uint64 inverters_idle = 16;
   uint64 inverters_flushing = 17;
   uint64 commits = 18; // writer only: commits since the writer opened
+  // Writer only: resident delete packets held by its pending set or merge
+  // catch-up, deduplicated across owners. Included in the node indexing
+  // reservation.
+  uint64 retained_delete_bytes = 19;
 }
 
 // Ids and generations that appear in filenames are reported in their
@@ -1870,6 +1874,9 @@ message IndexRamStats {
   uint64 reserved_bytes = 2;  // may temporarily exceed the soft limit
   uint64 draining_bytes = 3;  // reserved bytes currently draining through flushes
   uint64 pending_merge_bytes = 4; // pending merge demand, capped at the limit when limited
+  // Resident delete packets across all owners, including commit and merge
+  // catch-up references. Included in reserved_bytes; flushing does not free them.
+  uint64 retained_delete_bytes = 5;
 }
 
 // jemalloc's process-wide statistics (stats.*), read at one statistics epoch

@@ -28,6 +28,11 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
   static_cast<handler::IdHandler&>(*idHandler_).addDelete(*this, id, version);
 }
 
+size_t Inverter::retainedDeleteBytes() const {
+  if (failed() || idHandler_ == nullptr) return 0;
+  return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();
+}
+
 
 Inverter::UndoMark Inverter::undoMark() const {
   UndoMark mark;

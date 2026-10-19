@@ -97,6 +97,7 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   r.gauge("luxir_index_ram_budget_bytes", "Shared indexing RAM cap; zero means unlimited.", (double)ram.limit_bytes);
   r.gauge("luxir_index_ram_draining_bytes", "Reserved indexing RAM currently draining through flushes.", (double)ram.draining_bytes);
   r.gauge("luxir_index_ram_pending_merge_bytes", "Pending merge demand, capped at the indexing RAM budget when limited.", (double)ram.pending_merge_bytes);
+  r.gauge("luxir_index_ram_retained_delete_bytes", "Resident delete packets across all owners; part of the reservations and not freed by flushing.", (double)ram.retained_delete_bytes);
   r.gauge("luxir_storage_ram_bytes", "RAM storage bytes owned by the node; not disk usage.", (double)m.storage_ram.used_bytes);
   r.gauge("luxir_storage_ram_limit_bytes", "RAM storage cap; zero means unlimited or not applicable.", (double)m.storage_ram.limit_bytes);
   const auto& f = m.field_metadata;
@@ -195,6 +196,7 @@ void collections(Renderer& r, const api::StatsResponse& stats) {
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_idle, labels + ",state=\"idle\"");
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_flushing, labels + ",state=\"flushing\"");
     r.counter("luxir_index_commits_total", "Commits since the writer opened.", (double)index.commits, labels);
+    r.gauge("luxir_index_retained_delete_bytes", "Delete packets retained by the writer, counted once per packet.", (double)index.retained_delete_bytes, labels);
     if (c.activity) collectionActivity(r, *c.activity, labels);
     cache(r, index.query_cache, labels);
   }

@@ -1352,6 +1352,7 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexramstats.reserved_bytes"></a>[`reserved_bytes`](#field-luxir.indexramstats.reserved_bytes) | 2 | `uint64` | singular | may temporarily exceed the soft limit |
 | <a id="field-luxir.indexramstats.draining_bytes"></a>[`draining_bytes`](#field-luxir.indexramstats.draining_bytes) | 3 | `uint64` | singular | reserved bytes currently draining through flushes |
 | <a id="field-luxir.indexramstats.pending_merge_bytes"></a>[`pending_merge_bytes`](#field-luxir.indexramstats.pending_merge_bytes) | 4 | `uint64` | singular | pending merge demand, capped at the limit when limited |
+| <a id="field-luxir.indexramstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexramstats.retained_delete_bytes) | 5 | `uint64` | singular | Resident delete packets across all owners, including commit and merge catch-up references. Included in reserved\_bytes; flushing does not free them. |
 
 <a id="message-luxir.indexstats"></a>
 
@@ -1379,6 +1380,7 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.inverters_idle"></a>[`inverters_idle`](#field-luxir.indexstats.inverters_idle) | 16 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.inverters_flushing"></a>[`inverters_flushing`](#field-luxir.indexstats.inverters_flushing) | 17 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
+| <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
 
 <a id="message-luxir.jemallocstats"></a>
 

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <latch>
 #include <span>
 #include <string>
 #include <thread>
@@ -21,6 +22,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/server/Stats.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/store/Directory.h"
 #include "luxir/util/Signal.h"
@@ -145,11 +147,127 @@ TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
   EXPECT_EQ(inverter, iw->idleInverters.begin()->first);
   EXPECT_GT(inverter->memSize(), initialSize);
   EXPECT_GT(budget.reservedBytes(), initialReserved);
-  iw->perInverterRamBytes = inverter->memSize();
+  iw->perInverterRamBytes = inverter->memSize() - 1;
   ASSERT_TRUE(helper.deleteById(std::string(100, 'y')).success);
   iw->updateGraph->wait_for_all();
   EXPECT_FALSE(iw->pendingDeletes.empty());
   EXPECT_TRUE(iw->segInfos.empty());
+}
+
+TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
+  for (bool overwrite : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto& budget = node.getIndexRamBudget();
+    ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, false).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT, overwrite).success);
+    ASSERT_TRUE(helper.deleteById("absent").success);
+    auto& inverter = iw->obtainInverter(2);
+    int64_t packetBytes = (int64_t)inverter.retainedDeleteBytes();
+    int64_t before = budget.reservedBytes();
+    std::latch started(1), release(1);
+    auto cleanup = scope_guard([&] {
+      if (!release.try_wait()) release.count_down();
+      iw->updateGraph->wait_for_all();
+      Signal::unlisten("segmentFlushBody");
+    });
+    Signal::listen("segmentFlushBody", [&](void* source, void*, void*) -> void* {
+      if (source == &inverter) { started.count_down(); release.wait(); }
+      return nullptr;
+    });
+    iw->releaseInverter(inverter, true);
+    started.wait();
+    EXPECT_EQ(before, budget.reservedBytes());
+    EXPECT_EQ(before - packetBytes, budget.drainingBytesCount());
+    release.count_down();
+    iw->updateGraph->wait_for_all();
+    Signal::unlisten("segmentFlushBody");
+    ASSERT_EQ(1, iw->pendingDeletes.size());
+    EXPECT_EQ(packetBytes, (*iw->pendingDeletes.deletes.begin())->memSize());
+    EXPECT_EQ(packetBytes, budget.retainedDeleteBytesCount());
+    EXPECT_EQ(packetBytes, budget.reservedBytes());
+    EXPECT_EQ(packetBytes, iw->stats(false).retainedDeleteBytes);
+    helper.commit();
+    iw->updateGraph->wait_for_all();
+    EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+    EXPECT_EQ(0, budget.reservedBytes());
+  }
+}
+
+TEST_F(AutoFlushTest, rollbackRetainedDeleteAccounting) {
+  for (bool overwrite : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto& budget = node.getIndexRamBudget();
+    if (overwrite) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::NO_COMMIT, true).success);
+      ASSERT_TRUE(helper.deleteById("absent").success);
+    }
+    CollectionHelper::UpdateBuilder request;
+    request.add(flatdoc("id", "new")).add(flatdoc("id", "old"))
+        .add(flatdoc("id", "bad", "no_such_field", "fail"))
+        .overwrite(overwrite).allOrNone();
+    if (overwrite) request.remove("absent").remove("rolled-back");
+    EXPECT_FALSE(helper.submit(request).success);
+    auto& inverter = iw->obtainInverter();
+    iw->releaseInverter(inverter, true);
+    iw->updateGraph->wait_for_all();
+    if (overwrite) {
+      ASSERT_EQ(1, iw->pendingDeletes.size());
+      EXPECT_EQ((*iw->pendingDeletes.deletes.begin())->memSize(), budget.retainedDeleteBytesCount());
+    } else {
+      EXPECT_TRUE(iw->pendingDeletes.empty());
+      EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+      EXPECT_EQ(0, budget.reservedBytes());
+    }
+  }
+}
+
+TEST_F(AutoFlushTest, retainedDeleteStatsReachApi) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->perInverterRamBytes = 1;
+  ASSERT_TRUE(helper.deleteById("absent").success);
+  iw->updateGraph->wait_for_all();
+  uint64_t bytes = (uint64_t)node.getIndexRamBudget().retainedDeleteBytesCount();
+  ASSERT_GT(bytes, 0);
+  api::StatsRequest request;
+  request.collections = true;
+  api::StatsResponse response;
+  std::pmr::monotonic_buffer_resource resource;
+  gatherStats(node, request, response, resource);
+  EXPECT_EQ(bytes, response.memory->indexing_budget.retained_delete_bytes);
+  EXPECT_EQ(bytes, response.collections[0].shards[0].index.retained_delete_bytes);
+}
+
+TEST_F(AutoFlushTest, pressureChoosesReliefInsteadOfRetainedDeletes) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  auto& deletes = iw->obtainInverter(1);
+  for (int i = 0; i < 1000; i++) deletes.deleteId(std::string(100, 'x') + std::to_string(i), 1);
+  auto& docs = iw->obtainInverter(1);
+  auto& text = docs.getIndexHandler("text_w");
+  docs.startDoc();
+  text.index(docs, "reclaimable text");
+  docs.finishDoc();
+  docs.pool.alloc(16384);
+  size_t relief = deletes.memSize() - deletes.retainedDeleteBytes();
+  iw->pressureFlushFloorBytes = relief + 1;
+  ASSERT_GT(docs.memSize(), iw->pressureFlushFloorBytes);
+  ASSERT_GT(deletes.memSize(), docs.memSize());
+  iw->releaseInverter(deletes);
+  iw->releaseInverter(docs);
+  budget.setTotalBytes(1);
+  iw->updateGraph->wait_for_all();
+  EXPECT_TRUE(iw->idleInverters.contains(&deletes));
+  EXPECT_TRUE(iw->pendingDeletes.empty());
+  EXPECT_EQ(1, iw->segInfos.size());
+  budget.setTotalBytes(0);
 }
 
 // Waits for the budget's reservations to drain back to at most `bound` (the

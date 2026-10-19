@@ -222,8 +222,8 @@ blocks.
 
 | Parameter | Adds | Cost |
 | --- | --- | --- |
-| (default, node scope) | `service`: request, search, ingest and background activity and latency; `memory`: indexing RAM budget, draining and pending-merge bytes, RAM storage, field metadata, jemalloc and its arenas, configured budgets. | Atomic loads and one allocator statistics read. |
-| `collections=true` | `totals` and per-collection `collections`: documents, segments, committed bytes, commit time, generations, merges, inverters, snapshot pins and drops, query cache, availability. Implied on tenant and collection routes. | Briefly takes each writer's index lock and decodes each reader-only manifest. No file I/O. |
+| (default, node scope) | `service`: request, search, ingest and background activity and latency; `memory`: indexing RAM budget, draining, pending-merge and retained delete bytes, RAM storage, field metadata, jemalloc and its arenas, configured budgets. | Atomic loads and one allocator statistics read. |
+| `collections=true` | `totals` and per-collection `collections`: documents, segments, committed bytes, commit time, generations, merges, inverters, retained delete bytes, snapshot pins and drops, query cache, availability. Implied on tenant and collection routes. | Briefly takes each writer's index lock and decodes each reader-only manifest. No file I/O. |
 | `files=true` | `bytes` from an index directory listing; aux index and segment bytes. Implies `collections`. | Lists every index directory. |
 | `segments=true` | Per-segment records. Implies `files`. | Iterates segments. |
 | `system=true` | `system`: this process, the data filesystem and the process's cgroup v2. Node scope only. | About 15 procfs/cgroupfs reads and a scan of `/proc/self/fd`. |
@@ -299,6 +299,14 @@ In `memory`, `jemalloc` is present only when Luxir runs on jemalloc.
 pages awaiting decay; the process RssAnon also counts memory jemalloc does not
 manage.
 
+`memory.indexing_budget.retained_delete_bytes` reports resident delete packets
+across all collections and owners, including commit and merge catch-up
+references. It is included in `reserved_bytes`, not an additional allocation.
+Each `collections[].shards[].index.retained_delete_bytes` reports that writer's
+pending and merge catch-up packets, counted once per packet. Packets remain
+charged until their last owner releases them; flushing an inverter transfers
+their reservation rather than freeing it.
+
 Ids and generations that appear in filenames use their filesystem spelling so
 the response correlates directly with a directory listing: each segment's
 `seg` is its data-file prefix (e.g. `s0a`), while `live_gen` and aux `gen`
@@ -344,7 +352,7 @@ client load.
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
-| `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, and pending merge demand. The budget is soft; pending demand is capped at that budget when limited. |
+| `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, pending merge demand, and retained delete packets (part of the reservations, never freed by a flush). The budget is soft; pending demand is capped at that budget when limited. |
 | `luxir_storage_ram_bytes`, `luxir_storage_ram_limit_bytes` | RAM storage consumption and its cap, separate from filesystem usage. |
 | `luxir_field_metadata_objects`, `luxir_field_metadata_bytes` | Cached field metadata by `part` (directory, page, entry, name). |
 | `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
@@ -363,6 +371,7 @@ With `collections=true`:
 | `luxir_index_committed_bytes`, `luxir_index_last_commit_timestamp_seconds` | Current snapshot descriptor bytes and publication timestamp. An old timestamp alone does not indicate a problem on an idle collection. |
 | `luxir_index_directory_bytes` | Directory-listing bytes; only with `files=true`. See the two byte counts above. |
 | `luxir_index_commits_total` | Commits since the writer opened. |
+| `luxir_index_retained_delete_bytes` | Delete packets the writer retains for its pending set and merge catch-up, counted once per packet; part of `luxir_index_ram_reserved_bytes`. |
 | `luxir_collection_searches_total`, `luxir_collection_search_seconds_total` | Searches that reached the collection, by `outcome`, and their summed duration from submission to the final response. The mean is the ratio of the two rates. |
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
@@ -517,13 +526,14 @@ the node unlimited. The resolved values are logged at startup.
 - `indexing.max-ram-mb` is the shared MiB budget for all of a node's indexing
   work: merges reserve against it before they start, and inverters count their
   RAM against it, so a release that finds the budget over its cap flushes the
-  largest idle inverter. It defaults to half of `--max-ram-mb`, and to none at
-  all on a `--read-only` node, which never indexes. `0` leaves it unlimited.
+  idle inverter offering the most relief above the pressure flush floor.
+  Retained delete packets count against the budget and are not flush relief.
+  It defaults to half of `--max-ram-mb`, and to none at all on a `--read-only`
+  node, which never indexes. `0` leaves it unlimited.
 - `indexing.max-inverter-ram-mb` flushes one inverter to a segment when it grows
   past that size, checked at the end of an update batch. Total indexing RAM
   is bounded by `indexing.max-ram-mb`, so this cap defaults to it:
-  one
-  inverter may hold the whole indexing budget (with a single stream there is
+  one inverter may hold the whole indexing budget (with a single stream there is
   nothing else holding it) but no more. It is clamped to 3814 MiB - an inverter's
   memory pool can address at most 4 GiB, and the clamp leaves headroom for one
   batch's overshoot - so an explicit larger value is clamped with a startup

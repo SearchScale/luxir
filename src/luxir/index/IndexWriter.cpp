@@ -665,9 +665,9 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
   assert(it != idleInverters.end());
 
   if (pressure) {
-    if (!inverter.ramGuard.tryMarkDrainingForPressure()) return false;
+    if (!inverter.ramGuard.tryMarkDrainingForPressure((int64_t)inverter.retainedDeleteBytes())) return false;
   } else {
-    inverter.ramGuard.markDraining();
+    inverter.ramGuard.markDraining((int64_t)inverter.retainedDeleteBytes());
   }
 
   decltype(flushingInverters)::iterator flushingIt;
@@ -696,17 +696,22 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
   return false;
 }
 
-// Caller holds indexMutex.  Largest-local-first minimizes segment count; the
+// Caller holds indexMutex. Largest-relief-first avoids flushing retained RAM; the
 // budget-side claim prevents broadcasts to multiple writers from over-shedding
 // once the global pressure target is met.
 void IndexWriter::pressureShedIdleLocked() {
   if (!indexRamBudget->pressurePossible()) return;
   for (;;) {
     Inverter* victim = nullptr;
+    size_t largestRelief = 0;
     for (auto& entry : idleInverters) {
-      if (entry.first->memSize() < pressureFlushFloorBytes) continue;
-      if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
+      size_t retained = entry.first->retainedDeleteBytes();
+      assert(entry.first->memSize() >= retained);
+      size_t relief = entry.first->memSize() - retained;
+      if (relief == 0 || relief < pressureFlushFloorBytes) continue;
+      if (relief > largestRelief) {
         victim = entry.first;
+        largestRelief = relief;
       }
     }
     if (victim == nullptr || !startIdleFlushLocked(*victim, true)) return;
@@ -755,7 +760,7 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     auto [flushingIt, success] =
         flushingInverters.emplace(&inverter, std::move(it->second));
     assert(success);
-    flushingIt->second->ramGuard.markDraining();
+    flushingIt->second->ramGuard.markDraining((int64_t)inverter.retainedDeleteBytes());
     it = busyInverters.erase(it);
     if (!segmentFlushNode->try_put(&inverter)) {
       throw std::runtime_error("Segment flush node rejected a released inverter");
@@ -1133,6 +1138,10 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   std::unique_ptr<Inverter> inverterPtr;
   std::shared_ptr<const SortedDeletes> deletes;
   if (!aborted && inverter.hasDeletions()) {
+    auto& batch = *inverter.sortedDeletes;
+    int64_t actual = (int64_t)batch.memSize();
+    assert(actual == inverter.ramGuard.nonDrainingSize());
+    batch.ramGuard = inverter.ramGuard.transferToRetainedDeletes(actual);
     deletes = std::move(inverter.sortedDeletes);
   }
 
@@ -2803,6 +2812,15 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
     out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
+    boost::unordered_flat_set<const SortedDeletes*> retained;
+    auto countDeletes = [&](const MultiDeletesData& deletes) {
+      for (const auto& batch : deletes.deletes) {
+        if (retained.insert(batch.get()).second) out.retainedDeleteBytes += batch->memSize();
+      }
+    };
+    countDeletes(pendingDeletes);
+    for (const auto& [_, seg] : segInfos) countDeletes(seg->personalDeletes);
+    for (const auto& seg : segmentsToDelete) countDeletes(seg->personalDeletes);
     out.segments = segInfos.size();
     out.flushing = flushingInverters.size();
     out.idle = idleInverters.size();
@@ -2907,7 +2925,7 @@ struct DeletesCursorGreater {
 /// If there's only one input span, returns it directly (no allocation).
 SortedDeletes::EntrySpan mergeDeleteSpans(
     std::span<const SortedDeletes::EntrySpan> spans,
-    std::vector<SortedDeletes::Entry>& out) {
+    std::vector<SortedDeletes::Entry>& out, IndexRamBudget::Guard& scratch) {
 
   using Entry = SortedDeletes::Entry;
 
@@ -2929,7 +2947,9 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
     return {cursors[0].curr, (size_t)(cursors[0].end - cursors[0].curr)};
   }
 
+  scratch.forceResize((int64_t)(total * sizeof(Entry)));
   out.reserve(total);
+  if (out.capacity() != total) scratch.forceResize((int64_t)(out.capacity() * sizeof(Entry)));
 
   // K-way merge using a min-heap of cursors
   DirectPQ<DeletesCursor, DeletesCursorGreater> pq(cursors, cursors.size());
@@ -2981,8 +3001,9 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData&
   }
 
   // Merge commit-level deletes once - reused across all segments
+  auto mergedGuard = indexRamBudget->forceAcquire(0);
   std::vector<SortedDeletes::Entry> mergedBuf;
-  SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
+  SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf, mergedGuard);
 
   // Apply deletes to segments in parallel.  Each task writes new liveDocs
   // filenames into its own segment's unsyncedFiles (single owner per task, no
@@ -3013,6 +3034,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   // merge them with commit deletes into a combined span.
   SortedDeletes::EntrySpan deleteSpan = commitDeletes;
   boost::container::small_vector<SortedDeletes::EntrySpan, 4> allSpans;
+  auto segMergedGuard = indexRamBudget->forceAcquire(0);
   std::vector<SortedDeletes::Entry> segMergedBuf;
 
   if (!seg.personalDeletes.empty()) {
@@ -3024,7 +3046,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     if (!commitDeletes.empty()) {
       allSpans.push_back(commitDeletes);
     }
-    deleteSpan = mergeDeleteSpans(allSpans, segMergedBuf);
+    deleteSpan = mergeDeleteSpans(allSpans, segMergedBuf, segMergedGuard);
   }
 
   if (deleteSpan.empty()) {

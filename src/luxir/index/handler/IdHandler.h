@@ -124,7 +124,20 @@ public:
     undoLog_.clear();
   }
 
+  size_t retainedDeleteBytes() const {
+    if (!producesPacket()) return 0;
+    bool overwrites = hadOverwrites_ && termsHash.size() > 0;
+    bool deletes = deleteHash && deleteHash->size() > 0;
+    return sizeof(SortedDeletes) + idPool->capacity()
+        + (overwrites ? termsHash.tableBytes() : 0)
+        + (deletes ? deleteHash->tableBytes() : 0);
+  }
+
 private:
+  bool producesPacket() const {
+    return (hadOverwrites_ && termsHash.size() > 0) || (deleteHash && deleteHash->size() > 0);
+  }
+
   std::string_view fitId(std::string_view id, PackedTerm::TermBuffer& scratch) const {
     auto term = PackedTerm::fitTerm(fieldType->longTerms, id, scratch);
     if (!term) {
@@ -178,7 +191,8 @@ private:
   // Non-pool RAM: the private idPool (id strings + IdEntry values, plus the values
   // portion of both hashes) and the two heap hash tables.
   size_t idExtraBytes() const {
-    return idPool->size() + termsHash.memSize() + (deleteHash ? deleteHash->memSize() : 0);
+    return idPool->capacity() + termsHash.memSize() + (deleteHash ? deleteHash->memSize() : 0)
+        + (producesPacket() ? sizeof(SortedDeletes) : 0);
   }
 
   Inverter::InputHandler& getVersionHandler(Inverter& inverter) {

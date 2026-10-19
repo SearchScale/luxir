@@ -151,6 +151,7 @@ public:
     uint64_t commits = 0;
     uint64_t activeMerges = 0;
     uint64_t flushing = 0, idle = 0, indexing = 0;
+    uint64_t retainedDeleteBytes = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file

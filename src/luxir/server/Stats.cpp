@@ -38,6 +38,7 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.indexing_budget.reserved_bytes = (uint64_t)ram.reservedBytes();
   memory.indexing_budget.draining_bytes = (uint64_t)ram.drainingBytesCount();
   memory.indexing_budget.pending_merge_bytes = (uint64_t)ram.pendingMergeDemandBytes();
+  memory.indexing_budget.retained_delete_bytes = (uint64_t)ram.retainedDeleteBytesCount();
   memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
   memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
   memory.storage_ram.used_bytes = node.storageBytes();
@@ -231,6 +232,7 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     dst.inverters_idle = src.idle;
     dst.inverters_flushing = src.flushing;
     dst.commits = src.commits;
+    dst.retained_delete_bytes = src.retainedDeleteBytes;
   }
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
