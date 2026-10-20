@@ -180,6 +180,8 @@ endif()
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
 # use a precompiled header (see target_precompile_headers below). Apply it in
 # the launcher rather than relying on each developer's global ccache config.
+# tools/ccache-launch also deletes a stale .gch before the PCH compile, without
+# which ccache never caches a rebuilt PCH.
 # LUXIR_CCACHE_RELATIVE_PATHS shares objects between checkouts and worktrees at different
 # paths: CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes
 # the debug info's compilation directory relative to the checkout. PWD gives ccache the
@@ -192,7 +194,7 @@ endif()
 option(LUXIR_CCACHE_RELATIVE_PATHS "Use checkout-relative paths so ccache shares objects across checkouts" OFF)
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
-  list(APPEND _luxir_compile_launcher "${CMAKE_COMMAND}" -E env CCACHE_SLOPPINESS=pch_defines,time_macros)
+  list(APPEND _luxir_compile_launcher "${CMAKE_SOURCE_DIR}/tools/ccache-launch" CCACHE_SLOPPINESS=pch_defines,time_macros)
   if(LUXIR_CCACHE_RELATIVE_PATHS)
     list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}" "PWD=${CMAKE_BINARY_DIR}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
