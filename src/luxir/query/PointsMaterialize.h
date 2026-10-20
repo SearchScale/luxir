@@ -20,8 +20,14 @@ struct PointsMaterialize {
     uint64_t* words = nullptr;
   };
 
+  // Gathered in value order, an array of docs must be sorted, at a cost per doc several times
+  // that of setting its bit; a bitset costs a pass over maxDoc / 64 words to clear and to
+  // iterate. Past about maxDoc / 1024 docs the bitset is the cheaper of the two; a few hundred
+  // docs sort in microseconds, so up to that many (but never past maxDoc / 32, where the array
+  // outgrows the bitset) stay an array.
   static uint64_t arrayLimit(int32_t maxDoc) {
-    return ((uint64_t)(uint32_t)maxDoc + 31) >> 5;
+    uint64_t docs = (uint64_t)(uint32_t)maxDoc;
+    return std::max((docs + 1023) >> 10, std::min<uint64_t>(256, (docs + 31) >> 5));
   }
 
   static bool useBitset(uint64_t expected, int32_t maxDoc) {
