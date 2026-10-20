@@ -176,6 +176,8 @@ Coming from Lucene or Solr: `?` and mid-word `*` are **not** wildcards in a
 term, and `/re/` is not a regex; all three are ordinary characters.
 Wildcards and regular expressions are the named functions
 `wildcard(...)` and `regex(...)` described [below](#wildcards-and-regular-expressions).
+The value must follow `field:` directly: `title_t: dune` is an error here
+(simple_query reads it as plain words, like Solr's edismax).
 
 ## AND, OR, NOT, and +/-
 

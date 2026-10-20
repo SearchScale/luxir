@@ -747,7 +747,15 @@ private:
     }
 
     Token value = scanToken(stops, /*stopAtColon=*/false);
-    if (value.empty()) fail(pos, fmt::format("expected a value after '{}:'", field));
+    if (value.empty()) {
+      // 'title: dune' is an error, not a skip: an empty interpolated value
+      // (title: AND year_i:5) would otherwise silently take the next token
+      Cursor scan = cur;
+      bool spaced = scan.skipWs() && !scan.atEnd() && scan.peek() != ')'
+                    && !isStop(scan.peek(), stops);
+      fail(pos, fmt::format("expected a value after '{}:'{}", field,
+                            spaced ? " (no whitespace allowed between ':' and the value)" : ""));
+    }
     return emitTerm(scope, value);
   }
 

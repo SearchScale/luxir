@@ -662,6 +662,14 @@ TEST_F(ExprParserTest, emptyAndTrailing) {
   expectContains(parseErr("   "), "empty expression");
   expectContains(parseErr("title:"), "expected a value after 'title:'");
   expectContains(parseErr(":x"), "expected a field name before ':'");
+
+  // whitespace after the colon is an error, with a hint when a value follows
+  const char* hint = "no whitespace allowed between ':' and the value";
+  expectContains(parseErr("title: dune"), hint);
+  expectContains(parseErr("title: (dune OR messiah)"), hint);
+  expectContains(parseErr("title: AND count:5"), hint);
+  EXPECT_EQ(std::string::npos, parseErr("title:  ").find(hint));
+  EXPECT_EQ(std::string::npos, parseErr("(title: )").find(hint));
 }
 
 TEST_F(ExprParserTest, unicodeAndBinarySafety) {
