@@ -282,7 +282,7 @@ LUXIR_BENCHMARK_CAPTURE(BM_CollapseMembers, page_nested_wide_range_reset, 27)->A
 static void BM_RootDomainReset(benchmark::State& state, bool reset) {
   int32_t docs = unit_tests ? 120 : (int32_t)LuxirTest::scaleTestWork((int)state.range(0));
   CollectionHelper helper("root_domain_reset_" + std::to_string(docs));
-  if (!helper.indexMatchesShape({docs})) {
+  if (!helper.indexMatchesShape(std::vector<int32_t>{docs})) {
     helper.clear();
     std::vector<Doc> batch;
     for (int32_t doc = 0; doc < docs; doc++) batch.push_back(flatdoc(

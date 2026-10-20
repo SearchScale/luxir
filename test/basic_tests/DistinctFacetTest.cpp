@@ -756,7 +756,7 @@ TEST_F(DistinctFacetTest, scalarNumericDimensionsPreserveExtremaAndMissingChanne
       auto request = run("main", R"("limit":0,"ops":{"c":{"field_facet":{"field":"color_s","limit":-1,
           "missing":true,"count_distinct":)" + spec(std::vector<std::string>{field}, policy) + "}}}");
       check(*request->docList()->ops.at("c")->facetResult(),
-          oracle(*full->docList(), {field}, policy, "color_s", [](const api::Map&) { return true; }));
+          oracle(*full->docList(), std::vector<std::string>{field}, policy, "color_s", [](const api::Map&) { return true; }));
       if (field == std::string_view("wide_i")) { EXPECT_GT(stats.hash.load(), 0); }
       else { EXPECT_GT(stats.paged.load(), 0); }
     }

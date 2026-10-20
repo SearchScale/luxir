@@ -208,9 +208,10 @@ inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
 }
 inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
                       std::initializer_list<float> vec, int k, int nprobe = 0,
-                      bool exact = false, int refineCandidates = 0, float minScanFraction = 0) {
+                      bool exact = false, int refineCandidates = 0, float minScanFraction = 0,
+                      std::optional<float> similarity = std::nullopt) {
   return knn(mr, field, std::span<const float>(vec.begin(), vec.size()), k, nprobe, exact,
-             refineCandidates, minScanFraction);
+             refineCandidates, minScanFraction, similarity);
 }
 
 inline api::Query constantScore(std::pmr::memory_resource& mr, const api::Query& inner,
