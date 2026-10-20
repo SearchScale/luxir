@@ -112,3 +112,8 @@ LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k,         4, 10'000,    100, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_noOW,    4, 10'000,    100, false);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m,          4, 1'000'000, 100, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m_noOW,     4, 1'000'000, 100, false);
+
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_10k_batch1,       1, 10'000, 1, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_10k_batch1_noOW,  1, 10'000, 1, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_batch1,       4, 10'000, 1, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_batch1_noOW,  4, 10'000, 1, false);

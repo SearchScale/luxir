@@ -20,8 +20,7 @@ class IdHandler final : public Inverter::IndexHandler {
   std::unique_ptr<MemPool> idPool;
   TermValHash<IdEntry> ids;
   size_t nonzeroWatermarks = 0;
-  int64_t nextRun = 0;
-  int32_t lastDoc = -1;
+  VersionRunBuilder::Lookup birthLookup;
 
   // References survive rehash because the values live in idPool. An insertion
   // starts neutral, so restoring its old value also undoes its occupancy.
@@ -63,8 +62,7 @@ public:
   void addDelete(Inverter& inverter, std::string_view id, uint64_t version) {
     PackedTerm::TermBuffer scratch;
     auto& entry = entryFor(fitId(id, scratch));
-    raiseWatermark(entry, version);
-    resolveOccupant(inverter, entry);
+    if (raiseWatermark(entry, version)) resolveOccupant(inverter, entry);
     accountExtraRam(inverter, idExtraBytes());
   }
 
@@ -105,21 +103,16 @@ private:
     return entry->val();
   }
 
-  void raiseWatermark(IdEntry& entry, uint64_t version) {
-    if (version > entry.deleteWatermark) {
-      if (entry.deleteWatermark == 0) nonzeroWatermarks++;
-      entry.deleteWatermark = version;
-    }
+  bool raiseWatermark(IdEntry& entry, uint64_t version) {
+    // An occupant already satisfies an unchanged watermark.
+    if (version <= entry.deleteWatermark) return false;
+    if (entry.deleteWatermark == 0) nonzeroWatermarks++;
+    entry.deleteWatermark = version;
+    return true;
   }
 
   uint64_t birth(const Inverter& inverter, int32_t docId) {
-    if (docId < lastDoc) nextRun = 0;
-    const auto& runs = inverter.versionRuns;
-    nextRun = screaming::gallopLowerBound(nextRun, (int64_t)runs.size(), (uint32_t)docId + 1,
-        [&](int64_t i) { return runs[(size_t)i].firstDocId; });
-    lastDoc = docId;
-    assert(nextRun > 0);
-    return runs[(size_t)nextRun - 1].version;
+    return inverter.versionRuns.birth((uint32_t)docId, birthLookup);
   }
 
   void resolveOccupant(Inverter& inverter, IdEntry& entry) {
@@ -132,8 +125,7 @@ private:
   void indexId(Inverter& inverter, std::string_view id) {
     PackedTerm::TermBuffer scratch;
     auto& entry = entryFor(fitId(id, scratch));
-    if (inverter.overwrite) raiseWatermark(entry, inverter.currVersion);
-    resolveOccupant(inverter, entry);
+    if (inverter.overwrite && raiseWatermark(entry, inverter.currVersion)) resolveOccupant(inverter, entry);
 
     int32_t docId = inverter.getDoc();
     if (inverter.currVersion < entry.deleteWatermark) {

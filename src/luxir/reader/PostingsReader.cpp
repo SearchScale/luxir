@@ -105,17 +105,11 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   }
   if (maxdoc > 0) {
     uint32_t fileNum = versionsLoc.filenum();
-    uint64_t bytes = sizeof(uint32_t) + (uint64_t)versionCount * sizeof(VersionRun);
-    if (versionCount == 0 || versionsLoc.isNull() || fileNum >= inputStreams.size()
-        || !files[fileNum] || versionsLoc.offset() > (uint64_t)inputStreams[fileNum].size()
-        || bytes > (uint64_t)inputStreams[fileNum].size() - versionsLoc.offset()) {
+    if (versionCount == 0 || versionsLoc.isNull() || fileNum >= inputStreams.size() || !files[fileNum]) {
       throw std::runtime_error("Segment has invalid request birth versions");
     }
-    auto input = getInputStreamSeek(versionsLoc);
-    if ((uint32_t)input.readInt() != VersionRuns::PACKED) {
-      throw std::runtime_error("Unsupported request-version run encoding");
-    }
-    versions = VersionRuns({(const VersionRun*)input.ptr(), versionCount}, maxdoc);
+    const auto& input = inputStreams[fileNum];
+    versions = VersionRuns(input.ptr(0), input.size(), versionsLoc.offset(), versionCount, maxdoc);
   } else if (maxdoc != 0 || versionCount != 0 || !versionsLoc.isNull()) {
     throw std::runtime_error("Segment has invalid request birth versions");
   }

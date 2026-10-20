@@ -122,9 +122,9 @@ struct NumColumnFormat {
   // the engine (endValueRank and endOffset, read twice per doc).
   // leafZones == false skips the per-leaf extrema pass for writers that never
   // persist zones (monotonic sidecars), whose finish() drops them anyway.
-  static BlockPlan planBlock(std::span<const int64_t> values,
-                             std::vector<uint64_t>& quotients,
-                             bool useGcd = true, bool leafZones = true) {
+  template<class Values>
+  static BlockPlan planBlock(const Values& values, std::vector<uint64_t>& quotients,
+                            bool useGcd = true, bool leafZones = true) {
     assert(!values.empty() && values.size() <= BLOCK_SIZE);
 
     auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());

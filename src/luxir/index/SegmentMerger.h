@@ -807,9 +807,9 @@ private:
   void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target,
                          PostingsWriter::VersionRunsWriter& versions) {
     if (liveDocs == nullptr) {
-      for (const auto& run : seg.postingsReader->versionRuns().runs()) {
-        versions.add((uint32_t)seg.base + run.firstDocId, run.version);
-      }
+      VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
+      VersionRun run;
+      while (runs.next(run)) versions.add((uint32_t)seg.base + run.firstDocId, run.version);
       return;
     }
     int32_t maxDoc = seg.postingsReader->maxDoc();
@@ -818,17 +818,19 @@ private:
     int32_t newDocId = 0;
     const FixedBitSet& bitset = liveDocs->bitset();
     
-    auto runs = seg.postingsReader->versionRuns().runs();
-    size_t run = 0;
+    VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
+    VersionRun current, next;
+    bool haveNext = runs.next(current) && runs.next(next);
     bool emitted = false;
     for (int32_t oldDocId = 0; oldDocId < maxDoc; oldDocId++) {
-      if (run + 1 < runs.size() && runs[run + 1].firstDocId == (uint32_t)oldDocId) {
-        run++;
+      if (haveNext && next.firstDocId == (uint32_t)oldDocId) {
+        current = next;
+        haveNext = runs.next(next);
         emitted = false;
       }
       if (bitset.get(oldDocId)) {
         if (!emitted) {
-          versions.add((uint32_t)(seg.base + newDocId), runs[run].version);
+          versions.add((uint32_t)(seg.base + newDocId), current.version);
           emitted = true;
         }
         target[oldDocId] = newDocId++;

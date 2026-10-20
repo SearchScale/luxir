@@ -1186,12 +1186,103 @@ TEST_F(IndexWriterTest, requestBirthsValidateOnOpen) {
   PostingsWriter writer(dir, 1, 3);
   PostingsWriter::VersionRunsWriter versions(writer);
   versions.add(0, 5);
-  versions.add(3, 7); // The last boundary is outside maxDoc.
+  versions.add(4, 7); // The last boundary is outside maxDoc.
   versions.finish();
   ASSERT_TRUE(writer.finish());
   EXPECT_THROW(PostingsReader::create(dir, 1), std::runtime_error);
   PostingsWriter missing(dir, 2, 1);
   EXPECT_THROW(missing.finish(), std::runtime_error);
+}
+
+TEST_F(IndexWriterTest, requestBirthBlocksRoundTrip) {
+  for (int mode = 0; mode < 5; mode++) {
+    uint32_t count = VersionRuns::BLOCK_SIZE * 2 + (mode == 2 || mode == 4 ? 17 : 0);
+    RAMDir dir;
+    VersionRunBuilder builder;
+    std::vector<VersionRun> expected;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < count; i++) {
+      uint64_t version = mode == 4 ? (i % 3 == 0 ? UINT64_MAX : i % 3 == 1 ? 1ULL << 63 : i)
+          : mode == 0 ? (uint64_t)i + 1 : (uint64_t)(i ^ 7) + 1;
+      builder.add(start, version);
+      expected.push_back({start, version});
+      start += mode == 1 ? 9 : mode == 2 ? i % 7 + 1 : mode == 3 && i >= VersionRuns::BLOCK_SIZE ? 1000 : 1;
+    }
+    // Empty acquisitions can still replace/remove the first tail run after a seal.
+    builder.add(start, 100);
+    builder.add(start, expected.back().version);
+    EXPECT_EQ(count, builder.size());
+    start += 1000; // The final run can cover many documents, even in dense mode.
+    PostingsWriter writer(dir, 1, start);
+    writer.writeVersionRuns(builder);
+    ASSERT_TRUE(writer.finish());
+    auto reader = PostingsReader::create(dir, 1);
+    const auto& runs = reader->versionRuns();
+    ASSERT_EQ(count, runs.size());
+    VersionRuns::Cursor cursor(runs);
+    EXPECT_EQ(expected.back().version, cursor.birth((int32_t)start - 1));
+    VersionRuns::Iterator iterator(runs);
+    VersionRunBuilder::Lookup lookup;
+    EXPECT_EQ(expected.back().version, builder.birth(start - 1, lookup));
+    VersionRun actual;
+    for (uint32_t j = 0; j < count; j++) {
+      ASSERT_TRUE(iterator.next(actual));
+      EXPECT_EQ(expected[j].firstDocId, actual.firstDocId);
+      EXPECT_EQ(expected[j].version, actual.version);
+      uint32_t backward = count - j - 1;
+      EXPECT_EQ(expected[backward].version, builder.birth(expected[backward].firstDocId, lookup));
+      EXPECT_EQ(expected[backward].version, cursor.birth((int32_t)expected[backward].firstDocId));
+    }
+    EXPECT_FALSE(iterator.next(actual));
+  }
+}
+
+TEST_F(IndexWriterTest, requestBirthBlocksRejectCorruption) {
+  for (bool directoryDamage : {false, true}) {
+    RAMDir dir;
+    auto file = dir.createFile("runs");
+    OutputStream stream(file.get());
+    VersionRunBuilder builder;
+    builder.add(1, 9);
+    builder.add(3, 8); // Irregular starts 0, 1, 3.
+    VersionRunsOutput output(stream);
+    auto count = builder.finish(output, 4);
+    auto location = output.finish(count);
+    stream.close();
+    dir.finishFile(*file);
+    auto bytes = dir.openFile("runs")->read();
+    std::vector<char> corrupt(bytes.begin(), bytes.end());
+    auto* header = (VersionRunsHeader*)(corrupt.data() + location.offset());
+    if (directoryDamage) {
+      auto* directory = (VersionBlockDirectory*)(corrupt.data() + header->directoryOffset);
+      directory->offset = header->directoryOffset;
+    } else {
+      auto* starts = (NumBlockInfo*)(corrupt.data() + sizeof(VersionBlockHeader));
+      starts->baseBits = 0;
+      starts->scaledSlope = 0; // Decoded boundaries cease to increase.
+      starts->setPayload(starts->payloadOffset(), 0);
+    }
+    EXPECT_THROW(VersionRuns(corrupt.data(), corrupt.size(), location.offset(), count, 4), std::runtime_error);
+  }
+}
+
+TEST_F(IndexWriterTest, requestBirthRollbackAcrossSealedBlock) {
+  using namespace luxir::test;
+  CollectionHelper helper;
+  for (uint32_t i = 0; i < VersionRuns::BLOCK_SIZE; i++) ASSERT_TRUE(helper.index(Doc{}, UpdateMessage::NO_COMMIT, false).success);
+  CollectionHelper::UpdateBuilder request;
+  request.add(Doc{}).add(flatdoc("no_such_field", "fail")).allOrNone();
+  auto failed = helper.submit(request);
+  ASSERT_FALSE(failed.success);
+  auto last = helper.index(Doc{}, UpdateMessage::COMMIT, false);
+  ASSERT_TRUE(last.success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(VersionRuns::BLOCK_SIZE + 1, reader->liveDocs());
+  const auto& runs = reader->segments()[0].postingsReader().versionRuns();
+  VersionRuns::Cursor cursor(runs);
+  EXPECT_EQ(failed.updateVersion, cursor.birth(VersionRuns::BLOCK_SIZE));
+  EXPECT_EQ(failed.updateVersion, cursor.birth(VersionRuns::BLOCK_SIZE + 1));
+  EXPECT_EQ(last.updateVersion, cursor.birth(VersionRuns::BLOCK_SIZE + 2));
 }
 
 TEST_F(IndexWriterTest, requestBirthsPreserveFieldlessDocuments) {
@@ -1274,6 +1365,27 @@ TEST_F(IndexWriterTest, requestBirthsMergeDeletedRuns) {
   VersionRuns::Cursor cursor(runs);
   EXPECT_EQ(first.updateVersion, cursor.birth(0));
   EXPECT_EQ(last.updateVersion, cursor.birth(1));
+}
+
+TEST_F(IndexWriterTest, requestBirthMergeMixedBlocks) {
+  using namespace luxir::test;
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  std::vector<uint64_t> births;
+  for (int mode = 0; mode < 3; mode++) {
+    for (uint32_t i = 0; i < VersionRuns::BLOCK_SIZE + 3; i++) {
+      int count = mode == 0 ? 1 : mode == 1 ? 3 : (int)(i % 3) + 1;
+      auto result = helper.indexAll(std::vector<Doc>((size_t)count), UpdateMessage::NO_COMMIT, false);
+      ASSERT_TRUE(result.success);
+      births.insert(births.end(), (size_t)count, result.updateVersion);
+    }
+    helper.commit();
+  }
+  helper.getIndexWriter()->mergeSegments();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1, reader->segments().size());
+  VersionRuns::Cursor cursor(reader->segments()[0].postingsReader().versionRuns());
+  for (size_t i = 0; i < births.size(); i++) EXPECT_EQ(births[i], cursor.birth((int32_t)i));
 }
 
 TEST_F(IndexWriterTest, versionIsRetrievalOnly) {

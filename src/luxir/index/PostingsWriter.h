@@ -33,6 +33,7 @@
 #include "luxir/util/screaming.h"
 #include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
+#include "VersionRunBuilder.h"
 
 
 namespace luxir {
@@ -218,43 +219,51 @@ public:
 
   typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
 
+  void writeVersionRuns(const VersionRunBuilder& builder) {
+    if (!maxDoc) return;
+    auto stream = getOutputStream();
+    VersionRunsOutput output(*stream, (uint32_t)((builder.size() + VersionRuns::BLOCK_SIZE - 1) / VersionRuns::BLOCK_SIZE));
+    versionRunCount = builder.finish(output, (uint32_t)maxDoc);
+    versionRunsLoc = output.finish(versionRunCount);
+  }
+
   class VersionRunsWriter {
     PostingsWriter& writer;
-    OutputStreamPtr output;
-    std::optional<VersionRun> pending;
-    uint32_t count = 0;
+    OutputStreamPtr stream;
+    std::optional<VersionRunsOutput> output;
+    VersionRunBuilder builder;
     uint32_t lastStart = 0;
+    bool added = false;
 
-    void emitPending() {
-      output->write(&*pending, sizeof(VersionRun));
-      count++;
+    VersionRunsOutput& target() {
+      if (!output) {
+        stream = writer.getOutputStream();
+        output.emplace(*stream);
+      }
+      return *output;
     }
 
   public:
-    explicit VersionRunsWriter(PostingsWriter& writer) : writer(writer) {}
+    explicit VersionRunsWriter(PostingsWriter& writer) : writer(writer),
+        builder([this](std::span<const char> block, uint32_t first) { target().add(block, first); }) {}
+    VersionRunsWriter(VersionRunsWriter&&) = delete;
 
     void add(uint32_t firstDocId, uint64_t version) {
-      if (!pending) {
-        if (firstDocId != 0) throw std::runtime_error("Request-version runs must start at document zero");
-        output = writer.getOutputStream();
-        writer.versionRunsLoc = output->slocation();
-        output->writeInt(VersionRuns::PACKED);
-      } else {
-        if (firstDocId <= lastStart) throw std::runtime_error("Request-version runs must increase");
-        lastStart = firstDocId;
-        if (pending->version == version) return;
-        emitPending();
+      if (added ? firstDocId <= lastStart : firstDocId != 0) {
+        throw std::runtime_error("Request-version runs must start at zero and increase");
       }
-      pending = VersionRun{firstDocId, version};
+      builder.add(firstDocId, version);
+      lastStart = firstDocId;
+      added = true;
     }
 
     void finish() {
-      if (pending) {
-        emitPending();
-        pending.reset();
+      if (added) {
+        writer.versionRunCount = builder.finish(target(), (uint32_t)writer.maxDoc);
+        writer.versionRunsLoc = target().finish(writer.versionRunCount);
       }
-      writer.versionRunCount = count;
       output.reset();
+      stream.reset();
     }
   };
 
