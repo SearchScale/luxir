@@ -2394,6 +2394,31 @@ TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
   EXPECT_FALSE(applied.contains(newSeg));
 }
 
+TEST_F(IndexWriterTest, obtainInverterReusesOldestIdle) {
+  // Rotate which inverter is oldest, so map order cannot pass by luck.
+  for (size_t oldest = 0; oldest < 4; oldest++) {
+    SCOPED_TRACE(oldest);
+    RAMDir dir;
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots);
+    std::vector<Inverter*> inverters;
+    for (size_t i = 0; i < 4; i++) {
+      uint64_t version = i == oldest ? 10 : 20 + i;
+      auto& inv = iw.obtainInverter(version);
+      inv.startDoc();
+      inv.getIndexHandler("id").index(inv, std::to_string(version));
+      inv.finishDoc();
+      inverters.push_back(&inv);
+    }
+    for (auto* inv : inverters) iw.releaseInverter(*inv);
+    for (uint64_t version : {50, 60}) {
+      auto& inv = iw.obtainInverter(version);
+      EXPECT_EQ(inverters[oldest], &inv);
+      iw.releaseInverter(inv);
+    }
+  }
+}
+
 TEST_F(IndexWriterTest, idRangeClipsDeleteSelection) {
   for (bool wideEnvelope : {false, true}) {
     SCOPED_TRACE(wideEnvelope);

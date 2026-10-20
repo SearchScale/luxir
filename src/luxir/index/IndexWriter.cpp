@@ -642,8 +642,9 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
 }
 
 Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Schema> pinned) {
-  // IDEA: should we prefer grabbing the inverter with the most docs?  Idea would be to
-  // have a couple of really large segments that will need less merging?
+  // Reuse the idle inverter with the lowest minVersion, so the oldest work fills
+  // and flushes. A stable pick (map order) would leave the others idle, holding
+  // their minVersion and the delete retention it implies indefinitely.
   Inverter* inverter = nullptr;
   std::lock_guard<std::mutex> lock(indexMutex);
   auto current = getSchema();
@@ -654,7 +655,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
       if (!startIdleFlushLocked(*idle, false)) {
         throw std::runtime_error("Segment flush node rejected a stale inverter");
       }
-    } else if (!inverter && idle->schema == pinned) {
+    } else if (idle->schema == pinned && (!inverter || idle->minVersion < inverter->minVersion)) {
       inverter = idle;
     }
   }
