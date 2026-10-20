@@ -26,8 +26,9 @@ use the [ARM64 cross-build workflow](arm64-build.md).
   Benchmark. The compiler supplies OpenMP; FastPFOR is fetched and uni-algo is
   vendored
 
-The build uses `-march=native`; a release binary is intended for the machine
-class on which its dependencies and Luxir itself were built.
+The build targets the host CPU (`-march=native`, or the host's `-mcpu` on Apple
+silicon); a release binary is intended for the machine class on which its
+dependencies and Luxir itself were built.
 TBB and its internal tbbmalloc allocator are static vcpkg libraries. Static
 jemalloc replaces malloc/free and operator new/delete process-wide in every
 build by default unless sanitizer flags are present (`LUXIR_JEMALLOC` then
@@ -35,8 +36,8 @@ defaults to `OFF`); explicitly enabling both is an error. The startup banner
 reports the allocator version and effective configuration. The jemalloc overlay
 embeds allocator defaults; see [dependency settings](../../deps/README.txt).
 For Valgrind, configure a build with `-DLUXIR_JEMALLOC=OFF` or run with
-`--soname-synonyms=somalloc=NONE`. OpenBLAS supplies C LAPACK, so neither a
-Fortran compiler nor a Fortran runtime is required. Native builds retain shared
+`--soname-synonyms=somalloc=NONE`. OpenBLAS supplies C LAPACK (Accelerate does
+on macOS), so neither a Fortran compiler nor a Fortran runtime is required. Native builds retain shared
 GCC runtimes; the container's static runtime setting is a separate packaging
 choice.
 
@@ -63,6 +64,14 @@ Install the host tools (in addition to GCC/G++, CMake, and Ninja):
 
 ```bash
 sudo apt install pkg-config python3 curl zip unzip tar
+```
+
+On macOS, install the Command Line Tools (`xcode-select --install`), then the
+compiler and build tools from Homebrew; [macOS](#macos-apple-silicon) lists the
+differences from Linux:
+
+```bash
+brew install gcc cmake ninja pkg-config ccache
 ```
 
 Build both native dependency variants:
@@ -94,6 +103,30 @@ options when refreshing.
 After changing the manifest or overlays, rerun the script. To update vcpkg itself,
 change the manifest baseline, check out that revision in `/opt/vcpkg`, bootstrap
 again, then rerun the script. No changes to upstream ports or triplets are needed.
+
+### macOS (Apple silicon)
+
+The same presets and setup script work with Homebrew GCC. On macOS:
+
+- Dependencies use the `arm64-osx-luxir-m1*` triplets: a fixed `apple-m1`
+  and macOS 14 baseline instead of the host CPU, so one install serves local
+  builds and binaries for other Macs. Later Apple cores add only BF16 and int8
+  matrix-multiply instructions, and no dependency header tests for them, so
+  Luxir built for a newer chip sees the same inline dependency code. No CPU
+  fingerprint is needed.
+- `LUXIR_CPU_TARGET=native` resolves to the host chip (`apple-m5` and so on,
+  from `sysctl`), since GCC's `-mcpu=native` reports every Apple core as
+  `apple-m1`. Configure with `-DLUXIR_CPU_TARGET=apple-m1` for a binary that
+  runs on any Apple silicon Mac.
+- jemalloc is not yet supported; `LUXIR_JEMALLOC` defaults to `OFF`.
+- ASan works, but GCC has no LeakSanitizer there; `detect_leaks=1` is
+  accepted and finds nothing.
+- FAISS uses Apple's Accelerate for BLAS and LAPACK instead of OpenBLAS. Its
+  matrix unit runs SGEMM at about 15 times the rate of single-threaded
+  OpenBLAS on an M5. Accelerate runs its own threads; `VECLIB_MAXIMUM_THREADS`
+  caps them.
+- FAISS is built without its Metal GPU backend, which needs Xcode's `metal`
+  compiler.
 
 When migrating an existing build from the old classic-mode dependencies, reset
 the CMake caches so cached package paths cannot retain system TBB or the old

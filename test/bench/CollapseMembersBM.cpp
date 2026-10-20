@@ -67,7 +67,7 @@ static void BM_CollapseMembers(benchmark::State& state, int mode) {
   }
   SearchOverridesGuard guard(collapseMemberStrategy, collapseMemberStats, facetBucketBlockCounter);
   collapseMemberStrategy = (mode == 1 || mode == 6) ? CollapseMemberStrategy::KEYS
-      : (mode == 2 || mode == 7) ? CollapseMemberStrategy::DOMAIN : CollapseMemberStrategy::AUTO;
+      : (mode == 2 || mode == 7) ? CollapseMemberStrategy::DOMAIN_WALK : CollapseMemberStrategy::AUTO;
   std::string query = selective ? "eligible_s:yes" : "*:*";
   std::string body = R"({"collection":")" + name + R"(","query":")" + query
       + R"(","sort":"rank_i desc","fields":["id"],"limit":)" + std::to_string(limit);

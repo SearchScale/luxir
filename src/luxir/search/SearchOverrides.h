@@ -24,7 +24,7 @@
 namespace luxir {
 
 // Page-member traversal overrides affect work, never membership.
-enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN };
+enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN_WALK };
 inline CollapseMemberStrategy collapseMemberStrategy = CollapseMemberStrategy::AUTO;
 struct CollapseMemberStats {
   std::atomic<int64_t> keySegments{0}, domainSegments{0}, candidates{0}, members{0};

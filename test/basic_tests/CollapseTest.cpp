@@ -765,7 +765,7 @@ TEST_F(CollapseTest, pageMemberOracle) {
               auto expected = memberOracle(*rankDocs, *headDocs, fields, policy, fieldSort);
               auto collapse = spec(fields, policy);
               collapse.pop_back(); collapse += R"(,"get_number":true,"head_sort":)" + head + '}';
-              for (auto strategy : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN}) {
+              for (auto strategy : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN_WALK}) {
                 collapseMemberStrategy = strategy;
                 for (int parallel : {1, -1}) {
                   SCOPED_TRACE(collection + query + sort + head + collapse + std::to_string(parallel));
@@ -1033,9 +1033,9 @@ TEST_F(CollapseTest, groupOpsMemberOracle) {
             collapse.pop_back();
             collapse += R"JSON(,"get_number":true,"head_sort":["sort_i asc","id asc"],"ops":{"low":"min(sort_i)","high":"max(sort_i)","average":"avg(sort_i)","variants":{"top_docs":{"sort":["sort_i asc","id asc"],"fields":["id"],"document_format":"rows","limit":3}},"relevant":{"top_docs":{"query":")JSON" + query
                 + R"JSON(","get_scores":true,"fields":["id"],"document_format":"rows","limit":3}},"swatches":{"field_facet":{"field":"sort_s","limit":-1}}}})JSON";
-            for (auto forced : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN}) {
+            for (auto forced : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN_WALK}) {
               collapseMemberStrategy = forced;
-              forcedFacetBucketBlockBuckets = forced == CollapseMemberStrategy::DOMAIN ? 2 : 0;
+              forcedFacetBucketBlockBuckets = forced == CollapseMemberStrategy::DOMAIN_WALK ? 2 : 0;
               for (int parallel : {1, -1}) {
                 SCOPED_TRACE(collection + query + sort + collapse + std::to_string(parallel));
                 auto actual = run(collection, query, collapse, -1, 0, parallel, true, 7, sort);
@@ -1238,8 +1238,8 @@ TEST_F(CollapseTest, resetGroupDomainOracle) {
       }
       for (auto [source, parallel] : {std::pair{CollapseMemberStrategy::KEYS, 1},
                                       {CollapseMemberStrategy::KEYS, -1},
-                                      {CollapseMemberStrategy::DOMAIN, 1},
-                                      {CollapseMemberStrategy::DOMAIN, -1}}) {
+                                      {CollapseMemberStrategy::DOMAIN_WALK, 1},
+                                      {CollapseMemberStrategy::DOMAIN_WALK, -1}}) {
         collapseMemberStrategy = source;
         auto actual = execute(R"("query":"color_s:red","filter":["available_i:1"],
         "collapse":)" + collapse,

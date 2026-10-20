@@ -225,7 +225,9 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   ASSERT_EQ(200, metrics.result_int());
   EXPECT_EQ(prometheusContentType, metrics[http::field::content_type]);
   EXPECT_NE(std::string::npos, metrics.body().find("luxir_index_documents{"));
+#ifdef __linux__
   EXPECT_NE(std::string::npos, metrics.body().find("\nprocess_threads "));
+#endif
   auto bare = httpRequest(port, http::verb::get, "/metrics?collections=false&system=false").body();
   EXPECT_EQ(std::string::npos, bare.find("luxir_index_documents{"));
   EXPECT_EQ(std::string::npos, bare.find("\nprocess_threads "));

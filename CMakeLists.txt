@@ -2,19 +2,62 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.16)
+
+# The native presets name a dependency variant; its vcpkg triplets depend on the
+# host (see deps/make_deps.sh). Set before project() loads the vcpkg toolchain.
+if(DEFINED LUXIR_NATIVE_DEPS AND NOT DEFINED VCPKG_TARGET_TRIPLET)
+  if(CMAKE_HOST_APPLE)
+    set(_luxir_triplet arm64-osx-luxir-m1)
+  else()
+    set(_luxir_triplet x64-linux-luxir-native)
+  endif()
+  if(LUXIR_NATIVE_DEPS STREQUAL "native")
+    set(_luxir_host_triplet ${_luxir_triplet})
+  elseif(LUXIR_NATIVE_DEPS STREQUAL "native-asan")
+    set(_luxir_host_triplet ${_luxir_triplet}-host)
+    string(APPEND _luxir_triplet -asan)
+  else()
+    message(FATAL_ERROR "LUXIR_NATIVE_DEPS must be native or native-asan")
+  endif()
+  set(VCPKG_TARGET_TRIPLET ${_luxir_triplet} CACHE STRING "")
+  set(VCPKG_HOST_TRIPLET ${_luxir_host_triplet} CACHE STRING "")
+endif()
+
 project(Luxir VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
-set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4 armv8-a)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  if(LUXIR_CPU_TARGET STREQUAL "native")
-    set(_luxir_cpu_tune native)
-  else()
-    set(_luxir_cpu_tune generic)
+set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4 armv8-a
+             apple-m1 apple-m2 apple-m3 apple-m4 apple-m5)
+set(_luxir_cpu_name ${LUXIR_CPU_TARGET})
+# GCC's native detection reports every Apple core as apple-m1; name the chip.
+if(LUXIR_CPU_TARGET STREQUAL "native" AND APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+  execute_process(COMMAND sysctl -n machdep.cpu.brand_string
+                  OUTPUT_VARIABLE _luxir_brand OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(_luxir_brand MATCHES "^Apple (M[0-9]+)")
+    string(TOLOWER "apple-${CMAKE_MATCH_1}" _luxir_cpu_name)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mcpu=${_luxir_cpu_name}" LUXIR_MCPU_${CMAKE_MATCH_1})
+    if(NOT LUXIR_MCPU_${CMAKE_MATCH_1})
+      message(WARNING "${CMAKE_CXX_COMPILER} does not know -mcpu=${_luxir_cpu_name}; "
+                      "using -march=native")
+      set(_luxir_cpu_name native)
+    endif()
   endif()
-  add_compile_options("-march=${LUXIR_CPU_TARGET}" "-mtune=${_luxir_cpu_tune}")
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(_luxir_cpu_name MATCHES "^apple-")
+    # An Apple core name selects both the architecture and the tuning.
+    add_compile_options("-mcpu=${_luxir_cpu_name}")
+  else()
+    if(LUXIR_CPU_TARGET STREQUAL "native")
+      set(_luxir_cpu_tune native)
+    else()
+      set(_luxir_cpu_tune generic)
+    endif()
+    add_compile_options("-march=${_luxir_cpu_name}" "-mtune=${_luxir_cpu_tune}")
+  endif()
   # Plain -fstack-protector instead of the distro-default -strong. -strong also
   # instruments functions with any array or address-taken local, putting canary
   # loads in per-document loops (up to 9% on facet loops). The canary lives at
@@ -49,7 +92,11 @@ string(APPEND _luxir_build_flags
        "${CMAKE_C_FLAGS_${_luxir_config}} ${CMAKE_CXX_FLAGS_${_luxir_config}} "
        "${CMAKE_EXE_LINKER_FLAGS_${_luxir_config}} ")
 set(_luxir_sanitizer "")
+# jemalloc is not yet supported on macOS (deps/make_deps.sh omits it there).
 set(_luxir_jemalloc_default ON)
+if(APPLE)
+  set(_luxir_jemalloc_default OFF)
+endif()
 if(_luxir_build_flags MATCHES
    " -fsanitize=([a-z,-]*,)?(address|hwaddress|thread|memory|leak)[ ,]")
   set(_luxir_sanitizer "${CMAKE_MATCH_2}")
@@ -168,12 +215,15 @@ set(CMAKE_CXX_COMPILER_LAUNCHER "${_luxir_compile_launcher}")
 # writable extension entries, so some links put the entries in a read-only
 # segment and the binary segfaults in ld.so before main(). A test link cannot
 # catch a race, so check the version. It is not cached, so old caches get it.
+#
+# GCC on darwin accepts any of these -fuse-ld values but always runs the
+# system linker, so the probe would only mislabel it.
 include(CheckLinkerFlag)
 set(LUXIR_LINKER "")
 # Cross builds use their toolchain's linker. A host linker can pass the small
 # probe but mishandle target relocations: mold placed ARM64 upb extension
 # pointers in a read-only segment, causing a loader crash before main().
-if(NOT CMAKE_CROSSCOMPILING)
+if(NOT CMAKE_CROSSCOMPILING AND NOT APPLE)
   foreach(_cand mold lld gold)
     check_linker_flag(CXX "-fuse-ld=${_cand}" LUXIR_LD_WORKS_${_cand})
     if(LUXIR_LD_WORKS_${_cand} AND _cand STREQUAL "mold")
@@ -358,7 +408,7 @@ target_compile_definitions(luxir_lib PUBLIC
 add_executable(luxir src/luxir/main.cpp)
 target_link_libraries(luxir luxir_lib)
 set_source_files_properties(src/luxir/BuildInfo.cpp PROPERTIES
-  COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${LUXIR_CPU_TARGET}\"")
+  COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${_luxir_cpu_name}\"")
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
@@ -435,9 +485,14 @@ if(_luxir_tbb_type STREQUAL "STATIC_LIBRARY")
   # Preserve TBB's internal allocator when its weak references cannot dlopen
   # tbbmalloc. This does not replace the application's malloc/free.
   target_link_libraries(luxir_lib PRIVATE TBB::tbbmalloc)
+  # Mach-O symbol names carry a leading underscore.
+  set(_luxir_sym "")
+  if(APPLE)
+    set(_luxir_sym _)
+  endif()
   target_link_options(luxir_lib INTERFACE
-    -Wl,-u,scalable_malloc -Wl,-u,scalable_free
-    -Wl,-u,scalable_aligned_malloc -Wl,-u,scalable_aligned_free)
+    -Wl,-u,${_luxir_sym}scalable_malloc -Wl,-u,${_luxir_sym}scalable_free
+    -Wl,-u,${_luxir_sym}scalable_aligned_malloc -Wl,-u,${_luxir_sym}scalable_aligned_free)
 endif()
 target_link_libraries(luxir_lib PRIVATE xxHash::xxhash)
 target_link_libraries(luxir_lib PUBLIC Boost::core Boost::thread Boost::sort)

@@ -79,6 +79,8 @@ public:
 /// the inode readable after an unlink. With O_DIRECT the chunks come from the
 /// media and leave the page cache alone; a filesystem that refuses it (tmpfs)
 /// or a read it rejects falls back to buffered reads of the same fd offset.
+/// macOS has no O_DIRECT; F_NOCACHE keeps the reads out of its page cache
+/// without alignment rules.
 class FSChecksumReader : public ChecksumReader {
   std::filesystem::path path;
   int fd;
@@ -88,9 +90,20 @@ class FSChecksumReader : public ChecksumReader {
   static constexpr size_t kChunk = 1 << 20;
   static constexpr size_t kAlignment = 4096; // covers every common logical block size
 
-  static int openPath(const std::filesystem::path& path, bool direct) {
+  // Clears direct when the descriptor reads through the page cache after all.
+  static int openPath(const std::filesystem::path& path, bool& direct) {
+#if defined(__APPLE__)
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0 && direct) direct = fcntl(fd, F_NOCACHE, 1) == 0;
+#else
     int fd = ::open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
     if (fd < 0 && direct && errno == EINVAL) fd = ::open(path.c_str(), O_RDONLY);
+    // fcntl tells whether the direct open stuck (the fallback above cleared it).
+    if (fd >= 0 && direct) {
+      int flags = fcntl(fd, F_GETFL);
+      direct = flags >= 0 && (flags & O_DIRECT);
+    }
+#endif
     return fd;
   }
   [[noreturn]] static void fail(const std::filesystem::path& path, const char* operation, int error) {
@@ -99,8 +112,12 @@ class FSChecksumReader : public ChecksumReader {
     throw FileIOException(message);
   }
   void useBuffered() {
+#if defined(__APPLE__)
+    if (fcntl(fd, F_NOCACHE, 0) < 0) fail(path, "fcntl", errno);
+#else
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_DIRECT) < 0) fail(path, "fcntl", errno);
+#endif
     direct = false;
   }
 
@@ -118,10 +135,8 @@ public:
       ::close(fd);
       fail(path, "fstat", error);
     }
-    // fcntl tells whether the direct open stuck (the fallback above cleared it).
-    int flags = fcntl(fd, F_GETFL);
     try {
-      return std::make_shared<FSChecksumReader>(path, fd, (uint64_t)st.st_size, flags >= 0 && (flags & O_DIRECT));
+      return std::make_shared<FSChecksumReader>(path, fd, (uint64_t)st.st_size, direct);
     } catch (...) { ::close(fd); throw; }
   }
   FSChecksumReader(std::filesystem::path path, int fd, uint64_t size, bool direct)

@@ -15,6 +15,7 @@
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/util/thread.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationFollower.h"
@@ -44,7 +45,7 @@ class SignalWatcher {
   std::thread thread;
 
   void run() {
-    pthread_setname_np(pthread_self(), "luxir_signals");
+    nameThisThread("luxir_signals");
     sigset_t set = shutdownSignals();
     bool stopping = false;
     for (;;) {

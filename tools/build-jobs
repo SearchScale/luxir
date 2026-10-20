@@ -13,14 +13,19 @@ if (( $# != 1 )); then
 fi
 per_job=$1
 
-# nproc also honors OpenMP's thread limits, which say nothing about build jobs.
-cpus=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
-cores=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)
-if (( cores < 1 || cores > cpus )); then
-  cores=$cpus
+if [[ $(uname -s) == Darwin ]]; then
+  cores=$(sysctl -n hw.physicalcpu)
+  mem_mb=$(( $(sysctl -n hw.memsize) / 1048576 ))
+else
+  # nproc also honors OpenMP's thread limits, which say nothing about build jobs.
+  cpus=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
+  cores=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)
+  if (( cores < 1 || cores > cpus )); then
+    cores=$cpus
+  fi
+  mem_mb=$(( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 1024 ))
 fi
 
-mem_mb=$(( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 1024 ))
 # Walk this process's cgroup (v2) up to the root, then the v1 location.
 cgroup=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)
 limits=()

@@ -29,7 +29,8 @@
       "default-features": false,
       "features": [
         "dynamic-arch"
-      ]
+      ],
+      "platform": "!osx"
     }
   ],
   "features": {
