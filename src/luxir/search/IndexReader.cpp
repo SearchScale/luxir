@@ -540,7 +540,7 @@ FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
 }
 
 std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
-  std::call_once(projectableOnce, [this] {
+  callOnce(projectableOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
     // resource's metadata (StoredFieldsReader::fieldNames).  No copies needed.
@@ -583,7 +583,7 @@ std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projec
 
 std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() {
   assert(sharedSchema);
-  std::call_once(retrievableOnce, [this] {
+  callOnce(retrievableOnce, [this] {
     std::vector<RetrievableField> fields;
     for (const auto& source : projectableFields()) {
       auto split = source.name.rfind("__");

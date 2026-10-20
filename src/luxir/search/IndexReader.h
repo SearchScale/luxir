@@ -14,6 +14,7 @@
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
+#include "luxir/util/Once.h"
 #include "luxir/util/SharedLazyCell.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -260,7 +261,7 @@ private:
   // Its lazy catalogs and maps never retain a reader or schema.
   struct PhysicalCore {
     std::vector<Segment> segs;
-    std::once_flag projectableOnce;
+    OnceFlag projectableOnce;
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<FieldRecords> fields;
@@ -304,7 +305,7 @@ private:
   const std::shared_ptr<PhysicalCore> core;
   const std::shared_ptr<Schema> sharedSchema;
   const std::shared_ptr<FilterCache> sharedFilterCache;
-  std::once_flag retrievableOnce;
+  OnceFlag retrievableOnce;
   std::vector<RetrievableField> retrievable;
 
   // Opens the snapshot `manifest` (the newest durable root when null). Each

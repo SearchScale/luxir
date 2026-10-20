@@ -32,6 +32,7 @@
 #include "luxir/store/InputStream.h"
 #include "luxir/util/log.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/util/Once.h"
 
 namespace luxir {
 
@@ -272,7 +273,7 @@ class VectorAuxReader : public AuxReader {
   std::string name;
   std::string field;
   std::shared_ptr<InputFile> file;
-  mutable std::once_flag loadOnce;
+  mutable OnceFlag loadOnce;
   // Declared before faissIndex so the index is destroyed first; the index
   // never owns the lists (replace_invlists own=false).
   mutable std::unique_ptr<MmapInvertedLists> mmapLists;
@@ -332,7 +333,7 @@ public:
   // payloads are served zero-copy from the file's memory view via
   // MmapInvertedLists (see VectorAuxListsFooter).
   faiss::Index* getFaissIndex() const {
-    std::call_once(loadOnce, [this]() {
+    callOnce(loadOnce, [this]() {
       InputStream is = file->getInputStream();
       const char* base = is.ptr();
       size_t fileBytes = (size_t)is.left();
