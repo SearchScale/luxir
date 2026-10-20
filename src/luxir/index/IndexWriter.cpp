@@ -3048,14 +3048,16 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData&
   // pre-manifest fsync set and clears them only after sync succeeds, so
   // liveDocs files get the same retry-on-failed-commit durability as segment
   // data and overlay files.
-  oneapi::tbb::task_group tg;
-  for (SegInfo* seg : segs) {
-
-    tg.run([this, seg, commitDeletes]() {
-      applyDeletes(*seg, commitDeletes);
-    });
-  }
-  tg.wait();
+  // The waiting commit thread must not execute an unrelated merge or flush.
+  oneapi::tbb::this_task_arena::isolate([&] {
+    oneapi::tbb::task_group tg;
+    for (SegInfo* seg : segs) {
+      tg.run([this, seg, commitDeletes]() {
+        applyDeletes(*seg, commitDeletes);
+      });
+    }
+    tg.wait();
+  });
 }
 
 void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes) {
