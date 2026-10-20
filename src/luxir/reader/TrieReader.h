@@ -287,6 +287,68 @@ public:
 
     return nodeTerminal ? (int32_t)nodeLo : (int32_t)nodeLo - 1;
   }
+
+  /**
+   * The descent of the last floorBlock(target, cursor): the target bytes that matched a child
+   * exactly (up to MAX_DEPTH of them), and the state before each, so a later target resumes where
+   * the two diverge. Trivially destructible, for MemPool-made owners.
+   */
+  class Cursor {
+    friend class TrieReader;
+    static constexpr uint32_t MAX_DEPTH = 64;
+    struct Frame {
+      uint64_t nodeFp;
+      uint32_t nodeLo;
+      int32_t rememberedFloor;
+      bool nodeTerminal;
+    };
+    uint32_t depth = 0;  // path bytes recorded; frames[0..depth] valid once used
+    bool used = false;
+    char path[MAX_DEPTH];
+    Frame frames[MAX_DEPTH + 1];  // frames[d]: before path[d]
+  };
+
+  /** floorBlock(target), sharing the descent of cursor's last target (of this trie). */
+  int32_t floorBlock(std::string_view target, Cursor& cursor) const {
+    if (!cursor.used) {
+      cursor.frames[0] = {rootOff, 0, nBlocks - 1, true};
+      cursor.depth = 0;
+      cursor.used = true;
+    }
+    size_t lim = std::min((size_t)cursor.depth, target.size());
+    size_t depth = 0;
+    while (depth < lim && cursor.path[depth] == target[depth]) depth++;
+    cursor.depth = (uint32_t)depth;
+    Cursor::Frame f = cursor.frames[depth];
+    const char* node = base + f.nodeFp;
+    uint8_t header = (uint8_t)node[0];
+    for (; depth < target.size(); depth++) {
+      uint8_t b = (uint8_t)target[depth];
+      Child child = ceilChild(node, header, b);
+      if (!child.found) return f.rememberedFloor;
+      if (child.label > b) return (int32_t)childLo(node, header, child.pos) - 1;
+
+      if (child.hasNext) {
+        f.rememberedFloor = (int32_t)childLo(node, header, child.pos + 1) - 1;
+      }
+
+      uint32_t lo = childLo(node, header, child.pos);
+      uint64_t delta = childDelta(node, header, child.pos);
+      assert(delta > 0 && delta <= f.nodeFp);
+      f.nodeFp -= delta;
+      node = base + f.nodeFp;
+      header = (uint8_t)node[0];
+      f.nodeLo = lo;
+      f.nodeTerminal = (header & TrieBuilder::TERMINAL_BIT) != 0;
+      if (depth < Cursor::MAX_DEPTH) {
+        cursor.path[depth] = (char)b;
+        cursor.frames[depth + 1] = f;
+        cursor.depth = (uint32_t)depth + 1;
+      }
+    }
+
+    return f.nodeTerminal ? (int32_t)f.nodeLo : (int32_t)f.nodeLo - 1;
+  }
 };
 
 }

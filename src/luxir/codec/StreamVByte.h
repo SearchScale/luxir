@@ -3,6 +3,7 @@
 
 #pragma once
 #include <cstdint>
+#include <cstring>
 
 // StreamVByte declarations from FastPFOR deps/FastPFOR/src/streamvbyte.c, exposed
 // through C linkage for the postings docs tail (the < DOCS_BLOCK_SIZE leftover
@@ -47,6 +48,24 @@ inline uint32_t svbEncodedBytes(const uint8_t* keys, uint32_t count) {
     }
   }
   return keyBytes + dataBytes;
+}
+
+// Value i of a StreamVByte run of `count` values, without decoding the others:
+// the data before it is skipped by its control codes alone.
+inline uint32_t svbValueAt(const uint8_t* run, uint32_t count, uint32_t i) {
+  const uint8_t* data = run + svbKeyBytes(count);
+  uint32_t skip = 0;
+  for (uint32_t k = 0; k < (i >> 2); k++) {
+    const uint8_t key = run[k];
+    skip += 4 + (key & 3u) + ((key >> 2) & 3u) + ((key >> 4) & 3u) + (key >> 6);
+  }
+  const uint8_t key = run[i >> 2];
+  for (uint32_t j = 0; j < (i & 3u); j++) {
+    skip += 1 + ((key >> (j * 2)) & 3u);
+  }
+  uint32_t value = 0;
+  std::memcpy(&value, data + skip, 1 + ((key >> ((i & 3u) * 2)) & 3u));
+  return value;
 }
 
 // Bytes the StreamVByte AVX decoders may read past the encoded data (one 16-byte SIMD
