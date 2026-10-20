@@ -845,7 +845,7 @@ TEST_F(FusionOpTest, emptyIndexWithTwoSourcesSpawnsNoTasks) {
   int64_t spawns;
   {
     TaskSpawnCounter counter;
-    luxirNode->getSearchEngine().dispatch(*req.get(), -1);
+    luxirNode->getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
     spawns = counter.count();
   }
   ASSERT_OK(req);
@@ -880,7 +880,7 @@ TEST_F(FusionOpTest, unarySubOpDoesNotSpawn) {
         int64_t spawns;
         {
           TaskSpawnCounter counter;
-          luxirNode->getSearchEngine().dispatch(*req.get(), profile);
+          luxirNode->getSearchEngine().dispatch(*req.get(), profile, SearchEngine::Receiver::MAY_EXECUTE);
           spawns = counter.count();
         }
         ASSERT_OK(req);
