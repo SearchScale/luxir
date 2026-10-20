@@ -1299,6 +1299,20 @@ public:
       }
     }
 
+    // Where the next window with any of the term's docs starts: the term's next doc at or after
+    // min, word-aligned (but not before min); max when it has none before max. The windows
+    // skipped hold none of its docs, so they count and match nothing. Only without a window
+    // filter, which may prepare windows in order.
+    int32_t firstTermWindow(int32_t min, int32_t max) {
+      if (windowFilter != nullptr) return min;
+      std::span<const int32_t> next = scorer->docsEnum.peekDocOnlyBlock();
+      if (next.empty()) return max;
+      auto it = std::lower_bound(next.begin(), next.end(), min);
+      if (it == next.end()) return min;  // the decoded block ends before min: the fill skips
+      if (*it >= max) return max;
+      return std::max(min, *it & ~63);
+    }
+
   public:
     TermBulkScorer(MemPool& pool, TermQuery::Scorer* scorer, int32_t maxDoc)
         : scorer(scorer),
@@ -1350,6 +1364,10 @@ public:
       if (filter != nullptr && filter->card() == 0) {
         return PostingsReader::END;
       }
+      min = firstTermWindow(min, max);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
 
       setWindowBounds(min, max);
       if (!fillFilteredWindowBits(filter)) {
@@ -1386,6 +1404,11 @@ public:
         return PostingsReader::END;
       }
       if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      min = firstTermWindow(min, max);
+      if (min >= max) {
+        out.min = out.max = max;
         return PostingsReader::END;
       }
 
