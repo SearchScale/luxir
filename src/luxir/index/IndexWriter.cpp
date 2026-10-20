@@ -160,6 +160,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     coreGen = indexInfo.core_gen;
     schemaGen_ = indexInfo.schema_gen;
     updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
+    completedUpdateVersion = indexInfo.update_version;
     durableUpdateVersion = indexInfo.update_version;
     segInfos.reserve(indexInfo.segments.size());
     lastCommittedSegIds.reserve(indexInfo.segments.size());
@@ -2886,10 +2887,23 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
     out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
+    out.completedUpdateVersion = completedUpdateVersion;
+    auto includeInverters = [&](const auto& inverters) {
+      for (const auto& [inverter, _] : inverters) {
+        out.minInverterVersion = std::min(out.minInverterVersion, inverter->minVersion);
+      }
+    };
+    includeInverters(busyInverters);
+    includeInverters(idleInverters);
+    includeInverters(flushingInverters);
+    uint64_t frontier = std::min(out.completedUpdateVersion, out.minInverterVersion);
     boost::unordered_flat_set<const SortedDeletes*> retained;
     auto countDeletes = [&](const MultiDeletesData& deletes) {
       for (const auto& batch : deletes.deletes) {
-        if (retained.insert(batch.get()).second) out.retainedDeleteBytes += batch->memSize();
+        if (retained.insert(batch.get()).second) {
+          out.retainedDeleteBytes += batch->memSize();
+          if (batch->getLargestVersion() > frontier) out.frontierHeldDeleteBytes += batch->memSize();
+        }
       }
     };
     countDeletes(pendingDeletes);

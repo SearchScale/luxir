@@ -3634,3 +3634,50 @@ TEST_F(IndexWriterTest, storageLimitDiscardsPartialOutputBeforeRecovery) {
   ASSERT_TRUE(h.index(test::flatdoc("id", "small", "payload", "small"), UpdateMessage::COMMIT).success);
   EXPECT_EQ(1, h.collection().getReaderManager().getReader()->liveDocs());
 }
+
+TEST_F(IndexWriterTest, shadowFrontierWaitsForCompletedHandlers) {
+  using namespace luxir::test;
+  class HeldUpdate : public ProtoUpdateMessage {
+  public:
+    std::latch entered{1}, release{1}, finished{1};
+    using ProtoUpdateMessage::ProtoUpdateMessage;
+    void handle(IndexWriter& writer) override {
+      entered.count_down();
+      release.wait();
+      ProtoUpdateMessage::handle(writer);
+      finished.count_down();
+    }
+    void done(IndexWriter&) override {}
+  };
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto first = helper.index(flatdoc("id", "first"));
+  EXPECT_EQ(first.updateVersion, iw->stats(false, false).completedUpdateVersion);
+  EXPECT_EQ(first.updateVersion, iw->stats(false, false).minInverterVersion);
+  CollectionHelper::UpdateBuilder request;
+  request.add(flatdoc("id", "held"));
+  HeldUpdate held(&request.finish());
+  auto cleanup = scope_guard([&] {
+    if (!held.release.try_wait()) held.release.count_down();
+    iw->updateGraph->wait_for_all();
+  });
+  ASSERT_TRUE(iw->submitUpdate(&held));
+  held.entered.wait();
+  CollectionHelper::UpdateBuilder laterRequest;
+  laterRequest.add(flatdoc("id", "later"));
+  HeldUpdate later(&laterRequest.finish());
+  later.release.count_down();
+  ASSERT_TRUE(iw->submitUpdate(&later));
+  later.finished.wait();
+  EXPECT_GT(held.updateVersion, first.updateVersion);
+  EXPECT_EQ(first.updateVersion, iw->stats(false, false).completedUpdateVersion);
+  held.release.count_down();
+  iw->updateGraph->wait_for_all();
+  EXPECT_EQ(later.updateVersion, iw->stats(false, false).completedUpdateVersion);
+  helper.commit();
+  auto stats = iw->stats(false, false);
+  EXPECT_GT(stats.completedUpdateVersion, held.updateVersion);
+  EXPECT_EQ(UINT64_MAX, stats.minInverterVersion);
+  EXPECT_EQ(0, stats.frontierHeldDeleteBytes);
+}

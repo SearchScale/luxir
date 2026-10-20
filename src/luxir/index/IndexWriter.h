@@ -128,6 +128,7 @@ class IndexWriter {
   std::mutex indexMutex;
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
+  uint64_t completedUpdateVersion = 0; // indexMutex
   uint64_t nextManifestGen = 0;
   std::string incarnation;
 
@@ -156,6 +157,9 @@ public:
     uint64_t activeMerges = 0;
     uint64_t flushing = 0, idle = 0, indexing = 0;
     uint64_t retainedDeleteBytes = 0;
+    uint64_t completedUpdateVersion = 0;
+    uint64_t minInverterVersion = UINT64_MAX;
+    uint64_t frontierHeldDeleteBytes = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -647,6 +651,10 @@ private:
 
   void finishUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      completedUpdateVersion = msg.updateVersion;
+    }
     bool doneWithMessage = true;
     // A failed request has no effects, including its commit.  Commit numbers are
     // taken in initiateCommit, so skipping it leaves the commit sequencer dense.
