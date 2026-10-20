@@ -69,6 +69,9 @@ public:
     // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
 
+    // Null until known; once populated, the physical dictionary's bounds never change.
+    std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
+
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
 

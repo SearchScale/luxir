@@ -21,6 +21,7 @@
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/IdRange.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/store/OutputStream.h"
@@ -60,6 +61,10 @@ public:
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
   };
+
+  // The id field's bounds, captured when its dictionary is finalized. Absent
+  // when no finalized dictionary was written for it; callers then derive them.
+  std::optional<IdRange> idRange;
 
 private:
   Directory& directory;
@@ -1833,6 +1838,10 @@ public:
 
   void finalizeField(RangeResult&& result) {
     assert(buildTrie);
+
+    if ((std::string_view)fieldInfo->fieldname == "id") {
+      postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
+    }
 
     // write index into the blocks of the terms dict
     // TODO: use a more efficient encoding for this array

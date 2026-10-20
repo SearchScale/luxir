@@ -2372,13 +2372,13 @@ TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
   auto& inflightInv = iw.obtainInverter(1);
   int64_t inflightSeg = inflightInv.getSegId();
   inflightInv.startDoc();
-  inflightInv.getIndexHandler("id").index(inflightInv, "live");
+  inflightInv.getIndexHandler("id").index(inflightInv, "dup");
   inflightInv.finishDoc();
 
   auto& newInv = iw.obtainInverter(3);
   int64_t newSeg = newInv.getSegId();
   newInv.startDoc();
-  newInv.getIndexHandler("id").index(newInv, "newdoc");
+  newInv.getIndexHandler("id").index(newInv, "dup");
   newInv.finishDoc();
 
   iw.releaseInverter(delInv);
@@ -2392,6 +2392,76 @@ TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
   EXPECT_TRUE(applied.contains(oldSeg));
   EXPECT_TRUE(applied.contains(inflightSeg));
   EXPECT_FALSE(applied.contains(newSeg));
+}
+
+TEST_F(IndexWriterTest, idRangeClipsDeleteSelection) {
+  for (bool wideEnvelope : {false, true}) {
+    SCOPED_TRACE(wideEnvelope);
+    test::CollectionHelper helper;
+    auto iw = helper.getIndexWriter();
+    iw->mergePolicy->setMergeFactor(100);
+    ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+    auto* disjoint = iw->segInfos.begin()->second.get();
+    ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "x"), test::flatdoc("id", "y")}, UpdateMessage::COMMIT).success);
+    std::atomic<int> applied = 0;
+    Signal::listen("deleteAppliedToSegment", [&](void*, void*, void*) -> void* { applied++; return nullptr; });
+    auto unlisten = scope_guard([] { Signal::unlisten("deleteAppliedToSegment"); });
+    ASSERT_TRUE(helper.deleteByIds(wideEnvelope ? std::vector<std::string>{"0", "x", "z"}
+                                               : std::vector<std::string>{"x"}, UpdateMessage::COMMIT).success);
+    EXPECT_EQ(wideEnvelope ? 2 : 1, applied.load());
+    EXPECT_EQ(0, disjoint->liveGen);
+    EXPECT_EQ(nullptr, disjoint->sharedPostingsReader.load());
+    EXPECT_EQ(nullptr, iw->dir.openFile(Postings::getLiveDocsFileName(Postings::getSortableString(disjoint->segId), 1)));
+    EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
+    helper.clear();
+  }
+}
+
+TEST_F(IndexWriterTest, idRangeUsesFittedTerms) {
+  test::CollectionHelper helper;
+  std::string first = std::string(300, 'x') + "first", second = std::string(300, 'x') + "second";
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", first, "state_s", "first"),
+                               test::flatdoc("id", second, "state_s", "second")}, UpdateMessage::COMMIT, true).success);
+  auto range = helper.getIndexWriter()->segInfos.begin()->second->idRange.load();
+  ASSERT_NE(nullptr, range);
+  EXPECT_LT(range->max.size(), first.size());
+  ASSERT_TRUE(helper.deleteById(first, UpdateMessage::COMMIT).success);
+  auto req = test::localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"state_s"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_CONTAINS_DOC(req->getDocs(), test::flatdoc("state_s", "second"));
+  EXPECT_EQ(1, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, idRangeTracksMergeAndReopen) {
+  LuxirNode node;
+  test::CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(100);
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "y"), test::flatdoc("id", "z")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteByIds({"a", "z"}, UpdateMessage::COMMIT).success);
+  iw->mergeSegments();
+  ASSERT_EQ(1, iw->segInfos.size());
+  auto range = iw->segInfos.begin()->second->idRange.load();
+  ASSERT_NE(nullptr, range);
+  EXPECT_EQ("b", range->min);
+  EXPECT_EQ("y", range->max);
+  iw->close();
+  IndexWriter reopened(iw->snapshots);
+  auto& seg = *reopened.segInfos.begin()->second;
+  EXPECT_EQ(nullptr, seg.idRange.load());
+  auto version = reopened.stats(false).updateVersion + 1;
+  auto& inverter = reopened.obtainInverter(version);
+  inverter.deleteId("m", version);
+  reopened.releaseInverter(inverter);
+  reopened.commit();
+  range = seg.idRange.load();
+  ASSERT_NE(nullptr, range);
+  EXPECT_FALSE(range->empty);
+  EXPECT_EQ("b", range->min);
+  EXPECT_EQ("y", range->max);
 }
 
 

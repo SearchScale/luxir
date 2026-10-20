@@ -54,6 +54,27 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
   }
 }
 
+bool mayApplyDeletes(const SegInfo& seg, const MultiDeletesData& deletes) {
+  auto range = seg.idRange.load();
+  for (const auto& packet : deletes.deletes) {
+    if (seg.minVersion >= packet->getLargestVersion()) continue;
+    if (!range) return true;
+    for (auto span : packet->lists()) {
+      if (!span.empty() && range->overlaps((std::string_view)span.front(), (std::string_view)span.back())) return true;
+    }
+  }
+  return false;
+}
+
+SortedDeletes::EntrySpan clipDeletes(SortedDeletes::EntrySpan span, const IdRange& range) {
+  if (range.empty) return {};
+  auto first = std::lower_bound(span.begin(), span.end(), std::string_view(range.min),
+      [](const auto& entry, std::string_view id) { return (std::string_view)entry < id; });
+  auto last = std::upper_bound(first, span.end(), std::string_view(range.max),
+      [](std::string_view id, const auto& entry) { return id < (std::string_view)entry; });
+  return span.subspan((size_t)(first - span.begin()), (size_t)(last - first));
+}
+
 } // namespace
 
 
@@ -1140,6 +1161,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schemaGen = inverter.schema->gen_;
+    if (auto& range = inverter.getPostingsWriter().idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
       segInfo->liveGen = inverter.liveGen;
@@ -1289,7 +1311,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
       if (seg->lastCommitTime == 0) {
         seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
       }
-      if (!seg->personalDeletes.empty() || seg->minVersion < maxDeleteVersion) {
+      if (mayApplyDeletes(*seg, commitDeletes) || mayApplyDeletes(*seg, seg->personalDeletes)) {
         // this segment has personal deletes and/or commit-level deletes that need to be applied.
         segsToApplyDeletes.push_back(seg.get());
       }
@@ -1697,11 +1719,25 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 //
 std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& seg) {
   auto pr = seg.sharedPostingsReader.load();
-  if (pr) return pr;
-  std::shared_ptr<IndexReader> reader;
-  if (const auto* published = publishedSegment(seg, reader)) pr = published->postingsReaderShared();
-  if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
-  seg.sharedPostingsReader.store(pr);
+  if (!pr) {
+    std::shared_ptr<IndexReader> reader;
+    if (const auto* published = publishedSegment(seg, reader)) pr = published->postingsReaderShared();
+    if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
+    seg.sharedPostingsReader.store(pr);
+  }
+  if (!seg.idRange.load()) {
+    IdRange range;
+    if (auto* info = pr->fieldInfo("id"); info && info->nTerms > 0) {
+      auto guard = MemPool::threadLocalPoolGuard();
+      TermsEnum terms(guard.pool(), *pr, *info);
+      terms.seekOrd(0);
+      range.min = (std::string_view)terms.term();
+      terms.seekOrd(info->nTerms - 1);
+      range.max = (std::string_view)terms.term();
+      range.empty = false;
+    }
+    seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
+  }
   return pr;
 }
 
@@ -2412,6 +2448,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
@@ -3092,6 +3129,12 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     return;
   }
 
+  auto range = seg.idRange.load();
+  if (range) {
+    deleteSpan = clipDeletes(deleteSpan, *range);
+    if (deleteSpan.empty()) return;
+  }
+
   auto guard = MemPool::threadLocalPoolGuard();
   MemPool& pool = guard.pool();
 
@@ -3099,6 +3142,11 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   auto sharedReader = getSegmentPostingsReader(seg);
   PostingsReader& reader = *sharedReader;
   int32_t maxDocId = reader.maxDoc();
+
+  if (!range) {
+    deleteSpan = clipDeletes(deleteSpan, *seg.idRange.load());
+    if (deleteSpan.empty()) return;
+  }
 
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
