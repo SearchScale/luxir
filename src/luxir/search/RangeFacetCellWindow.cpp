@@ -107,7 +107,7 @@ bool RangeFacetCellWindow<T>::rebuildAffine(int64_t lo, int64_t hi, bool left, u
   std::optional<int64_t> certified;
   try { certified = grid.affineGap(first, (int64_t)std::min(end, (__int128)INT64_MAX)); }
   catch (const std::runtime_error&) {
-    // Headroom may cross a tzdb/representation boundary even though every
+    // Headroom may cross a representation boundary even though every
     // observed value fits. Retry the actual extent before rejecting it.
     first = lo;
     last = hi;

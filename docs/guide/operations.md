@@ -592,10 +592,11 @@ Search has its own limits:
 
 ## Time-zone data
 
-IANA time-zone names require the system zoneinfo database and compatible C++
-runtime data. Without it, date queries retain UTC and fixed-offset support but
-named zones are unavailable. Keep the zoneinfo data and C++ runtime consistent
-across machines if requests must produce identical civil-time boundaries.
+IANA time-zone names require the system zoneinfo database (`tzdata`), read
+from `$TZDIR` or `/usr/share/zoneinfo` at startup. Without it, date queries
+retain UTC and fixed-offset support but named zones are unavailable. Keep the
+zoneinfo data identical across machines if requests must produce identical
+civil-time boundaries.
 
 ## Shutdown and recovery
 

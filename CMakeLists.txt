@@ -242,6 +242,7 @@ find_package(faiss CONFIG REQUIRED)
 # luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
+find_package(absl CONFIG REQUIRED)
 if(LUXIR_JEMALLOC)
   # The vcpkg port installs a static archive and pkg-config metadata only.
   set(_luxir_triplet_dir "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
@@ -450,6 +451,8 @@ target_link_libraries(luxir_lib PRIVATE fastpfor)
 target_link_libraries(luxir_lib PUBLIC luxir_proto_concrete)
 target_link_libraries(luxir_lib PUBLIC protobuf::libprotobuf)
 target_link_libraries(luxir_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
+# IANA zones decode from the system's compiled TZif files (DateTime.cpp).
+target_link_libraries(luxir_lib PRIVATE absl::time)
 # log.h is included by tests and other dependents; propagate spdlog's compiled
 # mode so every TU shares the same default-logger registry.
 target_link_libraries(luxir_lib PUBLIC spdlog::spdlog)

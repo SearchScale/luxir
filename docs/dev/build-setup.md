@@ -275,12 +275,13 @@ Treat those as harnesses, not published comparative results.
 
 ## Time-zone database at runtime
 
-`std::chrono` time-zone support requires the system zoneinfo database to be
-present at runtime. Without it, the service degrades to UTC and fixed-offset
-zones only. The loaded tzdb version is logged at startup. Keep the zoneinfo
-data and the C++ runtime consistent across a fleet: identical tzdb version
-strings do not guarantee identical transition decoding across different
-parser implementations.
+IANA time zones are read at runtime from the system zoneinfo database
+(`$TZDIR`, else `/usr/share/zoneinfo`): zone and link names and the version
+come from its `tzdata.zi`, and the rules from the compiled TZif files that the
+C library also uses. Without it, the service degrades to UTC and fixed-offset
+zones only. The loaded version is logged at startup. Requests produce identical
+civil-time boundaries on machines with identical zoneinfo trees, whatever the
+compiler or C++ runtime.
 
 See [Operating Luxir](../guide/operations.md) for persistence, ports, security,
 and resource controls after the binary is built.

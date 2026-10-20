@@ -27,8 +27,7 @@ std::vector<int64_t> scanFences(TimeZone zone, int64_t center, int64_t gap, int6
   auto offset = [&](int64_t t) {
     if (zone.isUtc()) return int64_t{0};
     if (zone.isFixed()) return (int64_t)zone.offsetMinutes() * minute;
-    return duration_cast<milliseconds>(zone.ianaZone()->get_info(
-        sys_time<milliseconds>{milliseconds{t}}).offset).count();
+    return duration_cast<milliseconds>(zone.ianaZone()->offsetAt(t)).count();
   };
   std::vector<int64_t> result;
   int64_t begin = center - 3 * day, end = center + 3 * day;
@@ -56,8 +55,10 @@ TEST(RangeFacetGridTest, instantScanningOracle) {
       Case{"America/Denver", "2024-11-03T08:00Z"},
       Case{"Australia/Lord_Howe", "2024-04-06T15:00Z"},
       Case{"Australia/Lord_Howe", "2024-10-05T15:30Z"},
-      Case{"Pacific/Apia", "2011-12-30T11:00Z"},
+      Case{"Pacific/Apia", "2011-12-30T10:00Z"},
       Case{"America/New_York", "1969-10-26T06:00Z"},
+      Case{"America/New_York", "9999-03-14T07:00Z"},
+      Case{"America/New_York", "9999-11-07T06:00Z"},
       Case{"UTC", "1969-01-05T00:00Z"}, Case{"+05:30", "1969-01-05T00:00Z"}}) {
     for (int64_t gap : {15 * minute, 45 * minute, 60 * minute, 120 * minute, day}) {
       for (int64_t origin : {int64_t{0}, 5 * minute, 17 * minute, 360 * minute}) {
@@ -261,7 +262,24 @@ TEST(RangeFacetGridTest, bucketCapAdviceFollowsBounds) {
         epoch("2024-03-10T05:17Z"), epoch("2024-03-10T08:17Z"));
 }
 
-TEST(RangeFacetGridTest, calendarSkippedIntervalCacheMatchesDirectLookup) {
+// Apia skipped 2011-12-30. With noon-phased daily cells the skipped label is
+// Dec 30 noon; the Dec 29 noon cell spans the jump.
+TEST(RangeFacetGridTest, apiaSkippedLabelWithNoonPhase) {
+  int64_t start = epoch("2011-12-28T22:00Z");  // Dec 28 12:00 at -10
+  int64_t end = epoch("2011-12-31T22:00Z");    // Jan 1 12:00 at +14
+  auto grid = Grid::calendar(CalendarUnit::DAY, 1, zone("Pacific/Apia"), start);
+  auto built = grid.fences(start, end, true);
+  EXPECT_EQ((std::vector<int64_t>{start, epoch("2011-12-29T22:00Z"), epoch("2011-12-30T22:00Z"), end}),
+            built.values);
+  EXPECT_EQ(std::vector<int64_t>{epoch("2011-12-30T12:00Z")}, built.skippedCivil);
+  EXPECT_EQ(built.skippedCivil, grid.skippedCalendarCells(start, end));
+  // Reported only when the surviving fence it shares lies within the span.
+  int64_t surviving = epoch("2011-12-30T22:00Z");
+  EXPECT_EQ(built.skippedCivil, grid.skippedCalendarCells(start, surviving));
+  EXPECT_TRUE(grid.skippedCalendarCells(start, surviving - 1).empty());
+}
+
+TEST(RangeFacetGridTest, localResolverCacheMatchesDirectLookup) {
   struct Case { std::string_view zone, center; };
   for (auto c : std::array{
       Case{"America/New_York", "2024-03-10"},
@@ -272,14 +290,14 @@ TEST(RangeFacetGridTest, calendarSkippedIntervalCacheMatchesDirectLookup) {
     SCOPED_TRACE(std::string(c.zone));
     auto z = zone(c.zone);
     for (int direction : {1, -1}) {
-      datetime_detail::LocalTimeResolver resolver(z, std::nullopt);
-      for (int step = -48; step <= 48; step++) {
-        int64_t civil = epoch(c.center) + direction * step * 60 * minute;
-        ASSERT_TRUE(resolver.resolve(civil));
-        for (int64_t width : {int64_t{1}, 60 * minute, day, 7 * day, 40 * day}) {
-          EXPECT_EQ(civilIntervalSkipped(civil, civil + width, z),
-                    resolver.intervalSkipped(civil, civil + width))
-              << "civil=" << civil << " width=" << width;
+      for (auto preferred : {std::optional<std::chrono::seconds>{}, std::optional{civilFromInstant(
+               epoch(c.center) + 60 * day, z)->offset}}) {
+        datetime_detail::LocalTimeResolver resolver(z, preferred);
+        for (int step = -48 * 4; step <= 48 * 4; step++) {
+          int64_t civil = epoch(c.center) + direction * step * 15 * minute;
+          for (int64_t at : {civil, civil + 1, civil - 1}) {
+            EXPECT_EQ(instantFromCivil(at, z, preferred), resolver.resolve(at)) << "civil=" << at;
+          }
         }
       }
     }

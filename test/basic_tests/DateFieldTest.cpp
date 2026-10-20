@@ -498,7 +498,10 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
 
   std::string embeddedNul("America/Denver\0junk", 19);
   for (std::string_view spec : {"utc", "z", "+18:01", "+24:00", "+5:30",
-                                " UTC", "UTC ", "No/Such_Zone"}) {
+                                " UTC", "UTC ", "No/Such_Zone", "america/denver",
+                                "../../../etc/localtime", "/usr/share/zoneinfo/UTC",
+                                "file:/usr/share/zoneinfo/UTC", "localtime", "posixrules",
+                                "posix/UTC", "Fixed/UTC+05:30:00"}) {
     EXPECT_FALSE(resolveTimeZone(spec).has_value()) << spec;
   }
   EXPECT_FALSE(resolveTimeZone(embeddedNul).has_value());
@@ -506,7 +509,7 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
   auto alias = resolveTimeZone("US/Eastern");
   ASSERT_TRUE(alias.has_value());
   EXPECT_TRUE(alias->isIana());
-  EXPECT_EQ("America/New_York", alias->name());  // chrono returns the canonical target
+  EXPECT_EQ("America/New_York", alias->name());  // a link resolves to its target zone
   EXPECT_TRUE(timeZoneDatabaseAvailable());
   EXPECT_FALSE(timeZoneDatabaseVersion().empty());
 
@@ -522,6 +525,23 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
   }
   for (auto& thread : threads) thread.join();
   EXPECT_TRUE(concurrentOk);
+}
+
+// Transitions that std::chrono's text-tzdb parser has decoded wrongly, as the
+// compiled zoneinfo files define them.
+TEST_F(DateFieldTest, namedZonesFollowCompiledZoneinfo) {
+  auto offsetHours = [](std::string_view zone, std::string_view instant) {
+    return civilFromInstant(utcMs(instant), testZone(zone))->offset.count() / 3600.0;
+  };
+  EXPECT_EQ(-10, offsetHours("Pacific/Apia", "2011-12-30T09:59:59Z"));
+  EXPECT_EQ(14, offsetHours("Pacific/Apia", "2011-12-30T10:00:00Z"));
+  EXPECT_EQ(14, offsetHours("Pacific/Apia", "2012-03-31T13:59:59Z"));
+  EXPECT_EQ(-3, offsetHours("America/Argentina/Buenos_Aires", "2000-01-01T00:00:00Z"));
+  // A second-granular offset before 1970 keeps the instant's milliseconds.
+  TimeZone monrovia = testZone("Africa/Monrovia");  // -0:44:30
+  auto civil = civilFromInstant(utcMs("1960-01-01T00:00:00.123Z"), monrovia);
+  EXPECT_EQ(utcMs("1959-12-31T23:15:30.123Z"), civil->millis);
+  EXPECT_EQ(utcMs("1960-01-01T00:00:00.123Z"), instantFromCivil(civil->millis, monrovia));
 }
 
 TEST_F(DateFieldTest, literalOffsetPresenceCapsAndFrameRebase) {
