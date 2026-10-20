@@ -53,7 +53,8 @@ public:
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
-    int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
+    int64_t mergedLiveGen = -1;  // source generation covered by the merge
+    int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
     uint64_t publishedLiveGen = 0; // the generation in the published snapshot
     std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.

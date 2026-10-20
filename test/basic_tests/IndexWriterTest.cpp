@@ -3524,13 +3524,15 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
   started.wait();
   EXPECT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
   EXPECT_TRUE(writer->pendingDeletes.empty());
-  auto retained = writer->stats(false).retainedDeleteBytes;
-  EXPECT_GT(retained, 0);
-  EXPECT_EQ(retained, node.getIndexRamBudget().retainedDeleteBytesCount());
+  EXPECT_EQ(0, writer->stats(false).retainedDeleteBytes);
+  EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
   auto intermediate = test::readDurableIndexInfo(writer->dir);
   auto intermediateLiveDocs = Postings::getLiveDocsFileName(
       Postings::getSortableString(seg.seg_id), intermediate->segments.front().live_gen);
-  EXPECT_TRUE(helper.deleteById("c", UpdateMessage::COMMIT).success);
+  for (auto id : {"c", "e", "f"}) {
+    EXPECT_TRUE(helper.deleteById(id, UpdateMessage::COMMIT).success);
+    EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
+  }
   writer->setSchema(writer->getSchema());
   EXPECT_EQ(nullptr, writer->dir.openFile(intermediateLiveDocs));
   EXPECT_NE(nullptr, writer->dir.openFile(oldLiveDocs));
@@ -3538,8 +3540,226 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
   EXPECT_NO_THROW(merge.get());
   writer->updateGraph->wait_for_all();
   EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
-  EXPECT_EQ(3, writer->snapshots.readers.getReader()->liveDocs());
+  EXPECT_EQ(1, writer->snapshots.readers.getReader()->liveDocs());
   EXPECT_EQ(nullptr, writer->dir.openFile(oldLiveDocs));
+}
+
+TEST_F(IndexWriterTest, applicationFinishingAfterMergeCarriesToOutput) {
+  test::CollectionHelper helper("late_merge_delete");
+  auto writer = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  std::latch diff(1), releaseMerge(1), application(1), releaseApplication(1), swapped(1);
+  Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
+    diff.count_down(); releaseMerge.wait(); return nullptr;
+  });
+  auto unlisten = scope_guard([] {
+    Signal::unlisten("mergeLiveDocsDiff");
+    Signal::unlisten("deleteAppliedToSegment");
+    Signal::unlisten("mergeSwap");
+  });
+  auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
+  diff.wait();
+  auto sourceId = writer->snapshots.readers.getReader()->segments().front().segInfo.seg_id;
+  Signal::listen("deleteAppliedToSegment", [&](void* id, void*, void*) -> void* {
+    if ((uint64_t)id == sourceId) { application.count_down(); releaseApplication.wait(); }
+    return nullptr;
+  });
+  Signal::listen("mergeSwap", [&](void*, void*, void*) -> void* {
+    swapped.count_down(); return nullptr;
+  });
+  auto commit = std::async(std::launch::async, [&] {
+    return helper.deleteById("a", UpdateMessage::COMMIT);
+  });
+  application.wait();
+  releaseMerge.count_down();
+  swapped.wait();
+  releaseApplication.count_down();
+  EXPECT_TRUE(commit.get().success);
+  merge.get();
+  writer->updateGraph->wait_for_all();
+  EXPECT_EQ(1, writer->snapshots.readers.getReader()->liveDocs());
+  EXPECT_EQ(0, writer->stats(false).retainedDeleteBytes);
+  test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
+}
+
+namespace {
+
+void lateApplicationAcrossTwoMerges(bool carryWhileMerging) {
+  LuxirNode node;
+  test::CollectionHelper helper(node, "main");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(1000);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto* source = writer->segInfos.begin()->second.get();
+  auto sourceId = source->segId;
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "c"), test::flatdoc("id", "d")},
+                              UpdateMessage::COMMIT).success);
+  // The forced merge takes the two smallest segments; its output then chains
+  // into a policy merge with the untouched two-document segment.
+  writer->mergePolicy->setMergeFactor(2);
+  writer->mergePolicy->refresh();
+  std::latch diff(1), releaseMerge(1), application(1), releaseApplication(1);
+  std::latch secondStarted(1), releaseSecond(1), secondSwapped(1), releaseOutputApplication(1);
+  uint64_t firstOutput = 0, secondOutput = 0;
+  std::future<test::IndexResult> merge, commit;
+  auto cleanup = scope_guard([&] {
+    for (auto* gate : {&releaseMerge, &releaseApplication, &releaseSecond, &releaseOutputApplication}) {
+      if (!gate->try_wait()) gate->count_down();
+    }
+    if (commit.valid()) commit.wait();
+    if (merge.valid()) merge.wait();
+    writer->updateGraph->wait_for_all();
+    for (auto hook : {"mergeLiveDocsDiff", "deleteAppliedToSegment", "mergeStart", "mergeSwap"}) {
+      Signal::unlisten(hook);
+    }
+  });
+  Signal::listen("mergeLiveDocsDiff", [&](void* seg, void*, void*) -> void* {
+    if (firstOutput == 0) {
+      firstOutput = ((SegInfo*)seg)->segId;
+      diff.count_down(); releaseMerge.wait();
+    }
+    return nullptr;
+  });
+  Signal::listen("deleteAppliedToSegment", [&](void* id, void*, void*) -> void* {
+    if ((uint64_t)id == sourceId) {
+      application.count_down(); releaseApplication.wait();
+    }
+    // Keep M1's queued publication from consuming O's carry before M2 copies it.
+    if (carryWhileMerging && (uint64_t)id == firstOutput) releaseOutputApplication.wait();
+    return nullptr;
+  });
+  Signal::listen("mergeStart", [&](void* level, void*, void*) -> void* {
+    if ((int64_t)level == 1) {
+      secondStarted.count_down();
+      if (carryWhileMerging) releaseSecond.wait();
+    }
+    return nullptr;
+  });
+  Signal::listen("mergeSwap", [&](void* id, void*, void*) -> void* {
+    if ((uint64_t)id != firstOutput) {
+      secondOutput = (uint64_t)id;
+      secondSwapped.count_down();
+    }
+    return nullptr;
+  });
+  merge = std::async(std::launch::async, [&] {
+    test::CollectionHelper::UpdateBuilder request;
+    request.commit(false, 2);
+    return helper.submit(request);
+  });
+  diff.wait();
+  commit = std::async(std::launch::async, [&] {
+    return helper.deleteById("a", UpdateMessage::COMMIT);
+  });
+  application.wait();
+  releaseMerge.count_down();
+  if (carryWhileMerging) {
+    secondStarted.wait();
+    auto* output = writer->segInfos.at(firstOutput).get();
+    releaseApplication.count_down();
+    EXPECT_TRUE(commit.get().success);
+    EXPECT_TRUE(output->merging);
+    EXPECT_FALSE(output->personalDeletes.empty());
+    releaseSecond.count_down();
+    secondSwapped.wait();
+    releaseOutputApplication.count_down();
+  } else {
+    secondSwapped.wait();
+    EXPECT_EQ(secondOutput, source->mergedIntoSegId);
+    releaseApplication.count_down();
+    EXPECT_TRUE(commit.get().success);
+  }
+  EXPECT_TRUE(merge.get().success);
+  writer->updateGraph->wait_for_all();
+  helper.commit();
+  EXPECT_EQ(3, writer->snapshots.readers.getReader()->liveDocs());
+  auto* req = test::LocalReq::create(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+  req->execute();
+  EXPECT_FALSE(test::containsDoc(req->getDocs(), test::flatdoc("id", "a")));
+  req->done();
+  EXPECT_EQ(0, writer->stats(false).retainedDeleteBytes);
+  test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
+}
+
+} // namespace
+
+TEST_F(IndexWriterTest, lateApplicationFollowsTwoMergeSwaps) {
+  lateApplicationAcrossTwoMerges(false);
+}
+
+TEST_F(IndexWriterTest, lateApplicationCarriesOntoMergingOutput) {
+  lateApplicationAcrossTwoMerges(true);
+}
+
+TEST_F(IndexWriterTest, mergeRetriesLiveDocsDiffBeforeSwap) {
+  test::CollectionHelper helper("merge_diff_retry");
+  auto writer = helper.getIndexWriter();
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b")},
+                              UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "keep"), UpdateMessage::COMMIT).success);
+  std::latch diff(1), release(1), retry(1), releaseRetry(1);
+  std::atomic<int> attempts = 0;
+  Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
+    int attempt = attempts++;
+    if (attempt == 0) { diff.count_down(); release.wait(); }
+    if (attempt == 1) { retry.count_down(); releaseRetry.wait(); }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeLiveDocsDiff"); });
+  auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
+  diff.wait();
+  EXPECT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  release.count_down();
+  retry.wait();
+  EXPECT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  EXPECT_TRUE(helper.deleteById("keep", UpdateMessage::COMMIT).success);
+  EXPECT_EQ(0, writer->stats(false).retainedDeleteBytes);
+  releaseRetry.count_down();
+  merge.get();
+  writer->updateGraph->wait_for_all();
+  EXPECT_EQ(3, attempts.load());
+  EXPECT_EQ(0, writer->snapshots.readers.getReader()->liveDocs());
+  EXPECT_TRUE(writer->segInfos.empty());
+  test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
+}
+
+TEST_F(IndexWriterTest, failedMergeLiveDocsDiffPreservesSources) {
+  LuxirConfig config;
+  config.store.checked_dir.sync = "throw";
+  LuxirNode node(config);
+  test::CollectionHelper helper(node, "merge_diff_failure");
+  auto writer = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "keep"), UpdateMessage::COMMIT).success);
+  std::latch started(1), release(1);
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    started.count_down(); release.wait(); return nullptr;
+  });
+  auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
+  started.wait();
+  auto outputId = writer->lastSegId.load();
+  EXPECT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  {
+    auto fault = failFileCreation(writer->dir,
+        Postings::getLiveDocsFileName(Postings::getSortableString(outputId), 1));
+    ExpectLog quiet("Merge failed and was contained");
+    release.count_down();
+    merge.get();
+    writer->updateGraph->wait_for_all();
+  }
+  EXPECT_TRUE(segmentPrefixAbsent(writer->dir, outputId));
+  EXPECT_EQ(1, writer->snapshots.readers.getReader()->liveDocs());
+  for (auto& [id, seg] : writer->segInfos) {
+    EXPECT_FALSE(seg->merging);
+    EXPECT_EQ(-1, seg->mergeDiffLiveGen);
+  }
+  Signal::unlisten("mergeStart");
+  writer->mergeSegments();
+  EXPECT_EQ(1, writer->snapshots.readers.getReader()->liveDocs());
+  test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
 }
 
 TEST_F(IndexWriterTest, automaticMergePublishesDuringClose) {
