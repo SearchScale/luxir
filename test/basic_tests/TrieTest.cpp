@@ -86,12 +86,27 @@ int32_t floorRef(const std::vector<std::string>& keys, std::string_view target) 
   return (int32_t)(it - all.begin()) - 1;
 }
 
+// floorBlock with a cursor carried across the targets, in the given order and
+// sorted (as term-set lookups come, neighbours sharing long prefixes).
+void expectCursorMatchesRef(const TrieReader& reader, const std::vector<std::string>& keys,
+                            std::vector<std::string> targets, const std::string& info) {
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) std::sort(targets.begin(), targets.end(), byteLess);
+    TrieReader::Cursor cursor;
+    for (const std::string& target : targets) {
+      EXPECT_EQ(reader.floorBlock(target, cursor), floorRef(keys, target))
+          << info << " pass=" << pass << " target=" << hex(target);
+    }
+  }
+}
+
 void expectMatchesRef(const std::vector<std::string>& keys, const std::vector<std::string>& targets) {
   BuiltTrie built = buildTrie(keys);
   TrieReader reader(built.bytes.data(), built.root, built.nBlocks);
   for (const std::string& target : targets) {
     EXPECT_EQ(reader.floorBlock(target), floorRef(keys, target)) << "target=" << hex(target);
   }
+  expectCursorMatchesRef(reader, keys, targets, "");
   ASSERT_GE(built.bytes.size(), 8u);
   for (uint32_t i = 0; i < 8; i++) {
     EXPECT_EQ(built.bytes[built.bytes.size() - 1 - i], 0);
@@ -307,6 +322,30 @@ TEST(TrieTest, StrategySelectionAndReverseBoundaries) {
   });
 }
 
+TEST(TrieTest, CursorPastMaxRecordedDepth) {
+  // Keys and targets sharing prefixes longer than the cursor records.
+  std::mt19937_64 rng(0x7a11);
+  std::vector<std::string> keys;
+  std::vector<std::string> targets;
+  for (int shared : {60, 64, 65, 100}) {
+    std::string prefix(shared, 'p');
+    for (char c : {'b', 'd', 'f'}) {
+      keys.push_back(prefix + c);
+      keys.push_back(prefix + c + "xyz");
+    }
+    for (int i = 0; i < 20; i++) {
+      std::string t = prefix;
+      for (int j = (int)(rng() % 4); j > 0; j--) t.push_back((char)('a' + rng() % 26));
+      targets.push_back(t);
+      targets.push_back(prefix.substr(0, rng() % prefix.size()));
+    }
+  }
+  keys = sortedUnique(keys);
+  BuiltTrie built = buildTrie(keys);
+  TrieReader reader(built.bytes.data(), built.root, built.nBlocks);
+  expectCursorMatchesRef(reader, keys, targets, "long");
+}
+
 TEST(TrieTest, FuzzMatchesReference) {
   std::mt19937_64 rng(0x5eed1234);
   bool sawBits = false;
@@ -337,6 +376,7 @@ TEST(TrieTest, FuzzMatchesReference) {
       EXPECT_EQ(reader.floorBlock(target), floorRef(keys, target))
           << "round=" << round << " target=" << hex(target);
     }
+    expectCursorMatchesRef(reader, keys, targets, "round=" + std::to_string(round));
   }
 
   EXPECT_TRUE(sawBits);

@@ -8,7 +8,6 @@
 #include <string_view>
 
 #include "TermsEnum.h"
-#include "luxir/util/screaming.h"
 
 namespace luxir {
 
@@ -136,12 +135,23 @@ public:
       includeLower(includeLower), includeUpper(includeUpper) {}
 };
 
-// Accepts an explicit sorted unique term set. Dictionary seeks and candidate
-// advancement both move forward; when the dictionary lands past a requested
-// term, galloping skips the corresponding run in the provided set.
+// Accepts an explicit sorted unique term set: one forward exact seek per
+// requested term, skipping through each block by term hashes.
 class ExplicitTermsEnum final : public FilteredTermsEnum {
   const std::string_view* candidate;
   const std::string_view* end;
+  // Block of *candidate, found one candidate ahead so its load can be
+  // prefetched while the previous candidate is handled.
+  int32_t block = -1;
+  // Ascending targets share leading bytes: each dictionary descent resumes
+  // from the previous one's.
+  TrieReader::Cursor trie;
+
+  int32_t blockOf(std::string_view target, int32_t from) {
+    int32_t found = te.blockFor(target, trie);
+    if (found != from) te.prefetchBlock(found);
+    return found;
+  }
 
 public:
   ExplicitTermsEnum(TermsEnum& te, std::span<const std::string_view> terms)
@@ -152,20 +162,15 @@ public:
     if (exhausted) return false;
     if (started) {
       candidate++;
-      if (candidate == end || !te.nextTerm()) return finish();
     } else {
       started = true;
-      if (candidate == end || !te.seekCeilForward(*candidate)) return finish();
+      if (te.numTerms() == 0) return finish();
+      if (candidate != end) block = blockOf(*candidate, -1);
     }
-
-    while (candidate != end) {
-      std::string_view indexed = termView();
-      if (indexed == *candidate) return true;
-      if (*candidate < indexed) {
-        candidate = screaming::gallopLowerBound(candidate + 1, end, indexed);
-        if (candidate != end && *candidate == indexed) return true;
-      }
-      if (candidate != end && !te.seekCeilForward(*candidate)) return finish();
+    for (; candidate != end; candidate++) {
+      int32_t current = block;
+      if (candidate + 1 != end) block = blockOf(candidate[1], current);
+      if (te.seekExactInBlock(current, *candidate)) return true;
     }
     return finish();
   }

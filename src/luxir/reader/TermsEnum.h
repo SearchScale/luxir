@@ -96,12 +96,19 @@ class TermsEnum {
   bool statsDecoded = false;
   bool postingsDecoded = false;
   bool metadataRunsParsed = false;
+  // Block whose postings metadata a postingsState call last read one term's
+  // entries from: a second term there decodes the whole block instead.
+  int32_t singleEntryBlock = -1;
 
   // term index level
   const uint64_t* termBlockOffsets = nullptr;
   InputStream trieIS;
   const char* trieBase;
   int32_t numTermBlocks = 0;
+  // Cache lines prefetchBlock requests: a block's header, hashes, lengths
+  // and the start of its suffixes.
+  static constexpr int32_t PREFETCH_BLOCK_LINES = 8;
+  static constexpr int32_t MAX_PREFETCH_BLOCK_LINES = 32;
   const TermRangeRow* rangeRows = nullptr;
   const TermRangeRow* row = nullptr;
   int32_t rangeCount = 0;
@@ -427,6 +434,12 @@ public:
 
   PostingsState postingsState() {
     assert(ordInBlock >= 0);
+    if (!postingsDecoded && singleEntryBlock != termBlockIndex) {
+      // Sparse lookups (term sets) take one term per block: read just its
+      // entries rather than decoding every term's.
+      singleEntryBlock = termBlockIndex;
+      return singleEntryPostingsState();
+    }
     decodePostings();
 
     PostingsState state;
@@ -467,6 +480,79 @@ public:
   }
 
 protected:
+  // postingsState() of the current term, from its own metadata entries only.
+  PostingsState singleEntryPostingsState() {
+    parseMetadataRuns();
+    uint32_t n = blockTermCount();
+    uint32_t i = (uint32_t) ordInBlock;
+
+    PostingsState state;
+    state.hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
+    state.hasPositions = FieldType::hasPositions(fieldInfo.flags);
+    state.termOrdinal = ord();
+    if (statsDecoded) {
+      state.docFreq = (int32_t) docFreqs[i];
+    } else {
+      state.docFreq = dfRunLen == 0 ? 1 : (int32_t) svbValueAt((const uint8_t*) dfRun, n, i);
+    }
+    state.packedBlockCount = packedBlocksRunLen == 0
+        ? 0 : (int32_t) svbValueAt((const uint8_t*) packedBlocksRun, n, i);
+    uint64_t ttf = (uint64_t) state.docFreq;
+    if (state.hasFreqs) {
+      if (statsDecoded) {
+        ttf += ttfCodes[i];
+      } else if (ttfCodeRunLen != 0) {
+        const char* p = ttfCodeRun;
+        const char* end = ttfCodeRun + ttfCodeRunLen;
+        for (uint32_t t = 0; t < i; t++) InputStream::readVlong(p, end);
+        ttf += InputStream::readVlong(p, end);
+      }
+    }
+    assert(ttf <= INT64_MAX);
+    state.totalTermFreq = (int64_t) ttf;
+    state.termImpactFrontier = currentTermImpactFrontierSpan();
+
+    uint64_t startOffset = 0;
+    uint64_t endOffset = 0;
+    if (docsEndRunLen != 0) {
+      const char* p = docsEndRun;
+      const char* end = docsEndRun + docsEndRunLen;
+      for (uint32_t t = 0; t < i; t++) startOffset = InputStream::readVlong(p, end);
+      endOffset = InputStream::readVlong(p, end);
+    }
+    assert(endOffset >= startOffset);
+    assert(startOffset <= INT64_MAX && endOffset <= INT64_MAX);
+    state.docsStart = locOfDocsForTermBlock + (int64_t) startOffset;
+    state.docsEnd = locOfDocsForTermBlock + (int64_t) endOffset;
+
+    if (state.docsStart == state.docsEnd) {
+      assert((pulsedMask & (1u << i)) != 0);
+      uint32_t perTerm = state.hasPositions ? 2u : 1u;
+      uint32_t valueIndex = std::popcount(pulsedMask & ((1u << i) - 1)) * perTerm;
+      uint32_t count = std::popcount(pulsedMask & validPulsedMask()) * perTerm;
+      const auto* run = (const uint8_t*) pulsedRun;
+      state.pulsedDoc = (int32_t) svbValueAt(run, count, valueIndex);
+      if (state.hasPositions) {
+        state.pulsedPos = (int32_t) svbValueAt(run, count, valueIndex + 1);
+      }
+    } else {
+      state.docIS = postingsReader.getInputStream(rowDocsFile);
+      state.docIS.seek(state.docsStart);
+      if (state.hasPositions) {
+        uint64_t posOffset = 0;
+        if (posOffRunLen != 0) {
+          const char* p = posOffRun;
+          const char* end = posOffRun + posOffRunLen;
+          for (uint32_t t = 0; t <= i; t++) posOffset += InputStream::readVlong(p, end);
+        }
+        state.posStart = locOfPositionsForTermBlock + (int64_t) posOffset;
+        state.posIS = postingsReader.getInputStream(rowPosFile);
+        state.posIS.seek(state.posStart);
+      }
+    }
+    return state;
+  }
+
   static void skipEncodedImpactFrontier(const char*& p, const char* end) {
     uint32_t count = InputStream::readVint(p, end);
     for (uint32_t j = 0; j < count; j++) {
@@ -948,6 +1034,51 @@ public:
     return true;
   }
 
+  /// The term block that would hold target, as seek() would load it,
+  /// resuming the dictionary descent of cursor's last target (looked up in
+  /// this field) where target diverges from it.
+  int32_t blockFor(std::string_view target, TrieReader::Cursor& cursor) const {
+    assert(fieldInfo.nTerms > 0);
+    TrieReader trie(trieBase, (uint64_t)fieldInfo.trieRootOff, numTermBlocks);
+    return trie.floorBlock(target, cursor);
+  }
+
+  /// Asks the CPU to start loading term block blockOrd, so a later
+  /// seekExactInBlock of it, and the metadata its postings come from, find
+  /// their bytes cached.
+  void prefetchBlock(int32_t blockOrd) const {
+    assert(blockOrd >= 0 && blockOrd < numTermBlocks);
+    const TermRangeRow* selected = rowForBlock(blockOrd);
+    const char* p = termsIS.ptr(blockLocation(selected, blockOrd));
+    int32_t lines = PREFETCH_BLOCK_LINES;
+    const TermRangeRow* next = selected + 1;
+    if (blockOrd + 1 < numTermBlocks
+        && (next == rangeRows + rangeCount || (uint32_t) blockOrd + 1 < next->firstBlockOrd)) {
+      // the whole block, which ends where the next one on its row starts
+      uint64_t size = termBlockOffsets[blockOrd + 1] - termBlockOffsets[blockOrd];
+      lines = (int32_t) std::min<uint64_t>(size / 64 + 2, MAX_PREFETCH_BLOCK_LINES);
+    }
+    for (int32_t line = 0; line < lines; line++) {
+      __builtin_prefetch(p + line * 64);
+    }
+  }
+
+  /// Exact seek for ascending targets, each >= the previous target, given the
+  /// block blockFor(target) names: returns true positioned on target if it
+  /// exists. A miss leaves the enum on a term <= target (where it was, or at
+  /// the start of blockOrd), so the position is only good for later targets.
+  bool seekExactInBlock(int32_t blockOrd, std::string_view target) {
+    if (fieldInfo.nTerms == 0) return false;
+    assert(blockOrd >= termBlockIndex);
+    if (blockOrd != termBlockIndex) {
+      termBlockIndex = blockOrd;
+      readTermBlock();
+    }
+    bool found = seekExactInBlock(target);
+    sharedLen = 0;
+    return found;
+  }
+
   /// Forward-only exact seek. On a miss with a ceil, remains positioned on
   /// that ceil; on exhaustion, remains on the last term.
   bool seekForward(std::string_view target) {
@@ -980,6 +1111,61 @@ public:
   }
 
 protected:
+  // Exact match scan from the current term to the end of the block. It tracks
+  // how many leading bytes the term under the scan shares with target and
+  // reads only the prefix lengths and suffix bytes, so skipped terms are never
+  // rebuilt. Only a hit moves the enum (onto target); a miss leaves it where
+  // it was.
+  bool seekExactInBlock(std::string_view target) {
+    const auto* want = (const uint8_t*) target.data();
+    size_t wantLen = target.size();
+    std::string_view cur(currTerm.data(), currTerm.size());
+    size_t lim = std::min(cur.size(), wantLen);
+    size_t matched = 0;
+    while (matched < lim && (uint8_t) cur[matched] == want[matched]) matched++;
+    if (matched == lim) {
+      if (cur.size() == wantLen) return true;
+      if (cur.size() > wantLen) return false;  // target is a proper prefix
+    } else if ((uint8_t) cur[matched] > want[matched]) {
+      return false;
+    }
+    // The term under the scan is below target and shares exactly matched
+    // bytes with it.
+    int32_t ord = ordInBlock;
+    const char* cursor = suffixCursor;
+    while (ord < maxOrdInBlock) {
+      size_t shared = (size_t) blockPrefixLen + (uint8_t) prefixLens[ord];
+      size_t suffixLen = (uint8_t) suffixLens[ord];
+      const auto* suffix = (const uint8_t*) cursor;
+      cursor += suffixLen;
+      ord++;
+      // Keeping the byte where the previous term sorted below target keeps
+      // this term below it too.
+      if (shared > matched) continue;
+      // The first byte this term changes is one where the previous term
+      // agreed with target, and it only grows, so this term is past target.
+      if (shared < matched) return false;
+      size_t k = 0;
+      size_t rest = std::min(suffixLen, wantLen - matched);
+      while (k < rest && suffix[k] == want[matched + k]) k++;
+      if (k < rest) {
+        if (suffix[k] > want[matched + k]) return false;
+        matched += k;
+        continue;
+      }
+      if (k == suffixLen && matched + k == wantLen) {
+        ordInBlock = ord;
+        suffixCursor = cursor;
+        memcpy(const_cast<char*>(currTerm.data()), target.data(), wantLen);
+        currTerm.setSize((uint32_t) wantLen);
+        return true;
+      }
+      if (matched + k == wantLen) return false;  // target is a proper prefix
+      matched += k;  // this term is a proper prefix of target
+    }
+    return false;
+  }
+
   bool seekInBlock(std::string_view target) {
     // TODO: rather than hashing every call, have an option to pass it in?
     char hash = (char)XXH3_64bits(target.data(), target.size());

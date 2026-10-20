@@ -74,6 +74,7 @@ std::string randomAsciiTerm(std::mt19937_64& rng) {
 void addTargetVariants(std::vector<std::string>& targets, const std::string& term) {
   targets.push_back(term);
   targets.push_back(term + '\0');
+  targets.push_back(term + '\xc3');
   targets.push_back(term + '~');
   for (uint32_t len = 0; len <= std::min(3u, (uint32_t)term.size()); len++) {
     targets.push_back(term.substr(0, len));
@@ -232,6 +233,36 @@ TEST_F(TermsEnumSeekFuzzTest, ExplicitTermsForwardMergeCrossesBlocksAndGaps) {
   EXPECT_EQ((std::vector<std::string>{
                 "t000", "t010", "t031", "t032", "t033", "t064", "t066"}),
             actual);
+}
+
+TEST_F(TermsEnumSeekFuzzTest, ExplicitTermsMatchRandomSubsets) {
+  // Random sorted requests mixing present terms with near misses (which share
+  // hash bytes and block positions with present ones) and runs past the end.
+  std::mt19937_64 rng(0xe1e1e1e1);
+  TestIndex ti;
+  TestField field(ti, "subset_s");
+  std::vector<std::string> terms = makeTerms(rng);
+  indexTerms(ti, field, terms);
+  std::vector<std::string> targets = sortedUnique(makeTargets(rng, terms));
+
+  auto guard = field.testIndex.pool.rewindScopeGuard();
+  auto* seg = field.currentSegment();
+  for (int round = 0; round < 200; round++) {
+    std::vector<std::string_view> requested;
+    int keep = 1 + (int)(rng() % 8);
+    for (const std::string& t : targets) {
+      if ((int)(rng() % 8) < keep) requested.push_back(t);
+    }
+    std::vector<std::string> expected;
+    for (std::string_view t : requested) {
+      if (std::binary_search(terms.begin(), terms.end(), t)) expected.emplace_back(t);
+    }
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    ExplicitTermsEnum selected(te, requested);
+    std::vector<std::string> actual;
+    while (selected.next()) actual.emplace_back(selected.termView());
+    ASSERT_EQ(expected, actual) << "round " << round;
+  }
 }
 
 TEST_F(TermsEnumSeekFuzzTest, SharedPrefixLenMatchesAdjacentTerms) {
