@@ -84,6 +84,24 @@ inline api::Query regex(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+inline api::Query multiMatch(std::pmr::memory_resource& mr, std::string_view text,
+                             std::initializer_list<api::WeightedField> fields,
+                             api::MultiMatchQuery_::Mode mode = api::MultiMatchQuery_::Mode::COMBINED,
+                             MatchOp op = MatchOp::OPERATOR_UNSPECIFIED) {
+  api::Query q;
+  auto& arm = q.kind.emplace<api::MultiMatchQuery>();
+  arm.text = build::arenaStr(mr, text);
+  auto* arr = build::allocArray(arm.fields, fields.size(), mr);
+  size_t i = 0;
+  for (auto field : fields) {
+    field.field = build::arenaStr(mr, field.field);
+    arr[i++] = field;
+  }
+  arm.mode = mode;
+  arm.operator_ = op;
+  return q;
+}
+
 inline api::Query exists(std::pmr::memory_resource& mr, std::string_view field) {
   api::Query q;
   auto& e = q.kind.emplace<api::ExistsQuery>();

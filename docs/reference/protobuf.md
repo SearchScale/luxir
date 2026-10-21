@@ -144,6 +144,7 @@ defaults and constraints are described in the comments and guides.
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
+- [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
@@ -200,6 +201,7 @@ defaults and constraints are described in the comments and guides.
 - [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq)
 - [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq)
 - [`Warning`](#message-luxir.warning)
+- [`WeightedField`](#message-luxir.weightedfield)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
 <a id="message-luxir.activitystats"></a>
@@ -1486,7 +1488,7 @@ Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.
 
 ### luxir.Match
 
-Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolean scalar values; numeric and DATE fields accept string or numeric scalars. Null matches nothing. Arrays and structured values are rejected, and GEO\_POINT is unsupported. TEXT values are analyzed and scored; use AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for multi-field text.
+Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolean scalar values; numeric and DATE fields accept string or numeric scalars. Null matches nothing. Arrays and structured values are rejected, and GEO\_POINT is unsupported. TEXT values are analyzed and scored; use AnyOfQuery for constant-score value sets and MultiMatchQuery, SimpleQuery, or ExprQuery for multi-field text.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1513,6 +1515,22 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 | <a id="field-luxir.memorystats.node_budget_bytes"></a>[`node_budget_bytes`](#field-luxir.memorystats.node_budget_bytes) | 5 | `uint64` | singular | Configured budget for managed memory (max\_ram\_mb); not an RSS ceiling. Zero is unlimited. |
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
+
+<a id="message-luxir.multimatchquery"></a>
+
+### luxir.MultiMatchQuery
+
+Analyzes one text across several fields. In COMBINED mode, fields sharing an analyzer and long-term policy form a group scored as one field with BM25F; group scores add. PER\_FIELD adds weighted match scores. BM25F follows Lucene's CombinedFieldQuery.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.multimatchquery.text"></a>[`text`](#field-luxir.multimatchquery.text) | 1 | `string` | singular | the text to analyze |
+| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | [`WeightedField`](#message-luxir.weightedfield) | repeated | Required and non-empty. Fields resolve through their search bindings. Duplicate physical fields keep the larger weight. |
+| <a id="field-luxir.multimatchquery.mode"></a>[`mode`](#field-luxir.multimatchquery.mode) | 3 | [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode) | singular | Unset = COMBINED. |
+| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). |
+| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0. |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1699,6 +1717,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2480,6 +2499,19 @@ A nonfatal degradation reported by the query parser or engine. Documented defaul
 | <a id="field-luxir.warning.code"></a>[`code`](#field-luxir.warning.code) | 1 | `string` | singular | stable machine key, e.g. "fuzzy\_clamped", "field\_narrowed" |
 | <a id="field-luxir.warning.message"></a>[`message`](#field-luxir.warning.message) | 2 | `string` | singular | human-readable detail |
 
+<a id="message-luxir.weightedfield"></a>
+
+### luxir.WeightedField
+
+One search field and its contribution to a multi-field text query.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.weightedfield.field"></a>[`field`](#field-luxir.weightedfield.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.weightedfield.weight"></a>[`weight`](#field-luxir.weightedfield.weight) | 2 | `float` | optional | Unset = 1. Must be finite and &gt; 0 in every mode. |
+
 <a id="message-luxir.wildcardquery"></a>
 
 ### luxir.WildcardQuery
@@ -2506,6 +2538,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
+- [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode)
 - [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
@@ -2668,6 +2701,17 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.match.operator.operator_unspecified"></a>[`OPERATOR_UNSPECIFIED`](#value-luxir.match.operator.operator_unspecified) | 0 | treated as OR |
 | <a id="value-luxir.match.operator.or"></a>[`OR`](#value-luxir.match.operator.or) | 1 | a doc matches if any analyzed term matches |
 | <a id="value-luxir.match.operator.and"></a>[`AND`](#value-luxir.match.operator.and) | 2 | a doc must match every analyzed term |
+
+<a id="enum-luxir.multimatchquery.mode"></a>
+
+### luxir.MultiMatchQuery.Mode
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.multimatchquery.mode.combined"></a>[`COMBINED`](#value-luxir.multimatchquery.mode.combined) | 0 | TEXT fields only. A weight scales both term frequency and document length, at every group size, rather than multiplying the score. |
+| <a id="value-luxir.multimatchquery.mode.per_field"></a>[`PER_FIELD`](#value-luxir.multimatchquery.mode.per_field) | 1 | One match per field; each weight multiplies that field's score. |
 
 <a id="enum-luxir.rangefacet.bounds"></a>
 

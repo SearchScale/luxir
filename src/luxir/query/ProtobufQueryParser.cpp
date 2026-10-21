@@ -508,6 +508,40 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   return pool.make<luxir::MinScoreQuery>(rescored, *rescoreQuery.min_score);
 }
 
+luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQuery& query) {
+  if (query.min_match < 0) {
+    throw std::runtime_error("multi_match 'min_match' must not be negative");
+  }
+  if (query.fields.empty()) {
+    throw std::runtime_error("multi_match requires a non-empty 'fields' list");
+  }
+  auto fields = pool.make_span<QueryBuilder::WeightedField>(query.fields.size());
+  for (size_t i = 0; i < query.fields.size(); i++) {
+    const auto& field = query.fields[i];
+    float weight = field.weight.value_or(1.0f);
+    if (field.field.empty()) {
+      throw std::runtime_error("multi_match: empty field name");
+    }
+    if (!std::isfinite(weight) || weight <= 0.0f) {
+      throw std::runtime_error(std::format(
+          "multi_match: weight of field '{}' must be finite and > 0 (got {})",
+          field.field, weight));
+    }
+    fields[i] = {field.field, weight};
+  }
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  auto op = query.operator_ == luxir::api::Match_::Operator::AND
+      ? QueryBuilder::Operator::AND : QueryBuilder::Operator::OR;
+  switch (query.mode) {
+    case luxir::api::MultiMatchQuery_::Mode::COMBINED:
+      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match);
+    case luxir::api::MultiMatchQuery_::Mode::PER_FIELD:
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match);
+  }
+  throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
+}
+
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // The one recursion choke point for structured trees: every nested node
   // passes through here, so the shared budget bounds tree depth no matter
@@ -538,6 +572,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);
     },
+    [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);

@@ -298,6 +298,7 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+    MultiMatchQuery multi_match = 20; // one text over several weighted fields
   }
 }
 
@@ -380,8 +381,8 @@ message KnnQuery {
 // boolean scalar values; numeric and DATE fields accept string or numeric
 // scalars. Null matches nothing. Arrays and structured values are rejected,
 // and GEO_POINT is unsupported. TEXT values are analyzed and scored; use
-// AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for
-// multi-field text.
+// AnyOfQuery for constant-score value sets and MultiMatchQuery, SimpleQuery,
+// or ExprQuery for multi-field text.
 message Match {
   string field = 1;
   Val val = 2;
@@ -399,6 +400,43 @@ message Match {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
     AND = 2;                   // a doc must match every analyzed term
+  }
+}
+
+// One search field and its contribution to a multi-field text query.
+message WeightedField {
+  string field = 1;
+  // Unset = 1. Must be finite and > 0 in every mode.
+  optional float weight = 2;
+}
+
+// Analyzes one text across several fields. In COMBINED mode, fields sharing
+// an analyzer and long-term policy form a group scored as one field with
+// BM25F; group scores add. PER_FIELD adds weighted match scores.
+// BM25F follows Lucene's CombinedFieldQuery.
+message MultiMatchQuery {
+  string text = 1; // the text to analyze
+  // Required and non-empty. Fields resolve through their search bindings.
+  // Duplicate physical fields keep the larger weight.
+  repeated WeightedField fields = 2;
+  // Unset = COMBINED.
+  Mode mode = 3;
+
+  // How analyzed terms combine. Unset = OR. COMBINED applies this within
+  // each group (AND: every term in some field of one group). PER_FIELD
+  // applies it within each field (AND: every term in that field).
+  Match.Operator operator = 4;
+
+  // Zero uses operator. Positive values override operator and are clamped
+  // to the analyzed term count within each group/field. Must be >= 0.
+  int32 min_match = 5;
+
+  enum Mode {
+    // TEXT fields only. A weight scales both term frequency and document
+    // length, at every group size, rather than multiplying the score.
+    COMBINED = 0;
+    // One match per field; each weight multiplies that field's score.
+    PER_FIELD = 1;
   }
 }
 

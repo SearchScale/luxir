@@ -230,6 +230,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
+- `multi_match`: search one text across several weighted fields. `combined`
+  (default) groups TEXT fields sharing an analyzer and long-term policy,
+  scores each group as one field with BM25F, and adds the group scores.
+  Weights scale term frequency and length within a group. `per_field` adds
+  each field's match score multiplied by its weight.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).
