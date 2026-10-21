@@ -551,13 +551,6 @@ the node unlimited. The resolved values are logged at startup.
   inverter holding at least its share of the half (and at least
   `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
   inverters are flushed only once the whole budget is in use.
-- `indexing.max-concurrent-merges` (default 2) is how many automatic merges
-  one collection runs at once. Each merges at most `indexing.merge-factor`
-  (default 10) segments of similar size, so a long merge of large segments
-  does not keep new small segments from merging. A forced merge
-  (`max_segments`) runs alone. Raise it on a node with cores to spare when
-  segment counts climb under sustained ingest; every running merge reserves
-  against the same `indexing.max-ram-mb`.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it

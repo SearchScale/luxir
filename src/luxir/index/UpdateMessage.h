@@ -4,7 +4,6 @@
 #pragma once
 
 #include <deque>
-#include <vector>
 #include "CommitSnapshot.h"
 #include "Inverter.h"
 #include "luxir/server/LuxirError.h"
@@ -14,7 +13,6 @@ namespace luxir {
 
 class IndexWriter;
 class UpdateMessage;
-class SegInfo;
 
 // CommitInfo is used to track information about a commit.  This is internally used by the IndexWriter.
 // Each commit message owns the coordination state for its flushes and merge waits.
@@ -103,9 +101,6 @@ class MergeMessage : public UpdateMessage {
 public:
   int32_t mergeLevel = -1;  // Segment level to merge.  -1 means unspecified.
   UpdateMessage* forcedBy = nullptr;  // Client commit whose layout promise this merge completes.
-  // Policy merges: sources chosen and marked merging at submission, under
-  // indexMutex, so concurrent merges never select the same segment.
-  std::vector<SegInfo*> segs;
 };
 
 }
