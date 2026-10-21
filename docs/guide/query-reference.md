@@ -441,15 +441,15 @@ representation does not grant access to its siblings.
 
 ## Multi-match
 
-`multi_match` searches one text across several weighted fields. The default
-`combined` mode scores fields sharing an analyzer and long-term policy as one
-field with BM25F. The `per_field` mode adds weighted `match` scores:
+`multi_match` searches one text across several weighted fields. Choose
+`combined` (the default) to combine term frequencies within analyzer groups,
+or `per_field` to score a match in each field separately:
 
 ```json
 {
   "multi_match": {
     "text": "dune messiah",
-    "fields": [{"field": "title_t", "weight": 2}, {"field": "body_t"}],
+    "fields": [{"field": "title_t", "weight": 2}, {"field": "description_t"}],
     "operator": "and"
   }
 }
@@ -457,52 +457,200 @@ field with BM25F. The `per_field` mode adds weighted `match` scores:
 
 | Field | Meaning |
 |---|---|
-| `text` | Text to analyze or coerce. |
-| `fields` | Required non-empty list of objects with `field` and optional `weight`. Unset weight is `1`; every weight must be finite and greater than `0`. |
+| `text` | Text to analyze or coerce for each field. |
+| `fields` | Required non-empty list of fields with optional weights. Unset weight is `1`; weights must be finite and greater than `0`. |
 | `mode` | `combined` (default) or `per_field`. |
-| `operator` | `or` (default) or `and`; combines terms within each group in `combined`, or within each field in `per_field`. |
-| `min_match` | Must be non-negative. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count within each group or field. |
+| `operator` | `or` (default) or `and`; combines terms within each group in `combined`, or within each field in `per_field`. Must be unset with `phrase`. |
+| `min_match` | Non-negative minimum analyzed terms within each group or field. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count. Must be zero with `phrase`. |
+| `tie` | Combines field or group scores as described below. Finite and in `[0, 1]`; default `1` in both modes, including with `phrase`. |
+| `phrase` | Optional object, `per_field` only. `{}` requests an exact phrase; `{"slop":2}` allows phrase slop. |
 
-JSON also accepts `"title_t"` and `"title_t^2"`, the field-list form of Solr's
-`qf`, as shorthand for field objects.
-Writes use the canonical object form shown above. Field names resolve through
-their `search` binding, like `match`. Duplicate physical targets keep the
-larger weight in both modes; field order does not affect the query.
+### Fields and weights
 
-In `combined` mode, fields must be TEXT. Fields sharing the same compiled
-analyzer and long-term policy form a group. Group membership comes from the
-schema, independently of the query text. Each group analyzes the text once
-and scores each term with BM25F, as in Lucene's `CombinedFieldQuery`.
+JSON accepts field objects as shown above, or `"title_t"` and `"title_t^2"`
+as shorthand. Writes use the canonical object form. Weights below `1` are
+allowed. Fields resolve through their `search` bindings, like `match`.
+Duplicate physical targets keep the larger weight, and field order does not
+affect the query.
 
-Within a group, a weight scales that field's term frequency and document
-length at every group size, including a group with just one field. It does
-not multiply the field's score. For a term, frequency is the weighted sum of
+In `combined` mode, TEXT fields sharing an analyzer and `long_terms` policy
+form a group scored as one field with BM25F. Group membership is determined
+by the schema, independently of the query text. Each group analyzes the text
+once; a term found in several fields saturates once within that group.
+A weight scales its field's term frequency and document length, including
+in a group with just one field. For a term, frequency is the weighted sum of
 per-field frequencies, and length is the weighted sum of per-field lengths,
 rounded and encoded as a norm. Every field contributes length even when the
 term is absent from that field. Average length is the weighted sum of total
 term counts divided by the largest per-field document count; document
-frequency is the largest per-field document frequency. A term present in
-several fields saturates once within the group.
+frequency is the largest per-field document frequency. This is a BM25F
+weight, not a score multiplier; the scoring follows Lucene's
+`CombinedFieldQuery`.
 
-Group scores add, and a document matches when any group matches.
-`operator: "and"` requires every term in some field of one group; it does not
-require every group to match. `min_match` also applies within each group.
-A group producing no terms contributes nothing; if all groups produce no
-terms, the query matches nothing. One field at weight `1` scores like `match`.
+STRING, ID, numeric, and date fields each form their own group with `match`
+semantics and a weight that multiplies the field's score. STRING/ID fields
+match the whole text as one value. Numeric/date fields coerce it to a value
+and match through their columns.
 
-In `per_field` mode, each field runs a `match` query, and its weight multiplies
-that field's score. Field scores add, and a document matches when any field
-matches. This mode accepts the field types that [`match`](#match) accepts.
-`operator: "and"` requires every term in that field; `min_match` applies
-within each field. Use `per_field` to multiply individual field scores, or
-wrap the query in [`boost`](#constant-score-and-boost) to multiply its final score.
-Both modes keep the same match set when used as an unscored filter.
+In `per_field` mode, each field runs its own `match` query and its weight
+multiplies that field's score. This mode accepts the same field types as
+[`match`](#match). Use `per_field` to multiply individual field scores, or
+wrap the whole query in [`boost`](#constant-score-and-boost) to multiply its
+final score.
 
-The expression form uses `text` as its main value argument and accepts field
-weights and enum arguments:
+A document matches when any group (`combined`) or field (`per_field`)
+matches. Within a TEXT group, different terms may occur in different fields.
+`operator: "and"` requires every term somewhere within one matching group;
+it does not require every group to match. In `per_field`, AND requires every
+term in the same field. `min_match` also applies within each group or field.
+A group producing no terms contributes nothing.
+
+In both modes, including with `phrase`, a field whose text cannot be coerced
+to its value type is silently skipped. For example, `"dune"` over `title_t`
+and `year_i` searches only the title; `"1965"` can also match the year.
+Unknown fields, unsupported field types, and other errors still fail the
+request. Single-field `match` remains strict about coercion errors. If no
+field contributes a clause, the query matches nothing. Changing `tie` or
+using the query as an unscored filter does not change its match set.
+
+### Combining scores
+
+`tie` combines the scores of matching groups in `combined` mode, or matching
+fields in `per_field` mode. With `best` the largest matching score and `sum`
+the sum of matching scores:
 
 ```text
-multi_match(dune, fields=[title_t^2, body_t], mode=per_field, operator=and)
+score = best + tie * (sum - best)
+```
+
+The default, `tie: 1`, adds all scores. `tie: 0` keeps only the best score;
+values between them retain a fraction of the other scores. For example, to
+score the best field, with a weight of `2` on the title:
+
+```json
+{
+  "multi_match": {
+    "text": "dune",
+    "fields": ["title_t^2", "description_t"],
+    "mode": "per_field",
+    "tie": 0
+  }
+}
+```
+
+For applications using Elasticsearch's `multi_match` vocabulary:
+
+| Elasticsearch name | Luxir options |
+|---|---|
+| `best_fields` | `mode: per_field`, `tie: 0` |
+| `most_fields` | `mode: per_field` (default `tie: 1`) |
+| `cross_fields` (approximate) | `mode: combined`, `tie: 0` |
+| `phrase` | `mode: per_field`, with a `phrase` object |
+
+These are combinations of options, not mode names. Luxir defaults to
+`tie: 1` for both modes, including with `phrase`; set `tie: 0` for the best
+phrase field.
+
+The expression form accepts field weights and enum arguments:
+
+```text
+multi_match(dune messiah, fields=[title_t^2, description_t], operator=and)
+multi_match(dune, fields=[title_t^2, description_t], mode=per_field, tie=0)
+```
+
+### Phrase options
+
+Set `phrase` in `per_field` mode to run a phrase per TEXT field. An empty
+object requests an exact phrase; `slop` defaults to `0` and must be
+non-negative. Slop measures the spread of query-adjusted positions, as for
+[`phrase`](#phrase):
+
+```json
+{
+  "multi_match": {
+    "text": "dune messiah",
+    "fields": ["title_t^2", "description_t"],
+    "mode": "per_field",
+    "phrase": {"slop": 2}
+  }
+}
+```
+
+Every selected TEXT field must have indexed positions; selecting one
+without positions is an error. STRING/ID fields still match the whole text
+as one value, and numeric/date fields still use match coercion. Field weights
+multiply these scores, and `tie` combines them.
+
+With `phrase` present, `combined` mode, any explicit `operator` (including
+`or`), or a positive `min_match` is an error. The expression forms are:
+
+```text
+multi_match(dune messiah, fields=[title_t^2, description_t], mode=per_field, phrase={})
+multi_match(dune messiah, fields=[title_t^2, description_t], mode=per_field, phrase={slop: 2})
+```
+
+### Field patterns
+
+A field name containing `*` expands to indexed TEXT, STRING, and ID search
+targets. `*` matches zero or more characters; numeric/date fields must be
+listed explicitly. A pattern's weight applies to every field it selects:
+
+```json
+{"multi_match":{"text":"dune","fields":["*_t^0.5","title_t^2"]}}
+```
+
+Patterns without `__` select logical roots through their search bindings;
+patterns containing `__` select variants. The catalog includes concrete
+schema declarations even when absent from the index. Dynamic roots come
+from reader metadata, along with their schema-defined variants even when
+a variant is absent. Templates do not invent unknown dynamic roots.
+Patterns exclude engine names and the `__self` alias. A pattern matching
+nothing adds no field.
+
+A field list containing a pattern may resolve to at most `64` distinct
+physical targets, including explicitly listed fields. Overlapping patterns
+and aliases count once and keep the larger weight. Exceeding the limit is
+an error. The same selectors work in the expression form:
+
+```text
+multi_match(dune, fields=["*_t^0.5", title_t^2])
+```
+
+## Disjunction max
+
+`dis_max` matches a document when any of its queries matches. It combines
+matching query scores with the same formula as `multi_match`:
+`best + tie * (sum - best)`. Its default `tie` is `0`, keeping only the
+best query's score:
+
+```json
+{
+  "dis_max": {
+    "queries": [
+      {"match":{"title_t":"dune"}},
+      {"match":{"description_t":"dune"}}
+    ],
+    "tie": 0.3
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `queries` | Required non-empty list of queries. |
+| `tie` | Finite and in `[0, 1]`, default `0`. `0` keeps the best score; `1` adds all scores like a boolean disjunction. |
+
+Only matching queries contribute. Duplicate queries are kept as separate
+scoring contributions: repeating a query leaves the best score unchanged at
+`tie: 0`, but contributes again to the sum at positive `tie`. A single query
+scores as itself. `tie: 1` is equivalent to a boolean disjunction.
+
+In a filter, `dis_max` matches the same documents as a boolean disjunction of
+its queries and shares that disjunction's filter cache entry. The expression
+form takes a list of query sub-expressions:
+
+```text
+dis_max(queries=[title_t:dune, description_t:dune], tie=0.3)
 ```
 
 ## Expression
@@ -543,7 +691,11 @@ in their own guides:
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
   filters, and `domain` overrides are not supported directly in `Fusion.ops`
   or beneath facet buckets.
-- `multi_match` has no `dis_max`/`tie_breaker`, phrase forms, or wildcard
-  field names. `combined` mode accepts TEXT fields only.
+- `multi_match` lists containing field patterns are limited to `64` distinct
+  physical targets after resolving search bindings and deduplicating, including
+  explicitly listed fields. Patterns select indexed TEXT/STRING/ID targets.
+- `multi_match.phrase` requires `per_field` mode and indexed positions on
+  TEXT fields; it cannot be combined with an explicit `operator` or a
+  positive `min_match`.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.

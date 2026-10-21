@@ -102,6 +102,7 @@ defaults and constraints are described in the comments and guides.
 - [`CreateCollectionResponse`](#message-luxir.createcollectionresponse)
 - [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest)
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
+- [`DisMaxQuery`](#message-luxir.dismaxquery)
 - [`DiskStats`](#message-luxir.diskstats)
 - [`Diversify`](#message-luxir.diversify)
 - [`DocList`](#message-luxir.doclist)
@@ -149,6 +150,7 @@ defaults and constraints are described in the comments and guides.
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
+- [`PhraseOptions`](#message-luxir.phraseoptions)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
 - [`PressureStats`](#message-luxir.pressurestats)
@@ -809,6 +811,19 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionresponse.name"></a>[`name`](#field-luxir.deletecollectionresponse.name) | 1 | `string` | singular |  |
+
+<a id="message-luxir.dismaxquery"></a>
+
+### luxir.DisMaxQuery
+
+Matches documents that match any query and combines their matching scores as best + tie \* (sum - best), defaulting to the best score (tie = 0). Duplicate queries are kept as separate scoring contributions. A single query scores as itself; tie = 1 is a boolean disjunction. Filter use shares the equivalent boolean's membership and cache key (Elasticsearch dis\_max).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.dismaxquery.queries"></a>[`queries`](#field-luxir.dismaxquery.queries) | 1 | [`Query`](#message-luxir.query) | repeated | required, non-empty |
+| <a id="field-luxir.dismaxquery.tie"></a>[`tie`](#field-luxir.dismaxquery.tie) | 2 | `float` | optional | Weight of the non-best matching queries. Unset = 0. Must be finite and in \[0, 1\]; 1 adds every score like a boolean disjunction. |
 
 <a id="message-luxir.diskstats"></a>
 
@@ -1520,17 +1535,19 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 
 ### luxir.MultiMatchQuery
 
-Analyzes one text across several fields. In COMBINED mode, fields sharing an analyzer and long-term policy form a group scored as one field with BM25F; group scores add. PER\_FIELD adds weighted match scores. BM25F follows Lucene's CombinedFieldQuery.
+Searches one text across weighted fields. In COMBINED mode, TEXT fields sharing an analyzer and long-term policy form a group scored as one field with BM25F. STRING/ID/numeric/date fields form singleton match groups with multiplicative weights. PER\_FIELD scores a match in each field separately. Group or field scores combine as best + tie \* (sum - best), defaulting to sum (tie = 1). Values that cannot coerce to a field contribute no clause in either mode, including with phrase options; other errors fail the request. If no field contributes, matches nothing. BM25F follows Lucene's CombinedFieldQuery.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.multimatchquery.text"></a>[`text`](#field-luxir.multimatchquery.text) | 1 | `string` | singular | the text to analyze |
-| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | [`WeightedField`](#message-luxir.weightedfield) | repeated | Required and non-empty. Fields resolve through their search bindings. Duplicate physical fields keep the larger weight. |
+| <a id="field-luxir.multimatchquery.text"></a>[`text`](#field-luxir.multimatchquery.text) | 1 | `string` | singular | the text to analyze or coerce |
+| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | [`WeightedField`](#message-luxir.weightedfield) | repeated | Required and non-empty. Fields resolve through their search bindings. Field order does not matter; duplicate physical targets keep the larger weight. Names containing '\*' select indexed TEXT/STRING/ID search targets from concrete declarations and dynamic roots present in reader metadata. Patterns containing '\_\_' select variants; other patterns select roots through their search binding. Declared fields and variants of known roots need not be present in the index. Wildcard lists may resolve to at most 64 distinct physical targets, including explicit selectors; exceeding the limit is an error. |
 | <a id="field-luxir.multimatchquery.mode"></a>[`mode`](#field-luxir.multimatchquery.mode) | 3 | [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode) | singular | Unset = COMBINED. |
-| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). |
-| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0. |
+| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). Must be unset when phrase is present. |
+| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0, and must be zero when phrase is present. |
+| <a id="field-luxir.multimatchquery.tie"></a>[`tie`](#field-luxir.multimatchquery.tie) | 6 | `float` | optional | Combines matching field/group scores as best + tie \* (sum - best). Unset = 1 in every mode. Must be finite and in \[0, 1\]. |
+| <a id="field-luxir.multimatchquery.phrase"></a>[`phrase`](#field-luxir.multimatchquery.phrase) | 7 | [`PhraseOptions`](#message-luxir.phraseoptions) | singular | Absent = match. Present = a phrase per TEXT field (requires indexed positions); STRING/ID fields match the whole value, and numeric/date fields still use match coercion. PER\_FIELD only; fields combine by tie, and each weight multiplies its field's score. Operator must be unset and min\_match must be zero. |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1598,6 +1615,18 @@ Completed work by outcome, and its summed duration.
 | <a id="field-luxir.outcomestats.error"></a>[`error`](#field-luxir.outcomestats.error) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
+
+<a id="message-luxir.phraseoptions"></a>
+
+### luxir.PhraseOptions
+
+Phrase matching options. A present empty message requests an exact phrase.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.phraseoptions.slop"></a>[`slop`](#field-luxir.phraseoptions.slop) | 1 | `int32` | singular | Maximum spread of query-adjusted positions. Must be &gt;= 0; unset = 0. |
 
 <a id="message-luxir.phrasequery"></a>
 
@@ -1718,6 +1747,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
+| <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2503,7 +2533,7 @@ A nonfatal degradation reported by the query parser or engine. Documented defaul
 
 ### luxir.WeightedField
 
-One search field and its contribution to a multi-field text query.
+One search field and its weight. TEXT weights scale term frequency and length in COMBINED; all other weights multiply the field's score. JSON also accepts a bare field name or "name^weight" as shorthand.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2710,8 +2740,8 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 
 | Value | Number | Description |
 |---|---|---|
-| <a id="value-luxir.multimatchquery.mode.combined"></a>[`COMBINED`](#value-luxir.multimatchquery.mode.combined) | 0 | TEXT fields only. A weight scales both term frequency and document length, at every group size, rather than multiplying the score. |
-| <a id="value-luxir.multimatchquery.mode.per_field"></a>[`PER_FIELD`](#value-luxir.multimatchquery.mode.per_field) | 1 | One match per field; each weight multiplies that field's score. |
+| <a id="value-luxir.multimatchquery.mode.combined"></a>[`COMBINED`](#value-luxir.multimatchquery.mode.combined) | 0 | TEXT weights scale term frequency and document length at every group size. Other fields are singleton groups with multiplicative weights. |
+| <a id="value-luxir.multimatchquery.mode.per_field"></a>[`PER_FIELD`](#value-luxir.multimatchquery.mode.per_field) | 1 | One match or phrase per field; each weight multiplies its score. |
 
 <a id="enum-luxir.rangefacet.bounds"></a>
 

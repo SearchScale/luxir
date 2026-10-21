@@ -13,6 +13,7 @@
 #include "ForcePrepareQuery.h"
 #include "RescoreQuery.h"
 #include "MinScoreQuery.h"
+#include "DisMaxQuery.h"
 #include "BooleanQuery.h"
 
 namespace luxir {
@@ -56,6 +57,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::KNN:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
+    case QueryKind::DIS_MAX:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
   }
@@ -77,6 +79,9 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::RESCORE:
       return canOmitWeightForCacheFirstMembership(
           *static_cast<const RescoreQuery&>(query).getChild());
+    case QueryKind::DIS_MAX:
+      return canOmitWeightForCacheFirstMembership(
+          *static_cast<const DisMaxQuery&>(query).getMembership());
     case QueryKind::TERM:
     case QueryKind::PHRASE:
     case QueryKind::COMBINED_FIELDS:
@@ -121,6 +126,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::TERM:
     case QueryKind::PHRASE:
     case QueryKind::COMBINED_FIELDS:
+    case QueryKind::DIS_MAX:
     case QueryKind::BOOLEAN:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
@@ -161,6 +167,9 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::RESCORE:
       return directCountAvailable(
           *static_cast<const RescoreQuery&>(query).getChild(), reader);
+    case QueryKind::DIS_MAX:
+      return directCountAvailable(
+          *static_cast<const DisMaxQuery&>(query).getMembership(), reader);
     case QueryKind::ALL:
     case QueryKind::NONE:
       return true;
@@ -220,6 +229,9 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
           *static_cast<const ConstantScoreQuery&>(query).getChild());
     case QueryKind::MIN_SCORE:
       return Query::VerificationWork::PRESENT;
+    case QueryKind::DIS_MAX:
+      return membershipVerificationWork(
+          *static_cast<const DisMaxQuery&>(query).getMembership());
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:

@@ -17,6 +17,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/CombinedFieldQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/FuzzyQuery.h"
@@ -31,6 +32,8 @@
 #include "luxir/query/ValueSequence.h"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/FieldPattern.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/NumericUtils.h"
@@ -113,6 +116,8 @@ public:
 // returned query tree.
 class QueryBuilder {
   MemPool& pool;
+  Schema& schema;
+  IndexReader* reader;
   FieldResolver localFields;
   FieldResolver& fields;
   CoerceContext coerceContext;
@@ -322,7 +327,7 @@ private:
   // terms and positions must already live in storage that outlives the query
   // tree (the pool, or the caller's source bytes for pass-through terms).
   Query* buildPhrase(const ResolvedFieldHandle& target, std::span<std::string_view> inputTerms,
-                     std::span<const int64_t> inputPositions, int32_t slop) {
+                     std::span<const int64_t> inputPositions, int32_t slop, float boost = 1.0f) {
     auto field = poolCopy(target.physicalName);
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
@@ -361,13 +366,15 @@ private:
       return pool.make<MatchNoDocsQuery>();
     }
     if (terms.size() == 1) {
-      return pool.make<TermQuery>(field, terms[0]);
+      return pool.make<TermQuery>(field, terms[0], boost);
     }
-    return pool.make<PhraseQuery>(
+    auto* phrase = pool.make<PhraseQuery>(
         field,
         pool.copy_span(std::span<std::string_view>(terms.data(), terms.size())),
         pool.copy_span(std::span<int32_t>(positions.data(), positions.size())),
         slop);
+    if (boost == 1.0f) return phrase;
+    return pool.make<BoostQuery>(phrase, boost);
   }
 
 public:
@@ -377,8 +384,9 @@ public:
 
   QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
                std::string_view opName = {},
-               std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr)
-    : pool(pool), localFields(schema), fields(fields ? *fields : localFields),
+               std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr,
+               IndexReader* reader = nullptr)
+    : pool(pool), schema(schema), reader(reader), localFields(schema), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
       warnings(warnings) {}
 
@@ -849,32 +857,83 @@ public:
     float weight = 1.0f;
   };
 
+  // Wildcard lists include explicit selectors in this physical-target budget.
+  static constexpr size_t MAX_PATTERN_FIELDS = 64;
+
 private:
   struct ResolvedWeightedField {
     const ResolvedFieldHandle* target;
     float weight;
   };
 
-  // Normalize before analysis or clause construction. Search aliases can name
-  // the same physical field; the largest weight wins in either mode.
+  // Multi-field searches omit only values that cannot coerce to this field.
+  // Keep all query construction on the strict match/range path.
+  Query* tryCreateMatchQuery(const ResolvedFieldHandle& target, std::string_view text,
+                             Operator op, int minMatch, float weight) {
+    FieldType& type = *target.fieldType;
+    if (isNumericColumnType(type.type())) {
+      if (!type.hasColumn()) {
+        throw std::runtime_error(std::format(
+            "Range query field '{}' is not column-stored", target.physicalName));
+      }
+      api::Val value;
+      value.kind = text;
+      if (type.type() == FieldType::DATE) {
+        if (!((DateFieldType&)type).tryCoerceDateRange(value, coerceContext)) return nullptr;
+      } else {
+        if (!type.tryCoerceColInt64(value, target.physicalName, coerceContext)) return nullptr;
+      }
+    }
+    return createMatchQuery(target, text, op, minMatch, weight);
+  }
+
+  // Expand selectors, resolve search bindings, and keep the largest weight
+  // per physical target. Sort before analysis so request order never matters.
   std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
-    auto resolved = pool.make_span<ResolvedWeightedField>(requested.size());
-    for (size_t i = 0; i < requested.size(); i++) {
-      resolved[i] = {&fields.resolve(requested[i].field, OpClass::SEARCH, opName),
-                     requested[i].weight};
+    bool patterns = std::ranges::any_of(requested, [](const auto& field) {
+      return field.field.find('*') != std::string_view::npos;
+    });
+    std::vector<ResolvedWeightedField> resolved;
+    boost::unordered_flat_map<std::string_view, size_t, PackedTermHash, PackedTermEqual> seen;
+    auto add = [&](std::string_view name, float weight) {
+      const auto& target = fields.resolve(name, OpClass::SEARCH, opName);
+      auto [entry, inserted] = seen.try_emplace(target.physicalName, resolved.size());
+      if (inserted) {
+        if (patterns && resolved.size() == MAX_PATTERN_FIELDS) {
+          throw std::runtime_error(std::format(
+              "multi_match wildcard fields exceed the limit of {} physical targets", MAX_PATTERN_FIELDS));
+        }
+        resolved.push_back({&target, weight});
+      } else {
+        auto& previous = resolved[entry->second];
+        previous.weight = std::max(previous.weight, weight);
+      }
+    };
+    std::vector<std::string> schemaNames;
+    std::span<const std::string> catalog;
+    if (patterns) {
+      if (reader) {
+        assert(reader->schema().get() == &schema);
+        catalog = reader->searchableFields();
+      } else {
+        schemaNames = schema.searchableFields();
+        catalog = schemaNames;
+      }
+    }
+    for (const auto& field : requested) {
+      if (field.field.find('*') == std::string_view::npos) {
+        add(field.field, field.weight);
+      } else {
+        forEachFieldPattern(catalog, field.field,
+            [](const auto& name) { return std::string_view(name); },
+            [](const auto& name) { return name.find("__") != std::string_view::npos; },
+            [&](const auto& name) { add(name, field.weight); });
+      }
     }
     std::sort(resolved.begin(), resolved.end(), [](const auto& a, const auto& b) {
       return a.target->physicalName < b.target->physicalName;
     });
-    size_t count = 0;
-    for (const auto& field : resolved) {
-      if (count > 0 && resolved[count - 1].target->physicalName == field.target->physicalName) {
-        resolved[count - 1].weight = std::max(resolved[count - 1].weight, field.weight);
-      } else {
-        resolved[count++] = field;
-      }
-    }
-    return resolved.first(count);
+    return pool.copy_span(std::span(resolved));
   }
 
 public:
@@ -899,7 +958,8 @@ public:
   // analysis pass and one BM25F query per term. Group order follows physical
   // field order, independent of request order and the query text.
   Query* createMultiMatchCombined(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch) {
+                                  std::string_view text, Operator op, int minMatch,
+                                  float tie = 1.0f) {
     struct Group {
       const ResolvedFieldHandle* target;
       std::span<std::string_view> fields;
@@ -912,16 +972,15 @@ public:
     size_t numGroups = 0;
     for (size_t i = 0; i < resolved.size(); i++) {
       const auto& target = *resolved[i].target;
-      if (target.fieldType->type() != FieldType::TEXT) {
-        throw std::runtime_error(std::format(
-            "multi_match: field '{}' is not a TEXT field", target.physicalName));
-      }
-      auto* type = (TextFieldType*)target.fieldType;
-      size_t group = 0;
-      for (; group < numGroups; group++) {
-        auto* other = (TextFieldType*)groups[group].target->fieldType;
-        if (type->analyzer_.get() == other->analyzer_.get()
-            && type->longTerms == other->longTerms) break;
+      size_t group = numGroups;
+      if (target.fieldType->type() == FieldType::TEXT) {
+        auto* type = (TextFieldType*)target.fieldType;
+        for (group = 0; group < numGroups; group++) {
+          if (groups[group].target->fieldType->type() != FieldType::TEXT) continue;
+          auto* other = (TextFieldType*)groups[group].target->fieldType;
+          if (type->analyzer_.get() == other->analyzer_.get()
+              && type->longTerms == other->longTerms) break;
+        }
       }
       if (group == numGroups) groups[numGroups++] = {&target, {}, {}, 0};
       groupIndices[i] = group;
@@ -942,6 +1001,12 @@ public:
     auto optional = pool.make_span<Query*>(numGroups);
     size_t count = 0;
     for (const auto& group : groups) {
+      if (group.target->fieldType->type() != FieldType::TEXT) {
+        if (auto* query = tryCreateMatchQuery(*group.target, text, op, minMatch, group.weights[0])) {
+          optional[count++] = query;
+        }
+        continue;
+      }
       auto terms = analyzeText(*group.target, text);
       if (terms.empty()) continue;
       bool plainTerm = group.fields.size() == 1 && group.weights[0] == 1.0f;
@@ -956,23 +1021,27 @@ public:
       optional[count++] = combineAnalyzedClauses(clauses, op, minMatch);
     }
     if (count == 0) return matchNoDocs();
-    if (count == 1) return optional[0];
-    std::span<Query*> none{};
-    return pool.make<BooleanQuery>(none, optional.first(count), none, none);
+    return DisMaxQuery::make(pool, optional.first(count), tie);
   }
 
-  // Each field contributes its own match score multiplied by its weight.
+  // Each field contributes its own match or phrase score multiplied by its weight.
   Query* createMultiMatchPerField(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch) {
+                                  std::string_view text, Operator op, int minMatch,
+                                  float tie = 1.0f, std::optional<int32_t> phraseSlop = {}) {
     auto resolved = resolveWeightedFields(requested);
     auto clauses = pool.make_span<Query*>(resolved.size());
+    size_t count = 0;
     for (size_t i = 0; i < resolved.size(); i++) {
-      clauses[i] = createMatchQuery(*resolved[i].target, text, op, minMatch, resolved[i].weight);
+      const auto& target = *resolved[i].target;
+      if (phraseSlop && target.fieldType->type() == FieldType::Type::TEXT) {
+        clauses[count++] = createPhraseQuery(
+            target, std::span<const std::string_view>(&text, 1), {}, *phraseSlop, resolved[i].weight);
+      } else if (auto* query = tryCreateMatchQuery(target, text, op, minMatch, resolved[i].weight)) {
+        clauses[count++] = query;
+      }
     }
-    if (clauses.empty()) return matchNoDocs();
-    if (clauses.size() == 1) return clauses[0];
-    std::span<Query*> none{};
-    return pool.make<BooleanQuery>(none, clauses, none, none);
+    if (count == 0) return matchNoDocs();
+    return DisMaxQuery::make(pool, clauses.first(count), tie);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for
@@ -1125,12 +1194,15 @@ public:
   //     value is shifted by that overflow so the caller's gaps survive
   //     multi-token expansion.
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
-                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
-    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions, slop);
+                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
+                           float boost = 1.0f) {
+    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions,
+                              slop, boost);
   }
 
   Query* createPhraseQuery(const ResolvedFieldHandle& target, std::span<const std::string_view> values,
-                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
+                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
+                           float boost = 1.0f) {
     validatePositions(valuePositions, values.size(), "words");
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
@@ -1183,7 +1255,7 @@ public:
 
     return buildPhrase(target,
                        std::span<std::string_view>(terms.data(), terms.size()),
-                       std::span<const int64_t>(positions.data(), positions.size()), slop);
+                       std::span<const int64_t>(positions.data(), positions.size()), slop, boost);
   }
 
   // Build a phrase query from already-analyzed terms; the terms are used
