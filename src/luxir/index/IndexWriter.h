@@ -212,6 +212,11 @@ public:
       }
     }
 
+    // TODO: deletes are not considered.  The level comes from maxDoc and a merge
+    // needs mergeFactor segments at one level, so a mostly-deleted segment keeps
+    // its level and its dead docs are reclaimed only once that level fills;
+    // overwrite-heavy loads grow the index until then.
+    //
     // Integer arithmetic: a floating-point log ratio rounds exact powers of the
     // merge factor (e.g. 100 docs for factor 10) down a level.
     int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
