@@ -308,10 +308,10 @@ private:
   std::vector<std::string_view> analyzeText(const ResolvedFieldHandle& target,
                                            std::string_view text) {
     TokenChain& tc = *fields.chain(target);
-    Token& tok = tc.head.getToken();
+    Token& tok = tc.getToken();
     TokenStream& tail = *tc.tail;
     std::vector<std::string_view> terms;
-    tc.head.setValue(text);
+    tc.setValue(text);
     tc.reset();
     while (tail.incrementToken()) {
       terms.push_back(poolCopy(fitTerm(target, tok.text)));
@@ -469,11 +469,11 @@ public:
         char buf[coerce::TEXT_BUF_SIZE];
         std::string_view term = coerceAnyOfTerm(fieldType, field, value, buf);
         if (fieldType.type() == FieldType::Type::TEXT) {
-          normalizer->head.setValue(term);
+          normalizer->setValue(term);
           normalizer->reset();
           if (!normalizer->tail->incrementToken()) continue;
           // Token bytes are borrowed only until the next pull, including EOF.
-          term = poolCopy(normalizer->head.getToken().text);
+          term = poolCopy(normalizer->getToken().text);
           if (normalizer->tail->incrementToken()) {
             throw std::runtime_error(std::format(
                 "Field '{}': any_of / := requires a single term per exact TEXT value. "
@@ -1187,12 +1187,12 @@ public:
   // words + positions form): it gives the intended phrase position of each
   // value.
   //   * empty: positions accumulate into one continuous stream, so a value that
-  //     expands to several tokens occupies several positions and a value that
-  //     drops to zero tokens contributes none (no gap).
+  //     expands to several tokens occupies several positions, including holes
+  //     from removed stop words. Empty analysis contributes no positions.
   //   * provided: each value's tokens start at its given position; a value that
   //     expands to multiple tokens consumes extra positions, and every later
   //     value is shifted by that overflow so the caller's gaps survive
-  //     multi-token expansion.
+  //     multi-token expansion and trailing stop words.
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
                            std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
                            float boost = 1.0f) {
@@ -1210,7 +1210,7 @@ public:
     positionalTextFieldType(target);
     auto* chain = fields.chain(target);
     TokenChain& tc = *chain;
-    Token& tok = tc.head.getToken();
+    Token& tok = tc.getToken();
     TokenStream& tail = *tc.tail;
 
     // Collected here, then copied into pool-backed spans. Query parsing is a
@@ -1226,27 +1226,29 @@ public:
     if (valuePositions.empty()) {
       int64_t pos = -1;  // first token's positionIncrement (>= 1) lands it at >= 0
       for (std::string_view value : values) {
-        tc.head.setValue(value);
+        tc.setValue(value);
         tc.reset();
         while (tail.incrementToken()) {
           pos += (int64_t) tok.positionIncrement;
           emit(pos);
         }
+        pos += (int64_t) tc.end();
       }
     } else {
       int64_t carry = 0;  // extra positions consumed by prior values' expansion
       for (size_t i = 0; i < values.size(); i++) {
         int64_t base = (int64_t) valuePositions[i] + carry;
         int64_t relPos = -1;  // position within this value, relative to base
-        tc.head.setValue(values[i]);
+        tc.setValue(values[i]);
         tc.reset();
         while (tail.incrementToken()) {
           relPos += (int64_t) tok.positionIncrement;
           emit(base + relPos);
         }
+        relPos += (int64_t) tc.end();
         // A single-token value spans relPos 0 (no overflow); a value spanning
-        // relPos slots pushes the rest by relPos. A dropped value (relPos < 0)
-        // leaves following positions untouched.
+        // relPos slots pushes the rest by relPos, including trailing holes.
+        // An empty value (relPos < 0) leaves following positions untouched.
         if (relPos > 0) {
           carry += relPos;
         }

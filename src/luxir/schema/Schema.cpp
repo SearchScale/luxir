@@ -45,8 +45,8 @@ struct ResolvedField {
   std::optional<LongTerms> longTerms;
   bool hasColumn = false;
   bool column = false;
-  // The authored analyzer in force: the first non-empty AnalyzerDef in the
-  // parent chain (a view into the source entries); null = the type default.
+  // The effective analyzer, backed by source entries or AnalyzerDefinitions;
+  // null = the type default. Char-filter-only definitions keep the parent chain.
   const luxir::api::AnalyzerDef* analyzer = nullptr;
   const luxir::api::NormalizerDef* normalizer = nullptr;
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
@@ -60,7 +60,7 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
-  // Atomic like analyzer: the nearest authored ann in the parent chain.
+  // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
 };
 
@@ -147,17 +147,34 @@ static void parseSchemaDef(std::string_view bytes, luxir::api::SchemaDef& def,
 
 // An authored analyzer that says something: a tokenizer component (which must
 // then name a tokenizer - params-only input is an error, not a silent default)
-// or any filter.  {} inherits; filters-only replaces the whole parent analyzer
-// and gets the whitespace tokenizer.
+// or any filter. {} inherits; token filters alone replace the whole parent
+// analyzer and get the whitespace tokenizer; char filters alone keep its chain.
 static bool analyzerSet(const luxir::api::FieldDef& def) {
   return def.analyzer.has_value() &&
-         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty());
+         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty() ||
+          !def.analyzer->char_filters.empty());
 }
+
+// Intern merged views until all physical fields have been compiled. Their
+// component arrays/strings remain backed by the request or decoded base source.
+// Inherited variant definitions can request the same merge more than once.
+struct AnalyzerDefinitions {
+  std::map<std::pair<const api::AnalyzerDef*, const api::AnalyzerDef*>, api::AnalyzerDef> merged;
+
+  const api::AnalyzerDef* resolve(const api::FieldDef& def, const api::AnalyzerDef* parent) {
+    if (!analyzerSet(def)) return parent;
+    const auto& own = *def.analyzer;
+    if (own.tokenizer || !own.filters.empty() || !parent) return &own;
+    auto [it, inserted] = merged.try_emplace({parent, &own}, *parent);
+    if (inserted) it->second.char_filters = own.char_filters;
+    return &it->second;
+  }
+};
 
 // Pass 1: physical settings only. Variant parent edges consult this completed
 // graph, never the logical graph, so borrowing one's owner's settings is safe.
 static ResolvedField physicalSettings(std::string_view name, const api::FieldDef& def,
-                                      const ResolvedField& parentResolved) {
+                                      const ResolvedField& parentResolved, AnalyzerDefinitions& analyzers) {
   ResolvedField r;
 
   // type: use this field's if set, else parent's
@@ -200,8 +217,9 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.column = parentResolved.column;
   }
 
-  // analyzer: atomic - first non-empty AnalyzerDef in chain wins
-  r.analyzer = analyzerSet(def) ? &*def.analyzer : parentResolved.analyzer;
+  // A tokenizer or token filter replaces the chain; char filters alone replace
+  // just the inherited char filters, retaining the tokenizer and token filters.
+  r.analyzer = analyzers.resolve(def, parentResolved.analyzer);
   r.normalizer = def.normalizer ? &*def.normalizer : parentResolved.normalizer;
 
   // dims: explicit set on this field overrides (0 = infer from first value);
@@ -326,7 +344,7 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
 }
 
 static void resolveField(std::string_view name, const sv_entry_map& defMap,
-                         sv_resolved_map& resolved, sv_flat_set& visiting) {
+                         sv_resolved_map& resolved, sv_flat_set& visiting, AnalyzerDefinitions& analyzers) {
   if (resolved.contains(name)) return;
   if (!visiting.insert(name).second) {
     throw SchemaError("Circular schema inheritance detected involving field: " + std::string(name));
@@ -338,10 +356,10 @@ static void resolveField(std::string_view name, const sv_entry_map& defMap,
   const auto& entry = *it->second;
   ResolvedField parent;
   if (!entry.def.parent.empty()) {
-    resolveField(entry.def.parent, defMap, resolved, visiting);
+    resolveField(entry.def.parent, defMap, resolved, visiting, analyzers);
     parent = resolved.at(entry.def.parent);
   }
-  auto r = physicalSettings(name, entry.def, parent);
+  auto r = physicalSettings(name, entry.def, parent, analyzers);
   r.isTemplate = entry.isTemplate;
   resolved.emplace(name, std::move(r));
   visiting.erase(name);
@@ -452,7 +470,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
   }
 }
 
-// Pass 3 compiles each authored analysis definition once and creates physical
+// Pass 3 compiles each effective analysis definition once and creates physical
 // bundles with the logical owner's shape. Storage can only belong to the primary.
 static api::FieldDef::MultiMode resolveMultiMode(api::FieldDef::MultiMode declared,
     FieldClass type, bool isPrimary, std::string_view name) {
@@ -472,6 +490,7 @@ static api::FieldDef::MultiMode resolveMultiMode(api::FieldDef::MultiMode declar
 }
 
 struct FieldCompiler {
+  InvalidStopWords invalidStopWords;
   boost::unordered_flat_map<const api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   boost::unordered_flat_map<const api::NormalizerDef*, std::shared_ptr<const Analyzer>> normalizers;
 
@@ -605,7 +624,7 @@ struct FieldCompiler {
           // The registry's teaching error (unknown component, unexpected
           // parameter) plus the field it was found on.
           try {
-            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{});
+            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{}, invalidStopWords);
           } catch (const std::invalid_argument& e) {
             throw SchemaError(std::string(e.what()) + " (field: " + std::string(name) + ")");
           }
@@ -775,6 +794,10 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
+  return compile(def, base, InvalidStopWords::REJECT);
+}
+
+std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, InvalidStopWords invalidStopWords) {
   auto schema = std::make_shared<Schema>();
 
   // ---- assemble the authored source entries (merge or replace) ----
@@ -908,10 +931,11 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     }
   }
 
+  AnalyzerDefinitions analyzers;
   sv_resolved_map resolved;
   sv_flat_set visiting;
   for (const auto& e : entries) {
-    resolveField(e.name, defMap, resolved, visiting);
+    resolveField(e.name, defMap, resolved, visiting, analyzers);
     validateDirectProps(e, resolved.find(e.name)->second);
   }
   ownership_map ownership;
@@ -928,7 +952,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     }
   }
 
-  FieldCompiler compiler;
+  FieldCompiler compiler{invalidStopWords, {}, {}};
   for (const auto& e : entries) {
     const auto& r = resolved.at(e.name);
     const auto& owned = ownership.at(e.name);
@@ -967,7 +991,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
           }
           parent = it->second;
         }
-        auto branch = physicalSettings(name, def, parent);
+        auto branch = physicalSettings(name, def, parent, analyzers);
         validateDirectProps({name, def, false}, branch);
         if (branch.type == FieldClass::ID) throw SchemaError("variant cannot have type id: " + name);
         if (shapeFamily(branch.type) != logical->shape) {
