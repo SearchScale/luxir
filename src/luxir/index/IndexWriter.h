@@ -428,6 +428,9 @@ public:
   // A batch survives until a covering commit or a delete pass retires it.
   // Merge catch-up can hold additional references. Protected by indexMutex.
   MultiDeletesData pendingDeletes;
+  // Set when a registered segment gains carried personalDeletes; the pass
+  // scan that finds none clears it. indexMutex.
+  bool carriedDeletes = false;
   uint64_t durableUpdateVersion = 0;
   // Newest batch retired from pending. A pass retires without publishing, so
   // the next manifest must cover it. indexMutex.
@@ -435,8 +438,23 @@ public:
   // Smallest minDocVersion over busy, idle and flushing inverters: lowered at
   // release, recomputed when the inverter holding it leaves. indexMutex.
   uint64_t minInverterDocVersion = UINT64_MAX;
+  // Version of the newest commit to complete, published or not. Commits
+  // complete in version order: startUpdateNode is serial and assigns versions
+  // and ordinals together, and initiateCommit assigns commitNum in ordinal
+  // order. So a packet claimed at or below it no longer belongs to an
+  // outstanding commit and returns to passes. Protected by indexMutex.
+  uint64_t completedCommitVersion = 0;
+  bool deletePassQueued = false; // indexMutex, includes a running pass
+  // A failed pass holds passes until deletePassRetrySlot fires. The delay
+  // doubles per consecutive failure and resets on a successful pass or commit.
+  static constexpr std::chrono::milliseconds DELETE_PASS_RETRY_MIN{100};
+  static constexpr std::chrono::milliseconds DELETE_PASS_RETRY_MAX{5000};
+  std::chrono::milliseconds deletePassBackoff{0}; // indexMutex
+  bool deletePassHeld = false; // indexMutex
+  DeadlineScheduler::Slot deletePassRetrySlot{[this] { deletePassRetryFired(); }};
   DeletePassStats deletePassStats; // counters only, protected by indexMutex
   std::atomic<uint64_t> liveDocsBytesWritten = 0;
+  class DeletePassMessage;
 
   // One delete application: every registered segment, pinned against
   // retirement until unpin(); the packets it applies; and the version through
@@ -708,6 +726,7 @@ private:
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       completedUpdateVersion = msg.updateVersion;
+      requestDeletePassLocked();
     }
     bool doneWithMessage = true;
     // A failed request has no effects, including its commit.  Commit numbers are
@@ -766,6 +785,9 @@ private:
   uint64_t retirePendingLocked(const DeleteApplication& app);
   uint64_t deleteFrontierLocked() const;
   bool passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const;
+  void requestDeletePassLocked() noexcept;
+  void deletePassFinished(bool succeeded);
+  void deletePassRetryFired();
   uint64_t minDocumentVersionLocked() const;
   void collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names);
   // Caller holds publicationMutex. A supplied schema is copied before assigning history.

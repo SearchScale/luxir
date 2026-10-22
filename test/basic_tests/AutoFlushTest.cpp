@@ -63,6 +63,9 @@ struct BudgetTotalGuard {
   explicit BudgetTotalGuard(IndexRamBudget& b) : budget(b), saved(b.totalBytes()) {}
   ~BudgetTotalGuard() { budget.setTotalBytes(saved); }
 };
+
+// An uncapped budget runs no delete passes, so packets wait for a commit.
+void holdDeletePasses(LuxirNode& node) { node.getIndexRamBudget().setTotalBytes(0); }
 }  // namespace
 
 // A single update message never splits mid-request, even far past the cap: it lands
@@ -133,6 +136,7 @@ TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   auto& budget = node.getIndexRamBudget();
+  holdDeletePasses(node);
   ASSERT_TRUE(helper.deleteById("repeat").success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->idleInverters.size());
@@ -161,6 +165,7 @@ TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     auto& budget = node.getIndexRamBudget();
+    holdDeletePasses(node);
     if (shape != 1) {
       ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, shape == 0).success);
     }
@@ -214,6 +219,7 @@ TEST_F(AutoFlushTest, rollbackRetainedDeleteAccounting) {
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     auto& budget = node.getIndexRamBudget();
+    holdDeletePasses(node);
     if (overwrite) {
       ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::NO_COMMIT, true).success);
       ASSERT_TRUE(helper.deleteById("absent").success);
@@ -242,6 +248,7 @@ TEST_F(AutoFlushTest, retainedDeleteStatsReachApi) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
+  holdDeletePasses(node);
   iw->perInverterRamBytes = 1;
   ASSERT_TRUE(helper.deleteById("absent").success);
   iw->updateGraph->wait_for_all();

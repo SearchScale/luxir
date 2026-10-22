@@ -87,6 +87,16 @@ SortedDeletes::EntrySpan clipDeletes(SortedDeletes::EntrySpan span, const IdRang
 } // namespace
 
 
+class IndexWriter::DeletePassMessage final : public UpdateMessage {
+public:
+  DeletePassMessage() { applyOnly = true; }
+  void handle(IndexWriter&) override {}
+  void done(IndexWriter& writer) override {
+    auto self = std::unique_ptr<DeletePassMessage>(this);
+    writer.deletePassFinished(!result.errored());
+  }
+};
+
 // Goals of the TBB flow graph for updates:
 //   - make sure that a commit waits for all update messages to be processed (in the same stream at least)
 //   - make sure that a commit waits for all inverters to flush before writing commit info
@@ -422,6 +432,8 @@ void IndexWriter::fail(std::string reason) {
 }
 
 void IndexWriter::close() {
+  // No delete-pass retry fires once this returns; detach waits out a running one.
+  DeadlineScheduler::global().detach(deletePassRetrySlot);
   // Fatal publication can happen inside a graph task. Drain here even when
   // already marked, never recursively from the publishing task itself.
   std::lock_guard closeLock(closeMutex);
@@ -1167,34 +1179,94 @@ uint64_t IndexWriter::minDocumentVersionLocked() const {
 // no live inverter holding a document born before V and no older request in
 // flight. Completion is ordered: a request's documents are recorded under
 // indexMutex at release before completedUpdateVersion can pass its version.
-// Only request completion and flush registration raise the frontier; a release
-// cannot, since it lowers minInverterDocVersion only to a request still in
-// flight. Cached inputs are lowered eagerly and raised only by a recompute, so
-// a stale one can delay a pass but never retire a packet early.
+// Only request completion and flush registration raise the frontier, so
+// passes are requested there; a release cannot, since it lowers
+// minInverterDocVersion only to a request still in flight. Cached inputs are
+// lowered eagerly and raised only by a recompute, so a stale one can delay a
+// pass but never retire a packet early.
 uint64_t IndexWriter::deleteFrontierLocked() const {
   return std::min(completedUpdateVersion, minInverterDocVersion);
 }
 
 // A pass takes a packet once every request through its largest version has
-// flushed.
+// flushed and no outstanding commit has claimed it.
 bool IndexWriter::passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const {
-  return packet.getLargestVersion() <= frontier;
+  return packet.getLargestVersion() <= frontier && packet.commitClaim <= completedCommitVersion;
 }
 
 // Visits each packet a pass would take now, pending batches first, as
 // visit(packet, fromPending); stops and returns false once visit does. The
-// pass trigger and the pass's capture both select here.
+// pass trigger and the pass's capture both select here. Pending batches are
+// ordered by largest version, so the walk stops at the first past the frontier.
 template <class Visit>
 bool IndexWriter::forEachPassPacketLocked(uint64_t frontier, Visit&& visit) {
   for (const auto& packet : pendingDeletes.deletes) {
+    if (packet->getLargestVersion() > frontier) break;
     if (passMayRetireLocked(*packet, frontier) && !visit(packet, true)) return false;
   }
+  if (!carriedDeletes) return true;
+  bool carried = false;
   for (const auto& [_, seg] : segInfos) {
     for (const auto& packet : seg->personalDeletes.deletes) {
+      carried = true;
       if (passMayRetireLocked(*packet, frontier) && !visit(packet, false)) return false;
     }
   }
+  carriedDeletes = carried;
   return true;
+}
+
+// Any packet a pass may take starts one, so the final commit inherits only the
+// last generation. One outstanding message keeps a commit behind at most one
+// pass; its finish asks again. This runs for every request, so it reads only
+// pending batches at or below the frontier, and carried packets while a merge
+// output holds some.
+void IndexWriter::requestDeletePassLocked() noexcept {
+  if (deletePassQueued || deletePassHeld || isClosed() || indexRamBudget->totalBytes() == 0) return;
+  try {
+    if (forEachPassPacketLocked(deleteFrontierLocked(), [](const auto&, bool) { return false; })) return;
+    auto message = std::make_unique<DeletePassMessage>();
+    deletePassQueued = true;
+    if (commitFinishNode->try_put(message.get())) message.release();
+    else deletePassQueued = false;
+  } catch (...) {
+    deletePassQueued = false;
+  }
+}
+
+void IndexWriter::deletePassFinished(bool succeeded) {
+  uint64_t prepared;
+  std::optional<DeadlineScheduler::Clock::time_point> retry;
+  {
+    const std::lock_guard lock(indexMutex);
+    prepared = preparedDeleteVersion;
+    deletePassQueued = false;
+    if (succeeded) {
+      deletePassBackoff = {};
+    } else if (!isClosed()) {
+      // Retry without waiting for traffic, paced so a persistent fault cannot spin.
+      deletePassBackoff = deletePassBackoff.count() == 0 ? DELETE_PASS_RETRY_MIN
+                                                         : std::min(2 * deletePassBackoff, DELETE_PASS_RETRY_MAX);
+      deletePassHeld = true;
+      retry = DeadlineScheduler::Clock::now() + deletePassBackoff;
+    }
+    requestDeletePassLocked();
+  }
+  if (retry) {
+    try {
+      DeadlineScheduler::global().arm(deletePassRetrySlot, *retry);
+    } catch (const std::exception& e) {
+      LOG_ERROR("delete pass retry arm failed: {}", e.what());
+    }
+  }
+  Signal::emit("deletePassFinished", this, (void*)prepared);
+}
+
+// Runs on the DeadlineScheduler thread; close() detaches the slot.
+void IndexWriter::deletePassRetryFired() {
+  const std::lock_guard lock(indexMutex);
+  deletePassHeld = false;
+  requestDeletePassLocked();
 }
 
 // Inverter for the segment should already be in the flushingInverters list.
@@ -1289,6 +1361,15 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     if (success) segInfos.reserve(segInfos.size() + 1);
     if (deletes) {
       if (segInfo) deletes->sourceSegId = segInfo->segId;
+      // An adopting commit retires the packet unless it holds a newer request,
+      // and must not race a pass for it. No commit adopts the inverter once it
+      // leaves flushingInverters below. If initiateCommit throws after adopting
+      // inverters, nothing completes that commit, so their packets keep the
+      // claim until a later commit completes: a delay only.
+      if (auto* commit = inverter.commitInfo) {
+        uint64_t version = commit->updateMessage->updateVersion;
+        if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
+      }
       pendingDeletes.deletes.insert(std::move(deletes));
     }
 
@@ -1310,6 +1391,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     if (inverterPtr->minDocVersion != UINT64_MAX && inverterPtr->minDocVersion == minInverterDocVersion) {
       minInverterDocVersion = minDocumentVersionLocked();
     }
+    requestDeletePassLocked();
 
     // Check if we should merge anything.  Must happen *before* the leftToFlush
     // decrement: if this flush triggers a merge and the inverter's commit is
@@ -1393,6 +1475,7 @@ void IndexWriter::reconcileDeletes(const DeleteApplication& app) {
         uint64_t carriedBytes = 0;
         auto carry = [&](const auto& packet) {
           if (target.personalDeletes.deletes.insert(packet).second) carriedBytes += packet->memSize();
+          carriedDeletes = true;
         };
         for (const auto& packet : seg->personalDeletes.deletes) {
           if (app.selected.deletes.contains(packet)) carry(packet);
@@ -1405,7 +1488,7 @@ void IndexWriter::reconcileDeletes(const DeleteApplication& app) {
       }
     }
     if (!seg->personalDeletes.empty()) {
-      boost::unordered::erase_if(seg->personalDeletes.deletes,
+      boost::container::erase_if(seg->personalDeletes.deletes,
                                  [&](const auto& packet) { return app.selected.deletes.contains(packet); });
     }
   }
@@ -1427,6 +1510,13 @@ uint64_t IndexWriter::retirePendingLocked(const DeleteApplication& app) {
 // called from the commitFinishNode which has concurrency==1 (single-threaded)
 bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
+  // A commit's claims end with it on every path; packets it did not retire
+  // return to passes.
+  auto endClaims = scope_guard([this, version = msg.updateVersion] {
+    const std::lock_guard lock(indexMutex);
+    completedCommitVersion = std::max(completedCommitVersion, version);
+    requestDeletePassLocked();
+  });
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   // TODO: if nothing actually changed, we could skip writing a new commit at this point.
   // Not for a commit that waits for replicas: that wait relies on a generation
@@ -1549,6 +1639,9 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // Retire only batches in this snapshot. Later flushes may have registered
     // more while deletes were applied.
     retirePendingLocked(app);
+    // A published application lifts a failed pass's hold.
+    deletePassBackoff = {};
+    deletePassHeld = false;
   }
   publicationLock.unlock();
   // publishOnly commits publish a merge layout without flushing later-arrived
@@ -2662,6 +2755,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           if (!segInfo->personalDeletes.empty()) {
             INDEX_DEBUG("Will merge personal deletes from {} to {}", *segInfo, *newSegInfo);
             newSegInfo->personalDeletes.addAll(segInfo->personalDeletes);
+            carriedDeletes = true;
           }
 
           // remove from the index: move from segInfos to segmentsToDelete
@@ -2937,9 +3031,13 @@ void IndexWriter::testDeleteAllData() {
     activeVectorOverlayNames.clear();
     lastMergeFailure.reset();
     pendingDeletes.clear();
+    carriedDeletes = false;
     minInverterDocVersion = UINT64_MAX;
     durableUpdateVersion = 0;
     preparedDeleteVersion = 0;
+    completedCommitVersion = 0;
+    deletePassBackoff = {};
+    deletePassHeld = false;
     nextManifestGen = 0;
     manifestNames.clear();
 
