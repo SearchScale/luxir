@@ -33,6 +33,10 @@ size_t Inverter::retainedDeleteBytes() const {
   return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();
 }
 
+size_t Inverter::deleteCount() const {
+  return idHandler_ == nullptr ? 0 : static_cast<handler::IdHandler&>(*idHandler_).nonzeroWatermarks;
+}
+
 
 Inverter::UndoMark Inverter::undoMark() const {
   UndoMark mark;

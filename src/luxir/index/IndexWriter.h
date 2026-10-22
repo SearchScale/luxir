@@ -73,6 +73,7 @@ public:
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
+    std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -173,6 +174,8 @@ public:
     uint64_t pendingRetirableDeleteBytes = 0, pendingHeldDeleteBytes = 0, mergeCarryDeleteBytes = 0;
     // liveDocs files written by commits, passes, merges and flushes.
     uint64_t liveDocsBytesWritten = 0;
+    uint64_t deleteOnlyKneeFlushes = 0;
+    uint64_t deleteOnlyFlushCap = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -456,6 +459,7 @@ public:
   // registering at or below it is marked then, and markRetirableLocked marks
   // the rest as the frontier, which never falls, passes them. indexMutex.
   uint64_t retirableThrough = 0;
+  uint64_t deleteOnlyKneeFlushes = 0; // indexMutex
   DeletePassStats deletePassStats; // counters only, protected by indexMutex
   std::atomic<uint64_t> liveDocsBytesWritten = 0;
   class DeletePassMessage;
@@ -572,6 +576,9 @@ public:
   size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
   // Delete ids per application task within one segment.
   size_t deleteApplyChunkEntries = 64 * 1024;
+  // Small indexes still batch delete-only buffers: per-id cost was about 2x the
+  // knee at 100K ids and 4.9x at 10K.
+  uint64_t deleteOnlyFlushFloor = 64 * 1024;
 
   // Minimum memSize() for an idle inverter to be flushed under global RAM budget
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
@@ -795,6 +802,7 @@ private:
   void deletePassFinished(bool succeeded);
   void deletePassRetryFired();
   uint64_t minDocumentVersionLocked() const;
+  uint64_t deleteOnlyFlushCapLocked() const;
   void collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names);
   // Caller holds publicationMutex. A supplied schema is copied before assigning history.
   void publish(api::IndexInfo& info, std::pmr::memory_resource& arena,

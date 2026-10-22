@@ -137,6 +137,11 @@ TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
   auto iw = helper.getIndexWriter();
   auto& budget = node.getIndexRamBudget();
   holdDeletePasses(node);
+  iw->deleteOnlyFlushFloor = 1;
+  std::vector<Doc> base;
+  for (int i = 0; i < 1088; i++) base.push_back(flatdoc("id", std::to_string(i)));
+  ASSERT_TRUE(helper.indexAll(base, UpdateMessage::COMMIT).success);
+  EXPECT_EQ(34, iw->stats(false).deleteOnlyFlushCap);
   ASSERT_TRUE(helper.deleteById("repeat").success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->idleInverters.size());
@@ -151,11 +156,11 @@ TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
   EXPECT_EQ(inverter, iw->idleInverters.begin()->first);
   EXPECT_GT(inverter->memSize(), initialSize);
   EXPECT_GT(budget.reservedBytes(), initialReserved);
-  iw->perInverterRamBytes = inverter->memSize() - 1;
   ASSERT_TRUE(helper.deleteById(std::string(100, 'y')).success);
   iw->updateGraph->wait_for_all();
   EXPECT_FALSE(iw->pendingDeletes.empty());
-  EXPECT_TRUE(iw->segInfos.empty());
+  EXPECT_EQ(1, iw->segInfos.size());
+  EXPECT_EQ(1, iw->stats(false).deleteOnlyKneeFlushes);
 }
 
 TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {

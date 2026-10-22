@@ -840,6 +840,15 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     inverter.minDocVersion = std::min(inverter.minDocVersion, inverter.currVersion);
     minInverterDocVersion = std::min(minInverterDocVersion, inverter.minDocVersion);
   }
+  // A delete-only buffer flushes at the RAM cap or the id dictionary's locality
+  // knee, whichever comes first: past the knee, larger packets buy no per-id
+  // saving. Below the floor, the knee's sum over segments is not needed.
+  if (!flush && inverter.commitInfo == nullptr && inverter.getMaxDoc() == 0
+      && inverter.deleteCount() >= deleteOnlyFlushFloor
+      && inverter.deleteCount() >= deleteOnlyFlushCapLocked()) {
+    flush = true;
+    deleteOnlyKneeFlushes++;
+  }
 
   // Size-based auto-flush is driven by the caller (ProtoUpdateMessage::handle passes
   // flush=true at end of batch when inverter.shouldFlush() is true), not decided here:
@@ -1188,6 +1197,19 @@ uint64_t IndexWriter::deleteFrontierLocked() const {
   return std::min(completedUpdateVersion, minInverterDocVersion);
 }
 
+uint64_t IndexWriter::deleteOnlyFlushCapLocked() const {
+  uint64_t blocks = 0;
+  for (const auto& [_, seg] : segInfos) {
+    auto count = seg->idDictionaryBlocks.load();
+    // Reopened segments and merge outputs without a finalized id dictionary
+    // count slots until a reader supplies the exact count (including partial
+    // blocks at partition boundaries).
+    if (count == UINT64_MAX) count = ((uint64_t)seg->maxDoc + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE;
+    blocks += count;
+  }
+  return std::max(deleteOnlyFlushFloor, blocks);
+}
+
 // A pass takes a packet once every request through its largest version has
 // flushed and no outstanding commit has claimed it.
 bool IndexWriter::passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const {
@@ -1324,7 +1346,9 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schemaGen = inverter.schema->gen_;
-    if (auto& range = inverter.getPostingsWriter().idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
+    auto& postings = inverter.getPostingsWriter();
+    if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
+    segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
       liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
@@ -1905,18 +1929,25 @@ std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& s
     if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
     seg.sharedPostingsReader.store(pr);
   }
-  if (!seg.idRange.load()) {
+  bool rangeKnown = seg.idRange.load() != nullptr;
+  if (!rangeKnown || seg.idDictionaryBlocks.load() == UINT64_MAX) {
     IdRange range;
+    uint64_t blocks = 0;
     if (auto* info = pr->fieldInfo("id"); info && info->nTerms > 0) {
       auto guard = MemPool::threadLocalPoolGuard();
       TermsEnum terms(guard.pool(), *pr, *info);
-      terms.seekOrd(0);
-      range.min = (std::string_view)terms.term();
-      terms.seekOrd(info->nTerms - 1);
-      range.max = (std::string_view)terms.term();
-      range.empty = false;
+      blocks = terms.numBlocks();
+      if (!rangeKnown) {
+        terms.seekOrd(0);
+        range.min = (std::string_view)terms.term();
+        terms.seekOrd(info->nTerms - 1);
+        range.max = (std::string_view)terms.term();
+        range.empty = false;
+      }
     }
-    seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
+    seg.idDictionaryBlocks.store(blocks);
+    // A populated range is never replaced.
+    if (!rangeKnown) seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
   }
   return pr;
 }
@@ -2629,6 +2660,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
+      if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
@@ -3151,6 +3183,8 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.minInverterDocVersion = minInverterDocVersion;
     uint64_t frontier = deleteFrontierLocked();
     out.liveDocsBytesWritten = liveDocsBytesWritten.load(std::memory_order_relaxed);
+    out.deleteOnlyKneeFlushes = deleteOnlyKneeFlushes;
+    out.deleteOnlyFlushCap = deleteOnlyFlushCapLocked();
     boost::unordered_flat_set<const SortedDeletes*> retained;
     for (const auto& batch : pendingDeletes.deletes) {
       retained.insert(batch.get());

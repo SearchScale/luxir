@@ -157,6 +157,7 @@ public:
   // so all deletes end up as sorted lists after flush.
   void deleteId(std::string_view id, uint64_t version);
   size_t retainedDeleteBytes() const;
+  size_t deleteCount() const;
 
   /// This is what clients should call to index the fields of a document.
   class IndexHandler {
