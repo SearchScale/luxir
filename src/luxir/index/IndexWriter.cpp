@@ -1298,19 +1298,16 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
   std::vector<SegInfo*> segs;
   std::vector<SegInfo*> segsToApplyDeletes;
-  std::vector<SegInfo*> markedInUse;
-
-  // A failed commit must clear its in-use marks: a marked segment that a merge
-  // retires before the next successful commit would otherwise never be deleted.
-  // Cleared once published, when publication or the empty-segment drop below
-  // has replaced every mark and retirement may free the segments.
-  auto releaseInUseMarks = scope_guard([&] {
-    if (markedInUse.empty()) return;
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    for (auto* seg : markedInUse) {
-      if (seg->lastCommitTime == 1) seg->lastCommitTime = 0;
-    }
-  });
+  // Preparation pins keep the snapshot from retirement until publication has
+  // replaced it; a failed commit releases them on unwind.
+  bool pinsHeld = true;
+  auto releasePins = [&] {
+    const std::lock_guard lock(indexMutex);
+    if (!pinsHeld) return;
+    for (auto* seg : segs) --seg->preparationPins;
+    pinsHeld = false;
+  };
+  auto unpin = scope_guard(releasePins);
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -1319,14 +1316,10 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     msg.commitInfo->highestUpdateVersion =
       std::max({durableUpdateVersion, msg.updateVersion, maxDeleteVersion});
     segs.reserve(segInfos.size());
-    markedInUse.reserve(segInfos.size());
-    // grab all segments and mark them as being part of a commit.
+    // Pin the snapshot across application and concurrent merge replacement.
     for (auto& [segId, seg] : segInfos) {
       segs.push_back(seg.get());
-      if (seg->lastCommitTime == 0) {
-        seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
-        markedInUse.push_back(seg.get());
-      }
+      ++seg->preparationPins;
       if (mayApplyDeletes(*seg, commitDeletes) || mayApplyDeletes(*seg, seg->personalDeletes)) {
         // this segment has personal deletes and/or commit-level deletes that need to be applied.
         segsToApplyDeletes.push_back(seg.get());
@@ -1460,7 +1453,6 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::unique_lock publicationLock(publicationMutex);
   CommitId result{incarnation, 0};
   writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
-  markedInUse.clear();
   for (auto* seg : segsToKeep) seg->unsyncedFiles.clear();
   result.index_gen = indexGen;
   msg.resultingCommit = std::move(result);
@@ -1482,8 +1474,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // NOTE: we did have a call to tryDeleteSegments() from the merge code as well, but
   // there was a race condition: writeIndexInfoFile() was updating the commitTime of
   // the segments before updating lastCommitTime, so a segment could be deleted in that period.
-  // The race is fixable (always use "1" for a segment being committed, etc), but it's
-  // easier for now to just call tryDeleteSegments() in this method.
+  // Preparation pins now protect that interval; cleanup still follows publication.
   if (!toDelete.empty()) {
     const std::lock_guard<std::mutex> lock(indexMutex);
     for (auto& seg : toDelete) {
@@ -1496,6 +1487,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // but we'll just do it here for now.
 
   // Delete segment files only after the IndexInfo file is written.
+  releasePins();
   tryDeleteSegments();
 
   if (msg.maxSegments > 0) {
@@ -1503,6 +1495,20 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     return false;
   }
   return true;
+}
+
+// Collects seg's obsolete liveDocs generations for retirement, keeping the
+// current, published and merge-held ones and any past the published one: a
+// preparing commit's sync list can still hold those, including after a failed
+// publication.
+void IndexWriter::collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names) {
+  std::erase_if(seg.obsoleteLiveGens, [&](uint64_t gen) {
+    if (gen == seg.liveGen || gen >= seg.publishedLiveGen
+        || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
+        || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
+    names.push_back(Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen));
+    return true;
+  });
 }
 
 // Attempts to actually remove the files for segments in the deletion list.
@@ -1518,44 +1524,38 @@ void IndexWriter::tryDeleteSegments() {
       std::lock_guard publicationLock(publicationMutex);
       const std::lock_guard<std::mutex> lock(indexMutex);
       liveDocsToDelete.swap(pendingRetirement);
-      // grab all segments and put back ones we shouldn't delete yet.
-      std::swap(localDeleteList, segmentsToDelete);
-      for (auto& seg : localDeleteList) {
-        bool published = std::ranges::find(lastCommittedSegIds, seg->segId) != lastCommittedSegIds.end();
-        if (seg->merging || published || seg->lastCommitTime == 1) {
-          segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
-        }
-      }
-      auto retireLiveDocs = [&](SegInfo& seg) {
-        // Generations beyond the published one can still be in a preparing
-        // commit's sync list, including after a failed publication.
-        std::erase_if(seg.obsoleteLiveGens, [&](uint64_t gen) {
-          if (gen == seg.liveGen || gen >= seg.publishedLiveGen
-              || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
-              || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
-          auto name = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen);
-          liveDocsToDelete.push_back(std::move(name));
-          return true;
-        });
-      };
-      for (auto& [id, seg] : segInfos) retireLiveDocs(*seg);
-      for (auto& seg : segmentsToDelete) retireLiveDocs(*seg);
+      localDeleteList = takeDeletableSegmentsLocked();
+      for (auto& [id, seg] : segInfos) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
+      for (auto& seg : segmentsToDelete) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
     }
 
     // No publication or index lock is held during filesystem cleanup.
-    Signal::emit("segmentRetirement", this);
     snapshots.retire(liveDocsToDelete);
-    // Now delete the segments outside of the mutex.
-    // In the future, if we wanted to support windows, we need a background deleter to
-    // retry deletes after some time in case they are still open.
-    for (auto& seg : localDeleteList) {
-      if (!seg) continue; // skip null segments
-      INDEX_DEBUG("Deleting files {}", *seg);
-      snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
-      seg.reset(); // deletes the in-memory segment info
-    }
+    retireSegments(localDeleteList);
   } catch (std::exception& e) {
     LOG_ERROR("Exception caught while deleting segments: {}", e.what());
+  }
+}
+
+std::vector<std::unique_ptr<SegInfo>> IndexWriter::takeDeletableSegmentsLocked() {
+  std::vector<std::unique_ptr<SegInfo>> result;
+  result.swap(segmentsToDelete);
+  for (auto& seg : result) {
+    bool published = std::ranges::find(lastCommittedSegIds, seg->segId) != lastCommittedSegIds.end();
+    if (seg->merging || published || seg->preparationPins != 0) {
+      segmentsToDelete.push_back(std::move(seg));
+    }
+  }
+  return result;
+}
+
+void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments) {
+  Signal::emit("segmentRetirement", this);
+  for (auto& seg : segments) {
+    if (!seg) continue;
+    INDEX_DEBUG("Deleting files {}", *seg);
+    snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
+    seg.reset();
   }
 }
 

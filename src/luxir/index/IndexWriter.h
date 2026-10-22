@@ -55,11 +55,12 @@ public:
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
     int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
+    uint32_t preparationPins = 0; // protected by indexMutex
     uint64_t publishedLiveGen = 0; // the generation in the published snapshot
     std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t firstCommitTime = 0;  // first time this segment was committed as part of the index.
-    uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index (or 1 if currently committing)
+    uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
@@ -715,6 +716,7 @@ private:
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
+  void collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names);
   // Caller holds publicationMutex. A supplied schema is copied before assigning history.
   void publish(api::IndexInfo& info, std::pmr::memory_resource& arena,
                std::shared_ptr<Schema> schema = {});
@@ -746,6 +748,8 @@ private:
                                 std::string_view context) noexcept;
   // Release writer ownership; snapshot pins can retain the retired files.
   void tryDeleteSegments();
+  std::vector<std::unique_ptr<SegInfo>> takeDeletableSegmentsLocked();
+  void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);
   void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
