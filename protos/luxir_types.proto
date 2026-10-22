@@ -1478,8 +1478,8 @@ message ServiceStats {
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.
   repeated double request_duration_bounds = 3;
-  // Upper bounds, in seconds, of the flush, commit, merge, vector build and
-  // reader refresh histograms.
+  // Upper bounds, in seconds, of the flush, commit, delete pass, merge,
+  // vector build and reader refresh histograms.
   repeated double background_duration_bounds = 4;
   TransportStats http = 5;
   TransportStats grpc = 6;
@@ -1500,6 +1500,9 @@ message ServiceStats {
   map<string, uint64> document_errors = 19;
   ActivityStats flush = 14;
   ActivityStats commit = 15;
+  // Delete passes, which apply deletes between commits without flushing,
+  // syncing or publishing.
+  ActivityStats delete_pass = 22;
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;

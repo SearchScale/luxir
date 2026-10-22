@@ -273,7 +273,7 @@ Two byte counts measure different things and will disagree:
 
 `service` counters are process-wide and reset on restart. Each activity
 (`operations` per transport, `search`, `index_batches`, `flush`, `commit`,
-`merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
+`delete_pass`, `merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
 (`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram `counts` are
 cumulative, aligned with `service.request_duration_bounds` (requests, search
 execution and index batches, from 10 microseconds) or

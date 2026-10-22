@@ -540,6 +540,7 @@ struct ServiceStats {
   uint64_t delete_ids_accepted = 0;
   ActivityStats flush;
   ActivityStats commit;
+  ActivityStats delete_pass;
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
