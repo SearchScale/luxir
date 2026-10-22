@@ -835,7 +835,7 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // batch, not per doc. The
   // reservation is held until the inverter is destroyed (after flush), so
   // flushing inverters stay counted until their RAM is actually freed.
-  inverter.ramGuard.forceResize((int64_t)inverter.memSize());
+  inverter.ramGuard.forceResize((int64_t)inverter.memSize(), (int64_t)inverter.retainedDeleteBytes());
   if (inverter.getMaxDoc() > inverter.acquisitionMaxDoc) {
     inverter.minDocVersion = std::min(inverter.minDocVersion, inverter.currVersion);
     minInverterDocVersion = std::min(minInverterDocVersion, inverter.minDocVersion);
@@ -1234,6 +1234,18 @@ void IndexWriter::requestDeletePassLocked() noexcept {
   }
 }
 
+// A batch the frontier has passed leaves pressure: a pass, or the commit that
+// claimed it, reclaims it. Runs where the frontier can move, and marks only the
+// batches between the last frontier it saw and this one.
+void IndexWriter::markRetirableLocked() {
+  uint64_t frontier = deleteFrontierLocked();
+  if (frontier <= retirableThrough) return;
+  for (const auto& batch : pendingDeletes.between(retirableThrough, frontier)) {
+    if (batch->ramGuard) batch->ramGuard.markRetirable();
+  }
+  retirableThrough = frontier;
+}
+
 void IndexWriter::deletePassFinished(bool succeeded) {
   uint64_t prepared;
   std::optional<DeadlineScheduler::Clock::time_point> retry;
@@ -1370,6 +1382,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
         uint64_t version = commit->updateMessage->updateVersion;
         if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
       }
+      if (deletes->getLargestVersion() <= retirableThrough && deletes->ramGuard) deletes->ramGuard.markRetirable();
       pendingDeletes.deletes.insert(std::move(deletes));
     }
 
@@ -1391,6 +1404,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     if (inverterPtr->minDocVersion != UINT64_MAX && inverterPtr->minDocVersion == minInverterDocVersion) {
       minInverterDocVersion = minDocumentVersionLocked();
     }
+    markRetirableLocked();
     requestDeletePassLocked();
 
     // Check if we should merge anything.  Must happen *before* the leftToFlush
@@ -3031,6 +3045,7 @@ void IndexWriter::testDeleteAllData() {
     activeVectorOverlayNames.clear();
     lastMergeFailure.reset();
     pendingDeletes.clear();
+    retirableThrough = 0;
     carriedDeletes = false;
     minInverterDocVersion = UINT64_MAX;
     durableUpdateVersion = 0;

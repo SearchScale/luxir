@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <vector>
 #include <boost/container/flat_set.hpp>
@@ -48,7 +50,8 @@ public:
   using Table = TermValHash<IdEntry>::Table;
 
   // Declared before storage so the last owner's destruction frees storage first.
-  IndexRamBudget::Guard ramGuard;
+  // Mutable so shared owners can mark a packet retirable.
+  mutable IndexRamBudget::Guard ramGuard;
   // Version of the commit that flushed this packet and will retire it, or 0.
   // Passes leave the packet to that commit until it completes. Without the
   // claim, under NRT a pass would run between a commit's flushes and the
@@ -143,6 +146,13 @@ public:
 
   uint64_t getLargestVersion() const {
     return deletes.empty() ? 0 : (*deletes.rbegin())->getLargestVersion();
+  }
+
+  // The batches whose largest version is in (after, through], in order.
+  auto between(uint64_t after, uint64_t through) const {
+    auto largest = [](const auto& batch) { return batch->getLargestVersion(); };
+    auto first = std::ranges::upper_bound(deletes, after, {}, largest);
+    return std::ranges::subrange(first, std::ranges::upper_bound(first, deletes.end(), through, {}, largest));
   }
 
   uint64_t getSmallestVersion() const {

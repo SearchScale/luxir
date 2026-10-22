@@ -452,6 +452,10 @@ public:
   std::chrono::milliseconds deletePassBackoff{0}; // indexMutex
   bool deletePassHeld = false; // indexMutex
   DeadlineScheduler::Slot deletePassRetrySlot{[this] { deletePassRetryFired(); }};
+  // Every pending batch at or below this has left pressure as retirable: one
+  // registering at or below it is marked then, and markRetirableLocked marks
+  // the rest as the frontier, which never falls, passes them. indexMutex.
+  uint64_t retirableThrough = 0;
   DeletePassStats deletePassStats; // counters only, protected by indexMutex
   std::atomic<uint64_t> liveDocsBytesWritten = 0;
   class DeletePassMessage;
@@ -726,6 +730,7 @@ private:
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       completedUpdateVersion = msg.updateVersion;
+      markRetirableLocked();
       requestDeletePassLocked();
     }
     bool doneWithMessage = true;
@@ -786,6 +791,7 @@ private:
   uint64_t deleteFrontierLocked() const;
   bool passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const;
   void requestDeletePassLocked() noexcept;
+  void markRetirableLocked();
   void deletePassFinished(bool succeeded);
   void deletePassRetryFired();
   uint64_t minDocumentVersionLocked() const;

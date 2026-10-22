@@ -4402,6 +4402,32 @@ TEST_F(IndexWriterTest, deletePassCoalescesWhileHandlerPinsFrontier) {
   EXPECT_EQ(0, iw->stats(false, false).retainedDeleteBytes);
 }
 
+// The frontier, not a pass, takes a packet out of pressure, and retiring the
+// packet ends its discount.
+TEST_F(IndexWriterTest, frontierMarksPacketRetirable) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  auto base = helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT);
+  ASSERT_TRUE(base.success);
+  holdDeletePasses(node);
+  uint64_t next = base.updateVersion + 1;
+  auto& inverter = iw->obtainInverter(next);
+  inverter.deleteId("a", next);
+  iw->releaseInverter(inverter, true);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->pendingDeletes.size());
+  auto bytes = (int64_t)(*iw->pendingDeletes.deletes.begin())->memSize();
+  EXPECT_EQ(0, budget.retirableDeleteBytesCount());
+  ASSERT_EQ(next, helper.deleteById("absent").updateVersion);
+  EXPECT_EQ(bytes, budget.retirableDeleteBytesCount());
+  helper.commit();
+  iw->updateGraph->wait_for_all();
+  EXPECT_EQ(0, budget.retirableDeleteBytesCount());
+}
+
 TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
   using namespace luxir::test;
   LuxirNode node;

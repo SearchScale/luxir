@@ -290,6 +290,29 @@ TEST_F(AutoFlushTest, pressureChoosesReliefInsteadOfRetainedDeletes) {
   budget.setTotalBytes(0);
 }
 
+// An inverter's delete bytes outlive its flush as a packet while its successor
+// refills, so pressure sheds it once both would not fit, before reservations do.
+TEST_F(AutoFlushTest, pressureCountsPacketLeftBehind) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  iw->pressureFlushFloorBytes = 1;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) docs.push_back(flatdoc("id", std::string(100, 'x') + std::to_string(i)));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT, true).success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(0, iw->segInfos.size());
+  int64_t deletes = budget.liveDeleteBytesCount();
+  ASSERT_GT(deletes, 0);
+  budget.setTotalBytes(budget.reservedBytes() + deletes / 2);
+  EXPECT_FALSE(budget.overBudget());
+  iw->updateGraph->wait_for_all();
+  EXPECT_EQ(1, iw->segInfos.size());
+  EXPECT_EQ(0, budget.liveDeleteBytesCount());
+  budget.setTotalBytes(0);
+}
+
 // Waits for the budget's reservations to drain back to at most `bound` (the
 // last inverter is destroyed shortly AFTER its flush is observable, so a
 // post-commit check must poll).

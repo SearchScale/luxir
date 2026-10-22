@@ -232,3 +232,44 @@ TEST(IndexRamBudgetTest, RetainedDeleteTransferSizeMismatch) {
     EXPECT_EQ(0, budget.retainedDeleteBytesCount());
   }
 }
+
+TEST(IndexRamBudgetTest, liveDeleteBytesCountTwiceForPressure) {
+  IndexRamBudget budget(100);
+  auto inverter = budget.forceAcquire(0);
+  inverter.forceResize(60, 30);
+  EXPECT_EQ(60, budget.reservedBytes());
+  EXPECT_EQ(30, budget.liveDeleteBytesCount());
+  EXPECT_FALSE(budget.pressureNeeded());
+  inverter.forceResize(80, 30);
+  EXPECT_FALSE(budget.overBudget());
+  EXPECT_TRUE(budget.pressureNeeded());
+
+  // Draining hands the packet to plain reservations, so it counts once.
+  EXPECT_TRUE(inverter.tryMarkDrainingForPressure(30));
+  EXPECT_EQ(0, budget.liveDeleteBytesCount());
+  EXPECT_FALSE(budget.pressureNeeded());
+  inverter.clearDraining();
+  EXPECT_EQ(30, budget.liveDeleteBytesCount());
+  inverter.release();
+  EXPECT_EQ(0, budget.liveDeleteBytesCount());
+  EXPECT_EQ(0, budget.reservedBytes());
+}
+
+TEST(IndexRamBudgetTest, retirablePacketsLeavePressureNotAdmission) {
+  IndexRamBudget budget(100);
+  auto inverter = budget.forceAcquire(80);
+  inverter.markDraining(80);
+  auto packet = inverter.transferToRetainedDeletes(80);
+  inverter.release();
+  auto other = budget.forceAcquire(40);
+  EXPECT_TRUE(budget.pressureNeeded());
+  packet.markRetirable();
+  packet.markRetirable();
+  EXPECT_EQ(80, budget.retirableDeleteBytesCount());
+  EXPECT_TRUE(budget.overBudget());
+  EXPECT_FALSE(budget.pressureNeeded());
+  packet.release();
+  EXPECT_EQ(0, budget.retirableDeleteBytesCount());
+  EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+  EXPECT_EQ(40, budget.reservedBytes());
+}
