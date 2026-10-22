@@ -4172,6 +4172,31 @@ TEST_F(IndexWriterTest, deletePassTakesEveryRetirablePacket) {
   EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
 }
 
+TEST_F(IndexWriterTest, pinningFlushRequiresRetainedBytesToCoverVictim) {
+  using namespace luxir::test;
+  for (bool small : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto first = helper.index(flatdoc("id", "old"));
+    auto& old = iw->obtainInverter(first.updateVersion);
+    auto later = helper.index(flatdoc("id", "young"));
+    auto& young = iw->obtainInverter(later.updateVersion);
+    young.pool.alloc(1 << 20);
+    if (!small) old.pool.alloc(1 << 20);
+    auto& packet = iw->obtainInverter(later.updateVersion);
+    for (int i = 0; i < 256; i++) packet.deleteId(std::string(100, 'x') + std::to_string(i), later.updateVersion);
+    iw->releaseInverter(packet, true);
+    iw->updateGraph->wait_for_all();
+    iw->releaseInverter(old);
+    iw->releaseInverter(young);
+    iw->updateGraph->wait_for_all();
+    auto stats = iw->stats(false, false);
+    EXPECT_EQ(small ? 1 : 0, stats.pinningInverterFlushes);
+    EXPECT_EQ(small ? 0 : stats.retainedDeleteBytes, stats.pendingHeldDeleteBytes);
+  }
+}
+
 // A failed commit's liveDocs generation leaves the sync list once a pass
 // supersedes it, so the pass reclaims it and the next commit syncs only the
 // current one.

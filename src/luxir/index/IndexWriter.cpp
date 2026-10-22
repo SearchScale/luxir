@@ -737,6 +737,7 @@ void IndexWriter::pressureCheckBody() {
   if (isClosed()) return;
 
   const std::lock_guard<std::mutex> lock(indexMutex);
+  flushPinningInverterLocked();
   pressureShedIdleLocked();
 }
 
@@ -877,6 +878,8 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     // return inverter to idle pool
     idleInverters.emplace(&inverter, std::move(it->second));
     busyInverters.erase(it);
+    // Only the frontier holder going idle can make it worth flushing.
+    if (inverter.minDocVersion == minInverterDocVersion) flushPinningInverterLocked();
   }
 
   // Re-evaluate even when raw reservations fit: pending merge demand may need
@@ -1210,6 +1213,44 @@ uint64_t IndexWriter::deleteOnlyFlushCapLocked() const {
   return std::max(deleteOnlyFlushFloor, blocks);
 }
 
+// The oldest inverter holding documents pins the frontier; flush it once idle
+// if the pending batches it holds back are at least its size. Releases of other
+// inverters cannot make that true, so it is checked when a batch registers,
+// when the holder goes idle, and on a pressure check.
+void IndexWriter::flushPinningInverterLocked() noexcept {
+  // Only a finite budget runs passes. A pin below completedUpdateVersion must
+  // hold back a pending batch.
+  if (indexRamBudget->totalBytes() == 0 || minInverterDocVersion >= completedUpdateVersion
+      || pendingDeletes.between(minInverterDocVersion, completedUpdateVersion).empty()) return;
+  Inverter* oldest = nullptr;
+  uint64_t first = UINT64_MAX, next = completedUpdateVersion;
+  auto include = [&](const auto& inverters) {
+    for (const auto& [inverter, _] : inverters) {
+      auto version = inverter->minDocVersion;
+      if (version == UINT64_MAX) continue;
+      if (version < first) {
+        next = std::min(next, first);
+        first = version;
+        oldest = inverter;
+      } else next = std::min(next, version);
+    }
+  };
+  include(busyInverters);
+  include(idleInverters);
+  include(flushingInverters);
+  if (!oldest || next <= first || !idleInverters.contains(oldest)) return;
+  uint64_t released = 0;
+  for (const auto& batch : pendingDeletes.between(first, next)) released += batch->memSize();
+  try {
+    if (released >= oldest->memSize() && startIdleFlushLocked(*oldest, false)) {
+      pinningInverterFlushes++;
+      Signal::emit("pinningInverterFlush", oldest, (void*)released);
+    }
+  } catch (...) {
+    // A flush that fails to start leaves the inverter idle for the next check.
+  }
+}
+
 // A pass takes a packet once every request through its largest version has
 // flushed and no outstanding commit has claimed it.
 bool IndexWriter::passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const {
@@ -1430,6 +1471,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
     markRetirableLocked();
     requestDeletePassLocked();
+    flushPinningInverterLocked();
 
     // Check if we should merge anything.  Must happen *before* the leftToFlush
     // decrement: if this flush triggers a merge and the inverter's commit is
@@ -3183,6 +3225,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.minInverterDocVersion = minInverterDocVersion;
     uint64_t frontier = deleteFrontierLocked();
     out.liveDocsBytesWritten = liveDocsBytesWritten.load(std::memory_order_relaxed);
+    out.pinningInverterFlushes = pinningInverterFlushes;
     out.deleteOnlyKneeFlushes = deleteOnlyKneeFlushes;
     out.deleteOnlyFlushCap = deleteOnlyFlushCapLocked();
     boost::unordered_flat_set<const SortedDeletes*> retained;

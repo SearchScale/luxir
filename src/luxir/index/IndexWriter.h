@@ -174,7 +174,7 @@ public:
     uint64_t pendingRetirableDeleteBytes = 0, pendingHeldDeleteBytes = 0, mergeCarryDeleteBytes = 0;
     // liveDocs files written by commits, passes, merges and flushes.
     uint64_t liveDocsBytesWritten = 0;
-    uint64_t deleteOnlyKneeFlushes = 0;
+    uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0;
     uint64_t deleteOnlyFlushCap = 0;
   };
 
@@ -459,7 +459,7 @@ public:
   // registering at or below it is marked then, and markRetirableLocked marks
   // the rest as the frontier, which never falls, passes them. indexMutex.
   uint64_t retirableThrough = 0;
-  uint64_t deleteOnlyKneeFlushes = 0; // indexMutex
+  uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0; // indexMutex
   DeletePassStats deletePassStats; // counters only, protected by indexMutex
   std::atomic<uint64_t> liveDocsBytesWritten = 0;
   class DeletePassMessage;
@@ -803,6 +803,7 @@ private:
   void deletePassRetryFired();
   uint64_t minDocumentVersionLocked() const;
   uint64_t deleteOnlyFlushCapLocked() const;
+  void flushPinningInverterLocked() noexcept;
   void collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names);
   // Caller holds publicationMutex. A supplied schema is copied before assigning history.
   void publish(api::IndexInfo& info, std::pmr::memory_resource& arena,
