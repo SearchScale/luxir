@@ -38,8 +38,8 @@ struct IdEntry {
 /// sorted spans of nonzero-watermark entries. An inverter produces one span
 /// combining overwrites and explicit deletes.
 ///
-/// Lists are sorted by id, enabling efficient k-way merge
-/// when applying deletes across multiple inverters.
+/// Lists are sorted by id, so application seeks forward through a
+/// segment's id dictionary.
 class SortedDeletes {
 public:
   using Entry = TermValRef<IdEntry>;
@@ -48,6 +48,9 @@ public:
 
   // Declared before storage so the last owner's destruction frees storage first.
   IndexRamBudget::Guard ramGuard;
+  // The segment flushed with this packet. It needs none of the packet: its inverter
+  // resolved those ids against its own documents while indexing them.
+  uint64_t sourceSegId = 0;
 
 private:
   std::unique_ptr<MemPool> pool_;

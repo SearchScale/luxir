@@ -21,7 +21,6 @@
 #include <memory_resource>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
-#include "luxir/util/heap.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
@@ -54,15 +53,18 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
   }
 }
 
-bool mayApplyDeletes(const SegInfo& seg, const MultiDeletesData& deletes) {
+bool mayApplyDeletes(const SegInfo& seg, const SortedDeletes& packet) {
+  if (seg.minVersion >= packet.getLargestVersion()) return false;
   auto range = seg.idRange.load();
-  for (const auto& packet : deletes.deletes) {
-    if (seg.minVersion >= packet->getLargestVersion()) continue;
-    if (!range) return true;
-    for (auto span : packet->lists()) {
-      if (!span.empty() && range->overlaps((std::string_view)span.front(), (std::string_view)span.back())) return true;
-    }
+  if (!range) return true;
+  for (auto span : packet.lists()) {
+    if (!span.empty() && range->overlaps((std::string_view)span.front(), (std::string_view)span.back())) return true;
   }
+  return false;
+}
+
+bool mayApplyDeletes(const SegInfo& seg, const MultiDeletesData& deletes) {
+  for (const auto& packet : deletes.deletes) if (mayApplyDeletes(seg, *packet)) return true;
   return false;
 }
 
@@ -1206,7 +1208,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   }
 
   std::unique_ptr<Inverter> inverterPtr;
-  std::shared_ptr<const SortedDeletes> deletes;
+  std::shared_ptr<SortedDeletes> deletes;
   if (!aborted && inverter.hasDeletions()) {
     auto& batch = *inverter.sortedDeletes;
     int64_t actual = (int64_t)batch.memSize();
@@ -1225,7 +1227,10 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // The delete-set insertion may allocate. Holding indexMutex across both
     // registrations keeps segment snapshots consistent with their deletes.
     if (success) segInfos.reserve(segInfos.size() + 1);
-    if (deletes) pendingDeletes.deletes.insert(std::move(deletes));
+    if (deletes) {
+      if (segInfo) deletes->sourceSegId = segInfo->segId;
+      pendingDeletes.deletes.insert(std::move(deletes));
+    }
 
     // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
     std::pair<SegMap::iterator, bool> iter;
@@ -3002,109 +3007,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   return out;
 }
 
-/// A cursor into a sorted EntrySpan for k-way merge.
-namespace {
-
-struct DeletesCursor {
-  const SortedDeletes::Entry* curr;
-  const SortedDeletes::Entry* end;
-
-  bool exhausted() const { return curr >= end; }
-  void advance() { ++curr; }
-  const SortedDeletes::Entry& current() const { return *curr; }
-};
-
-struct DeletesCursorGreater {
-  bool operator()(const DeletesCursor& a, const DeletesCursor& b) const {
-    return a.current() > b.current();  // min-heap: greater means lower priority
-  }
-};
-
-/// K-way merge of pre-sorted entry spans into a single sorted, deduped vector.
-/// Drops inert facts (watermark==0). Deduplicates by id, keeping the highest watermark.
-/// If there's only one input span, returns it directly (no allocation).
-SortedDeletes::EntrySpan mergeDeleteSpans(
-    std::span<const SortedDeletes::EntrySpan> spans,
-    std::vector<SortedDeletes::Entry>& out, IndexRamBudget::Guard& scratch) {
-
-  using Entry = SortedDeletes::Entry;
-
-  if (spans.empty()) return {};
-  if (spans.size() == 1) return spans[0];
-
-  // Build cursors for non-empty spans
-  boost::container::small_vector<DeletesCursor, 8> cursors;
-  size_t total = 0;
-  for (auto& span : spans) {
-    if (!span.empty()) {
-      cursors.push_back({span.data(), span.data() + span.size()});
-      total += span.size();
-    }
-  }
-
-  if (cursors.empty()) return {};
-  if (cursors.size() == 1) {
-    return {cursors[0].curr, (size_t)(cursors[0].end - cursors[0].curr)};
-  }
-
-  scratch.forceResize((int64_t)(total * sizeof(Entry)));
-  out.reserve(total);
-  if (out.capacity() != total) scratch.forceResize((int64_t)(out.capacity() * sizeof(Entry)));
-
-  // K-way merge using a min-heap of cursors
-  DirectPQ<DeletesCursor, DeletesCursorGreater> pq(cursors, cursors.size());
-
-  while (pq.size() > 0) {
-    auto& top = pq.top();
-    // Copy the entry - the reference into the span's backing memory remains valid after
-    // advance/removeTop since entries live in detached TermValHash tables, not in the cursor.
-    Entry entry = top.current();
-
-    top.advance();
-    if (top.exhausted()) {
-      pq.removeTop();
-    } else {
-      pq.updateTop();
-    }
-
-    // Drain any duplicates with the same id from other cursors, keeping the highest watermark.
-    while (pq.size() > 0 && (std::string_view)pq.top().current() == (std::string_view)entry) {
-      const auto& candidate = pq.top().current();
-      if (candidate.val().deleteWatermark > entry.val().deleteWatermark) entry = candidate;
-
-      pq.top().advance();
-      if (pq.top().exhausted()) {
-        pq.removeTop();
-      } else {
-        pq.updateTop();
-      }
-    }
-
-    // A zero watermark is inert.
-    if (entry.val().deleteWatermark > 0) {
-      out.push_back(entry);
-    }
-  }
-
-  return out;
-}
-
-} // anonymous namespace
-
 void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData) {
-  // Collect commit-level spans
-  boost::container::small_vector<SortedDeletes::EntrySpan, 4> commitSpans;
-  for (const auto& sd : multiDeletesData.deletes) {
-    for (auto& span : sd->lists()) {
-      commitSpans.push_back(span);
-    }
-  }
-
-  // Merge commit-level deletes once - reused across all segments
-  auto mergedGuard = indexRamBudget->forceAcquire(0);
-  std::vector<SortedDeletes::Entry> mergedBuf;
-  SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf, mergedGuard);
-
   // Apply deletes to segments in parallel.  Each task writes new liveDocs
   // filenames into its own segment's unsyncedFiles (single owner per task, no
   // synchronization needed); the commit body drains unsyncedFiles into the
@@ -3115,16 +3018,27 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData&
   oneapi::tbb::this_task_arena::isolate([&] {
     oneapi::tbb::task_group tg;
     for (SegInfo* seg : segs) {
-      tg.run([this, seg, commitDeletes]() {
-        applyDeletes(*seg, commitDeletes);
+      tg.run([this, seg, &multiDeletesData]() {
+        // Packets apply span by span, unmerged: a document goes when any fact for
+        // its id outranks its birth, which is what a merged maximum would decide.
+        boost::container::small_vector<SortedDeletes::EntrySpan, 8> spans;
+        auto add = [&](const SortedDeletes& packet) {
+          if (packet.sourceSegId == seg->segId || !mayApplyDeletes(*seg, packet)) return;
+          for (auto& span : packet.lists()) spans.push_back(span);
+        };
+        for (const auto& packet : multiDeletesData.deletes) add(*packet);
+        for (const auto& packet : seg->personalDeletes.deletes) {
+          if (!multiDeletesData.deletes.contains(packet)) add(*packet);
+        }
+        applyDeletes(*seg, spans);
       });
     }
     tg.wait();
   });
 }
 
-void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes) {
-  if (commitDeletes.empty() && seg.personalDeletes.empty()) {
+void IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans) {
+  if (spans.empty()) {
     return;
   }
 
@@ -3132,37 +3046,19 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   // Called in parallel for different segments, so consumers should synchronize when applicable.
   luxir::Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg.segId);
 
-  // If this segment has personal deletes (rare - only during concurrent merges),
-  // merge them with commit deletes into a combined span.
-  SortedDeletes::EntrySpan deleteSpan = commitDeletes;
-  boost::container::small_vector<SortedDeletes::EntrySpan, 4> allSpans;
-  auto segMergedGuard = indexRamBudget->forceAcquire(0);
-  std::vector<SortedDeletes::Entry> segMergedBuf;
-
-  if (!seg.personalDeletes.empty()) {
-    for (const auto& sd : seg.personalDeletes.deletes) {
-      for (auto& span : sd->lists()) {
-        allSpans.push_back(span);
-      }
+  boost::container::small_vector<SortedDeletes::EntrySpan, 8> clipped;
+  auto clip = [&](const IdRange& range) {
+    clipped.clear();
+    for (auto span : spans) {
+      span = clipDeletes(span, range);
+      if (!span.empty()) clipped.push_back(span);
     }
-    if (!commitDeletes.empty()) {
-      allSpans.push_back(commitDeletes);
-    }
-    deleteSpan = mergeDeleteSpans(allSpans, segMergedBuf, segMergedGuard);
-  }
-
-  if (deleteSpan.empty()) {
-    return;
-  }
-
+  };
   auto range = seg.idRange.load();
   if (range) {
-    deleteSpan = clipDeletes(deleteSpan, *range);
-    if (deleteSpan.empty()) return;
+    clip(*range);
+    if (clipped.empty()) return;
   }
-
-  auto guard = MemPool::threadLocalPoolGuard();
-  MemPool& pool = guard.pool();
 
   // Read the segment to find documents that should be deleted
   auto sharedReader = getSegmentPostingsReader(seg);
@@ -3170,8 +3066,8 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t maxDocId = reader.maxDoc();
 
   if (!range) {
-    deleteSpan = clipDeletes(deleteSpan, *seg.idRange.load());
-    if (deleteSpan.empty()) return;
+    clip(*seg.idRange.load());
+    if (clipped.empty()) return;
   }
 
   // Load existing LiveDocs if they exist: the published reader's when it
@@ -3186,14 +3082,23 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
   }
 
-  // We'll allocate the FixedBitSet only when we find the first new delete
+  // The new generation's bits: copied from the existing liveDocs at the first
+  // delete, or before chunk tasks start so they only clear bits.
   std::unique_ptr<screaming::RAMFixedBitSet> liveBits;
+  auto ensureLiveBits = [&] {
+    if (liveBits) return;
+    liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
+    if (existingLiveDocs) {
+      const auto& existingBitset = existingLiveDocs->bitset();
+      size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
+      std::memcpy(liveBits->words, existingBitset.words, wordsSize);
+    }
+  };
 
-  // currLiveBits points to the FixedBitSet that should be used to check for live documents.
-  // it starts off pointing to the existing live documents, but switches to the new liveBits.
+  // currLiveBits is the existing generation, immutable while chunks collect.
   const screaming::FixedBitSet* currLiveBits = existingLiveDocs ? &existingLiveDocs->bitset() : nullptr;
   int32_t numLiveDocs = existingLiveDocs ? existingLiveDocs->numLive() : maxDocId;
-  int32_t newDeletesCount = 0;
+  std::atomic<int32_t> newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
   auto* idFieldInfo = reader.fieldInfo("id");
@@ -3202,80 +3107,98 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     return;
   }
 
-  TermsEnum termsEnum(pool, reader, *idFieldInfo);
-
-  // Phase 1: walk the merged delete span and collect the live candidate doc
-  // for each delete entry.
-  // The span is sorted by id, so we use seekForward() to scan the segment's terms
-  // in order, avoiding redundant binary searches across blocks.
-  // Zero watermarks are inert, including in the single-span fast path.
+  // Each chunk walks its id-sorted piece with seekForward() and collects the
+  // live doc for each hit, then gates hits in docId order against request
+  // births and clears them. Hits drain whenever they reach the chunk size, so
+  // scratch is bounded by the chunk rather than by overlapping packets or
+  // duplicate postings. Zero watermarks are inert.
   struct DeleteCandidate {
     int32_t docId;
     uint64_t deleteVersion;
   };
-  std::vector<DeleteCandidate> candidates;
-
-  for (auto& entry : deleteSpan) {
-    uint64_t deleteVersion = entry.val().deleteWatermark;
-    if (deleteVersion == 0) continue;
-    std::string_view deleteId = (std::string_view)entry;
-
-    INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
-             deleteId, deleteVersion, seg.segId);
-
-    if (termsEnum.seekForward(deleteId)) {
-      // Found the ID term, now get documents containing this ID
-      DocsOnlyEnum docsEnum(termsEnum);
-
-      for (int32_t docId = docsEnum.next(); docId != DocsEnumMeta::END; docId = docsEnum.next()) {
-        if (currLiveBits && !currLiveBits->get(docId)) {
-          continue;
-        }
-        candidates.push_back({docId, deleteVersion});
-      }
-    } // end if termsEnum.seek()
-  }
-
-  // Gate in docId order with a forward cursor over request births.
-  std::sort(candidates.begin(), candidates.end(),
-            [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
-  VersionRuns::Cursor versions(reader.versionRuns());
-  for (const auto& candidate : candidates) {
-    uint64_t docVersion = versions.birth(candidate.docId);
-
-    if (docVersion < candidate.deleteVersion) {
-      if (!liveBits) {
-        liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
-
-        if (existingLiveDocs) {
-          const auto& existingBitset = existingLiveDocs->bitset();
-          size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
-          std::memcpy(liveBits->words, existingBitset.words, wordsSize);
-        }
-      }
-
-      // a doc could appear under two delete entries if it indexed multiple id
-      // values; guard the count against clearing the same bit twice.
-      if (liveBits->get(candidate.docId)) {
-        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
-                 candidate.docId, seg.segId);
-        liveBits->clear(candidate.docId);
-        newDeletesCount++;
+  const size_t chunk = deleteApplyChunkEntries;
+  assert(chunk > 0);
+  auto drain = [&](std::vector<DeleteCandidate>& hits, IndexRamBudget::Guard& scratch) {
+    if (hits.empty()) return;
+    scratch.forceResize((int64_t)(hits.capacity() * sizeof(DeleteCandidate)));
+    std::sort(hits.begin(), hits.end(),
+              [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
+    VersionRuns::Cursor versions(reader.versionRuns());
+    int32_t cleared = 0;
+    for (const auto& hit : hits) {
+      // A doc goes when any fact outranks its birth; ties survive.
+      if (versions.birth(hit.docId) >= hit.deleteVersion) continue;
+      ensureLiveBits();
+      // A doc can be hit from several chunks or packets (or by several id values);
+      // only the clear that finds its bit set counts it.
+      std::atomic_ref<uint64_t> word(liveBits->words[hit.docId >> 6]);
+      uint64_t mask = (uint64_t)1 << (hit.docId & 63);
+      if (word.fetch_and(~mask, std::memory_order_relaxed) & mask) {
+        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.segId);
+        cleared++;
       }
     }
+    newDeletesCount.fetch_add(cleared, std::memory_order_relaxed);
+    hits.clear();
+  };
+  auto apply = [&](SortedDeletes::EntrySpan span) {
+    auto guard = MemPool::threadLocalPoolGuard();
+    TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
+    std::vector<DeleteCandidate> hits;
+    auto scratch = indexRamBudget->forceAcquire(0);
+    for (auto& entry : span) {
+      uint64_t deleteVersion = entry.val().deleteWatermark;
+      if (deleteVersion == 0) continue;
+      std::string_view deleteId = (std::string_view)entry;
+
+      INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
+               deleteId, deleteVersion, seg.segId);
+
+      if (termsEnum.seekForward(deleteId)) {
+        // Found the ID term, now get documents containing this ID
+        DocsOnlyEnum docsEnum(termsEnum);
+
+        for (int32_t docId = docsEnum.next(); docId != DocsEnumMeta::END; docId = docsEnum.next()) {
+          if (currLiveBits && !currLiveBits->get(docId)) {
+            continue;
+          }
+          hits.push_back({docId, deleteVersion});
+          if (hits.size() >= chunk) drain(hits, scratch);
+        }
+      } // end if termsEnum.seek()
+    }
+    drain(hits, scratch);
+  };
+  // Split large spans into id-ordered chunks so a few big segments still use every
+  // worker; each chunk seeks forward from its own enum.
+  boost::container::small_vector<SortedDeletes::EntrySpan, 8> pieces;
+  for (auto span : clipped) {
+    for (size_t at = 0; at < span.size(); at += chunk) {
+      pieces.push_back(span.subspan(at, std::min(chunk, span.size() - at)));
+    }
+  }
+  if (pieces.size() == 1) {
+    apply(pieces[0]);
+  } else {
+    ensureLiveBits();
+    oneapi::tbb::task_group tg;
+    for (auto piece : pieces) {
+      tg.run([&, piece] { apply(piece); });
+    }
+    tg.wait();
   }
 
   // If we found any new documents to delete, write a new delete generation
-  if (newDeletesCount > 0) {
+  if (int32_t deleted = newDeletesCount.load(std::memory_order_relaxed); deleted > 0) {
     auto newLiveGen = seg.liveGen + 1;
-    numLiveDocs -= newDeletesCount;
+    numLiveDocs -= deleted;
 
     std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), seg.liveGen);
     LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
     std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
-                newDeletesCount, seg.segId, newLiveGen, numLiveDocs);
+                deleted, seg.segId, newLiveGen, numLiveDocs);
 
     {
       const std::lock_guard<std::mutex> lock(indexMutex);

@@ -179,6 +179,17 @@ bool waitForMergesCommit(IndexWriter& iw) {
   return msg.success;
 }
 
+// Ids of the published live documents, with multiplicity.
+std::multiset<std::string> publishedIds(luxir::test::CollectionHelper& helper) {
+  auto req = luxir::test::localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(1000);
+  req->execute();
+  EXPECT_OK(req);
+  std::multiset<std::string> ids;
+  for (const auto& doc : req->getDocs()) ids.insert(std::get<std::string>(*luxir::test::find(doc, "id")));
+  return ids;
+}
+
 uint32_t randomForceMergeTarget(Rng& r) {
   if (r.rint(100) >= 12) return 0;
   return (uint32_t)r.rint(3) + 1;
@@ -1179,6 +1190,41 @@ TEST_F(IndexWriterTest, localDeletePreservesNewerArrivalBeforeOlderOverwrite) {
   req->execute();
   ASSERT_OK(req);
   EXPECT_EQ(1, req->getDocs().size());
+}
+
+TEST_F(IndexWriterTest, packetSkipsItsOwnSegment) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  std::atomic<int> applied = 0;
+  Signal::listen("deleteAppliedToSegment", [&](void*, void*, void*) -> void* { applied++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("deleteAppliedToSegment"); });
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(1, applied.load());
+  EXPECT_EQ(2, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, chunkedDeleteApplicationDeletesExactlyTheIds) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  std::vector<Doc> docs;
+  for (int i = 0; i < 40; i++) docs.push_back(flatdoc("id", fmt::format("{:02}", i)));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  iw->deleteApplyChunkEntries = 3;
+  std::vector<std::string> odd;
+  std::multiset<std::string> even;
+  for (int i = 0; i < 40; i++) {
+    if (i % 2) odd.push_back(fmt::format("{:02}", i));
+    else even.insert(fmt::format("{:02}", i));
+  }
+  odd.push_back("absent");
+  ASSERT_TRUE(helper.deleteByIds(odd, UpdateMessage::COMMIT).success);
+  EXPECT_EQ(20, iw->snapshots.readers.getReader()->liveDocs());
+  EXPECT_EQ(even, publishedIds(helper));
 }
 
 TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
@@ -4046,4 +4092,58 @@ TEST_F(IndexWriterTest, forceMergeOfEmptyOrClosedWriterCompletes) {
   writer.mergeSegments();
   EXPECT_EQ(1u, writer.segInfos.size());
   EXPECT_FALSE(writer.testMergeRunning());
+}
+
+// Packets apply unmerged: a document goes when any watermark outranks its
+// birth, as the merged maximum would decide; an equal watermark spares it.
+// One-fact chunks put a document's hits from different packets in different
+// tasks, and it counts once.
+TEST_F(IndexWriterTest, overlappingPacketsApplyTheirMaximumWatermark) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(flatdoc("id", "pad"), UpdateMessage::COMMIT).success);
+  auto birth = helper.indexAll({flatdoc("id", "lowEqual"), flatdoc("id", "lowHigh"), flatdoc("id", "equalHigh"),
+                                flatdoc("id", "low"), flatdoc("id", "highHigh")}, UpdateMessage::COMMIT).updateVersion;
+  iw->deleteApplyChunkEntries = 1;
+  auto packet = [&](std::initializer_list<std::pair<std::string_view, uint64_t>> facts) {
+    auto& inverter = iw->obtainInverter(birth + 1);
+    for (auto [id, watermark] : facts) inverter.deleteId(id, watermark);
+    iw->releaseInverter(inverter, true);
+  };
+  packet({{"lowEqual", birth - 1}, {"lowHigh", birth - 1}, {"low", birth - 1}});
+  packet({{"lowEqual", birth}, {"equalHigh", birth}});
+  packet({{"lowHigh", birth + 1}, {"equalHigh", birth + 1}, {"highHigh", birth + 1}});
+  packet({{"highHigh", birth + 1}});
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(4, iw->pendingDeletes.size());
+  helper.commit();
+  EXPECT_EQ((std::multiset<std::string>{"pad", "lowEqual", "low"}), publishedIds(helper));
+  EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+// One fact reaches every duplicate posting of its id, here merged into one
+// segment and drained one hit at a time; only older births go.
+TEST_F(IndexWriterTest, deleteFactReachesMergedDuplicatePostings) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  // An inverter keeps one document per id, so each duplicate gets its own segment.
+  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
+  auto watermark = helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).updateVersion;
+  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
+  iw->mergeSegments();
+  ASSERT_EQ(1, iw->segInfos.size());
+  ASSERT_EQ(5, iw->snapshots.readers.getReader()->liveDocs());
+  iw->deleteApplyChunkEntries = 1;
+  auto& inverter = iw->obtainInverter(watermark);
+  inverter.deleteId("dup", watermark);
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+  EXPECT_EQ((std::multiset<std::string>{"dup", "dup", "keep"}), publishedIds(helper));
+  EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
 }

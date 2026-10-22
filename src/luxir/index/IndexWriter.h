@@ -508,6 +508,8 @@ public:
   // orders of magnitude sooner; tests lower it to flush at exact doc boundaries.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
+  // Delete ids per application task within one segment.
+  size_t deleteApplyChunkEntries = 64 * 1024;
 
   // Minimum memSize() for an idle inverter to be flushed under global RAM budget
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
@@ -752,7 +754,7 @@ private:
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);
-  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
+  void applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
 
