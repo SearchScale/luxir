@@ -193,6 +193,11 @@ public:
     bool allMatch;
     bool multi;
     int32_t docid = -1;
+    // Sparse verification of a single-valued column: each block's relation to the predicate, found
+    // the first time a candidate lands in it (0 unknown, 1 outside, 2 inside, 3 crosses). A candidate
+    // in a block wholly outside or inside is answered without reading its value; columns whose
+    // values cluster by doc (time-ordered data) leave only boundary blocks to read. Empty: off.
+    std::span<uint8_t> blockRelations;
 
     LUXIR_INLINE void observe(int32_t doc) {
 #ifndef NDEBUG
@@ -206,6 +211,17 @@ public:
       observe(doc);
       if (!multi) {
         if (allMatch) return true;
+        if (!blockRelations.empty()) {
+          size_t block = (size_t)rank / IntColReader::BLOCK_SIZE;
+          uint8_t relation = blockRelations[block];
+          if (relation == 0) {
+            BlockRelation r = query.classifyBlock(reader, (int64_t)block).relation;
+            relation = r == BlockRelation::OUTSIDE ? 1 : r == BlockRelation::INSIDE ? 2 : 3;
+            blockRelations[block] = relation;
+          }
+          if (relation == 1) return false;
+          if (relation == 2) return true;
+        }
         return query.matchesValue(iter.values().valueAt(rank));
       }
       auto [start, end] = reader.getStartEndValueRank(rank);
@@ -238,9 +254,11 @@ public:
   public:
     PredicateScorer(IntColReader& reader, const NumericPredicateQuery& query,
                 bool allMatch,
-                float constantScore)
+                float constantScore,
+                std::span<uint8_t> blockRelations = {})
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
-        query(query), allMatch(allMatch), multi(reader.multiValued()) {}
+        query(query), allMatch(allMatch), multi(reader.multiValued()),
+        blockRelations(multi || allMatch ? std::span<uint8_t>() : blockRelations) {}
 
     [[gnu::cold]] void reset() override {
       iter.reset();
@@ -1224,7 +1242,8 @@ public:
             return targetPool.make<
                 PredicateScorer<IntColReader::SparseIterator>>(
                     reader, weight.query,
-                    allMatch, weight.constantScore);
+                    allMatch, weight.constantScore,
+                    targetPool.make_span_zeroed<uint8_t>((size_t)reader.numBlocks()));
           case ScorerArm::POINTS:
             if (complement) {
               skipCount(SkipStats::numericPredicateComplementArms);
