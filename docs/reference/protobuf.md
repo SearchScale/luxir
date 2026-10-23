@@ -232,7 +232,7 @@ One kind of work: currently running, completed by outcome, and the duration of c
 
 ### luxir.AnalyzerComponent
 
-One analysis-chain component - a tokenizer or a token filter - named by its registry name, plus its parameters. params values are typed JSON values (string, number, bool, string list), e.g. {"possessive": false} for kstem. A component that takes no parameters rejects any. The JSON dialect accepts a bare string for a parameterless component: "lowercase" == {"name": "lowercase"}.
+One analysis-chain component - a tokenizer, character filter, or token filter - named by its registry name, plus its parameters. params values are typed JSON values (string, number, bool, string list), e.g. {"possessive": false} for kstem. A component that takes no parameters rejects any. The JSON dialect accepts a bare string for a parameterless component: "lowercase" == {"name": "lowercase"}.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -250,7 +250,8 @@ One analysis-chain component - a tokenizer or a token filter - named by its regi
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.analyzerdef.tokenizer"></a>[`tokenizer`](#field-luxir.analyzerdef.tokenizer) | 1 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | singular | "whitespace" (default when absent), "keyword", "unicode\_word" |
-| <a id="field-luxir.analyzerdef.filters"></a>[`filters`](#field-luxir.analyzerdef.filters) | 2 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | applied in order, e.g., \["nfkc\_cf", "fold"\] |
+| <a id="field-luxir.analyzerdef.filters"></a>[`filters`](#field-luxir.analyzerdef.filters) | 2 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | applied after tokenization, in order |
+| <a id="field-luxir.analyzerdef.char_filters"></a>[`char_filters`](#field-luxir.analyzerdef.char_filters) | 3 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | whole-value cleanup before tokenization, in order |
 
 <a id="message-luxir.anyofquery"></a>
 
