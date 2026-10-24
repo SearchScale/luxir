@@ -755,6 +755,10 @@ private:
   // frontier (same staircase as L0 and the term dictionary) so group bounds
   // come from real (norm, tf) pairs, not a cross-doc (maxTf, minNorm) corner.
   std::array<uint32_t, 256> l1GroupMaxTfPerNorm{};
+  // The (norm -> maxTf) surfaces are zero outside [lo, hi] (empty when lo > hi); frontier scans
+  // and clears cover only that range, so a term with a few docs costs a few slots, not 256.
+  // Zero slots never join a frontier, so the encoded bytes are the same.
+  uint32_t l1NormLo = 256, l1NormHi = 0;
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
@@ -780,13 +784,14 @@ private:
   std::vector<char> compressed_output;
   std::vector<char> header_output;
   std::vector<char> group_output;
-  std::array<uint32_t, 256> maxTfPerNorm;
+  std::array<uint32_t, 256> maxTfPerNorm{};  // zero between buildImpactFrontier calls
   std::vector<uint32_t> frontierNorms;
   std::vector<uint32_t> frontierTfs;
   // Term-level (maxTf, norm) surface accumulated across the whole term, so the
   // term dictionary can store the term's impact frontier: a scorer's global
   // max score must come from stored data, never a walk of the postings.
-  std::array<uint32_t, 256> termMaxTfPerNorm;
+  std::array<uint32_t, 256> termMaxTfPerNorm{};
+  uint32_t termNormLo = 256, termNormHi = 0;
   std::vector<char> termImpactRun;  // per-term encoded frontiers for the current term block
   static inline bool disableL0CheckpointWrite =
       std::getenv("LUXIR_DISABLE_L0_CHECKPOINT_WRITE") != nullptr;
@@ -884,19 +889,25 @@ private:  // some internal utility methods... not for use by indexers
       return minNorm;
     }
 
-    maxTfPerNorm.fill(0);
+    uint32_t maxNorm = 0;
     for (uint32_t i = 0; i < docCount; i++) {
       uint32_t norm = normForDoc(docs[i]);
       assert(norm <= 255);
       uint32_t tf = (uint32_t) tfreqs[i];
       minNorm = std::min(minNorm, norm);
+      maxNorm = std::max(maxNorm, norm);
       maxTfPerNorm[norm] = std::max(maxTfPerNorm[norm], tf);
       termMaxTfPerNorm[norm] = std::max(termMaxTfPerNorm[norm], tf);
     }
+    if (docCount > 0) {
+      termNormLo = std::min(termNormLo, minNorm);
+      termNormHi = std::max(termNormHi, maxNorm);
+    }
 
     uint32_t runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < maxTfPerNorm.size(); norm++) {
+    for (uint32_t norm = minNorm; norm <= maxNorm; norm++) {
       uint32_t tf = maxTfPerNorm[norm];
+      maxTfPerNorm[norm] = 0;  // left zero for the next block
       if (tf > runningMaxTf) {
         frontierNorms.push_back(norm);
         frontierTfs.push_back(tf);
@@ -909,11 +920,13 @@ private:  // some internal utility methods... not for use by indexers
   // Encode the Pareto frontier of a (norm -> maxTf) surface as
   // [count vint][(norm u8, tf-delta vint)*], the same staircase the L0
   // headers use.  count == 0 only for fields without freqs+norms.
+  // The surface is zero outside [lo, hi] (empty when lo > hi).
   static void appendImpactFrontier(std::vector<char>& out,
-                                   const std::array<uint32_t, 256>& surface) {
+                                   const std::array<uint32_t, 256>& surface,
+                                   uint32_t lo, uint32_t hi) {
     uint32_t count = 0;
     uint32_t runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+    for (uint32_t norm = lo; norm <= hi; norm++) {
       if (surface[norm] > runningMaxTf) {
         count++;
         runningMaxTf = surface[norm];
@@ -921,7 +934,7 @@ private:  // some internal utility methods... not for use by indexers
     }
     appendVint(out, count);
     runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+    for (uint32_t norm = lo; norm <= hi; norm++) {
       uint32_t tf = surface[norm];
       if (tf > runningMaxTf) {
         out.push_back((char) (uint8_t) norm);
@@ -931,12 +944,13 @@ private:  // some internal utility methods... not for use by indexers
     }
   }
 
+  // The surface is zero outside [lo, hi] (empty when lo > hi).
   static void appendL1ImpactFrontier(std::vector<char>& out,
                                      const std::array<uint32_t, 256>& surface,
-                                     uint32_t maxTf) {
+                                     uint32_t lo, uint32_t hi, uint32_t maxTf) {
     uint32_t count = 0;
     uint32_t runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+    for (uint32_t norm = lo; norm <= hi; norm++) {
       uint32_t tf = surface[norm];
       if (tf > runningMaxTf) {
         count++;
@@ -948,7 +962,7 @@ private:  // some internal utility methods... not for use by indexers
     appendVint(out, (count << 1) | (useU32 ? 1u : 0u));
 
     runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+    for (uint32_t norm = lo; norm <= hi; norm++) {
       uint32_t tf = surface[norm];
       if (tf > runningMaxTf) {
         assert(norm <= 255);
@@ -958,7 +972,7 @@ private:  // some internal utility methods... not for use by indexers
     }
 
     runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+    for (uint32_t norm = lo; norm <= hi; norm++) {
       uint32_t tf = surface[norm];
       if (tf > runningMaxTf) {
         if (useU32) {
@@ -1142,6 +1156,10 @@ private:  // some internal utility methods... not for use by indexers
         uint32_t norm = frontierNorms[i];
         l1GroupMaxTfPerNorm[norm] = std::max(l1GroupMaxTfPerNorm[norm], frontierTfs[i]);
       }
+      if (!frontierNorms.empty()) {  // ascending
+        l1NormLo = std::min(l1NormLo, frontierNorms.front());
+        l1NormHi = std::max(l1NormHi, frontierNorms.back());
+      }
     }
     if (l1GroupBlockCount == L1_PERIOD) {
       flushL1Group();
@@ -1187,7 +1205,7 @@ private:  // some internal utility methods... not for use by indexers
     }
     if (hasFreqs && hasNorms) {
       assert(l1GroupMaxTf > 0);
-      appendL1ImpactFrontier(header_output, l1GroupMaxTfPerNorm, l1GroupMaxTf);
+      appendL1ImpactFrontier(header_output, l1GroupMaxTfPerNorm, l1NormLo, l1NormHi, l1GroupMaxTf);
     } else if (hasFreqs) {
       assert(l1GroupMaxTf > 0);
       appendVint(header_output, l1GroupMaxTf);
@@ -1207,9 +1225,14 @@ private:  // some internal utility methods... not for use by indexers
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
-    l1BlockLastDocs.fill(0);
-    l1BlockBodyOffsets.fill(0);
-    l1GroupMaxTfPerNorm.fill(0);
+    // l1BlockLastDocs and l1BlockBodyOffsets are written before they are read
+    clearSurface(l1GroupMaxTfPerNorm, l1NormLo, l1NormHi);
+  }
+
+  static void clearSurface(std::array<uint32_t, 256>& surface, uint32_t& lo, uint32_t& hi) {
+    if (lo <= hi) std::fill(surface.begin() + lo, surface.begin() + hi + 1, 0u);
+    lo = 256;
+    hi = 0;
   }
 
   // number of docs for the current term
@@ -1663,11 +1686,9 @@ public:
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
-    l1BlockLastDocs.fill(0);
-    l1BlockBodyOffsets.fill(0);
-    l1GroupMaxTfPerNorm.fill(0);
+    clearSurface(l1GroupMaxTfPerNorm, l1NormLo, l1NormHi);
     group_output.resize(0);
-    termMaxTfPerNorm.fill(0);
+    clearSurface(termMaxTfPerNorm, termNormLo, termNormHi);
     locOfPositionsForTerm = posOutput.size();
     pendingBlockPosByteOff = locOfPositionsForTerm;
     locOfDocsForTerm = docOutput.size();
@@ -1705,11 +1726,12 @@ public:
       sumDocFreq += 1;
       if (hasFreqs && hasNorms) {
         // single-doc term: exact one-point frontier from its norm
-        termMaxTfPerNorm.fill(0);
+        clearSurface(termMaxTfPerNorm, termNormLo, termNormHi);
         uint32_t norm = normForDoc(docs[0]);
         assert(norm <= 255);
         termMaxTfPerNorm[norm] = 1;
-        appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
+        termNormLo = termNormHi = norm;
+        appendImpactFrontier(termImpactRun, termMaxTfPerNorm, termNormLo, termNormHi);
       }
       termPackedBlocks.push_back(0);
       termDocFreqs.push_back(1);
@@ -1806,7 +1828,7 @@ public:
         termPosOffsets.push_back(posOffset);
       }
       if (hasFreqs && hasNorms) {
-        appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
+        appendImpactFrontier(termImpactRun, termMaxTfPerNorm, termNormLo, termNormHi);
       }
       termPackedBlocks.push_back(termPackedBlockCount);
       termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
