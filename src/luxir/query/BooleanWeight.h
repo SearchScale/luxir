@@ -7742,7 +7742,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       return true;
     }
     return query->getKind() == QueryKind::PHRASE
-        && static_cast<PhraseQuery*>(query)->getSlop() == 0;
+        && static_cast<PhraseQuery*>(query)->exactMatcher();
   }
 
   static bool lessMaxScore(float a, float b) {

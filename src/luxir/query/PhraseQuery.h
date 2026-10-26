@@ -10,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <type_traits>
+#include <typeinfo>
 #include <vector>
 
 #include "ImpactsIndex.h"
@@ -19,7 +20,7 @@
 
 namespace luxir {
 
-class PhraseQuery final : public Query {
+class PhraseQuery : public Query {
   std::string_view field;
   std::span<std::string_view> terms;
   std::span<const int32_t> positions;
@@ -307,9 +308,11 @@ public:
     assert(slop >= 0);
   }
 
+  // A subclass with a matcher of its own matches different documents: it is never equal to a
+  // plain PhraseQuery over the same terms.
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const PhraseQuery&>(other);
-    return field == rhs.field && slop == rhs.slop
+    return typeid(*this) == typeid(other) && field == rhs.field && slop == rhs.slop
         && terms.size() == rhs.terms.size()
         && positions.size() == rhs.positions.size()
         && std::equal(terms.begin(), terms.end(), rhs.terms.begin())
@@ -336,6 +339,21 @@ public:
   [[nodiscard]] std::span<std::string_view> getTerms() const { return terms; }
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
+  // Whether this query matches as the exact phrase scorer does, so routes that run that scorer
+  // directly may take it. A subclass with a matcher of its own returns false.
+  [[nodiscard]] virtual bool exactMatcher() const { return slop == 0; }
+
+  // Builds one segment's scorer over the postings, norms and impacts Weight assembled for it. The
+  // default is the exact or the sloppy phrase scorer; a subclass that matches the terms' positions
+  // its own way returns a PhraseScorer with its own matcher policy over the same parts.
+  virtual Query::Scorer* makeScorer(
+      MemPool& targetPool, std::span<DocsPosEnum*> slotEnums, std::span<PosEnum*> slotPosEnums,
+      std::span<const int32_t> positions, std::span<const int32_t> ordinals,
+      std::span<DocsPosEnum*> conjunctionEnums, std::span<PosEnum*> conjunctionPosEnums,
+      NormsReader* normsReader, Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
+      std::span<const int32_t> impactMultiplicities, std::span<const int32_t> slotGroup,
+      std::span<RepeatGroup> groups, int64_t approximationCost, float matchCostEstimate,
+      bool exclusionWindowFill) const;
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
@@ -558,19 +576,11 @@ public:
         if (allBuilt) impacts = built;
       }
 
-      if (query.getSlop() > 0) {
-        return targetPool.make<SloppyScorer>(
-            targetPool, slotEnums, slotPosEnums, positions, ordinals,
-            conjunctionEnums, conjunctionPosEnums, normsReader,
-            simScorer, impacts, impactMultiplicities, slotGroup, groups,
-            estimate.approximationCost, estimate.matchCost, query.getSlop(),
-            (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
-      }
-      return targetPool.make<Scorer>(
+      return query.makeScorer(
           targetPool, slotEnums, slotPosEnums, positions, ordinals,
           conjunctionEnums, conjunctionPosEnums, normsReader,
           simScorer, impacts, impactMultiplicities, slotGroup, groups,
-          estimate.approximationCost, estimate.matchCost, 0,
+          estimate.approximationCost, estimate.matchCost,
           (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
     }
 
@@ -1649,5 +1659,25 @@ public:
     }
   };
 };
+
+inline Query::Scorer* PhraseQuery::makeScorer(
+    MemPool& targetPool, std::span<DocsPosEnum*> slotEnums, std::span<PosEnum*> slotPosEnums,
+    std::span<const int32_t> positions, std::span<const int32_t> ordinals,
+    std::span<DocsPosEnum*> conjunctionEnums, std::span<PosEnum*> conjunctionPosEnums,
+    NormsReader* normsReader, Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
+    std::span<const int32_t> impactMultiplicities, std::span<const int32_t> slotGroup,
+    std::span<RepeatGroup> groups, int64_t approximationCost, float matchCostEstimate,
+    bool exclusionWindowFill) const {
+  if (slop > 0) {
+    return targetPool.make<SloppyScorer>(
+        targetPool, slotEnums, slotPosEnums, positions, ordinals, conjunctionEnums,
+        conjunctionPosEnums, normsReader, simScorer, impacts, impactMultiplicities, slotGroup,
+        groups, approximationCost, matchCostEstimate, slop, exclusionWindowFill);
+  }
+  return targetPool.make<Scorer>(
+      targetPool, slotEnums, slotPosEnums, positions, ordinals, conjunctionEnums,
+      conjunctionPosEnums, normsReader, simScorer, impacts, impactMultiplicities, slotGroup, groups,
+      approximationCost, matchCostEstimate, 0, exclusionWindowFill);
+}
 
 } // namespace luxir
