@@ -206,8 +206,12 @@ public:
     // Sparse verification of a single-valued column: each block's relation to the predicate, found
     // the first time a candidate lands in it (0 unknown, 1 outside, 2 inside, 3 crosses). A candidate
     // in a block wholly outside or inside is answered without reading its value; columns whose
-    // values cluster by doc (time-ordered data) leave only boundary blocks to read. Empty: off.
+    // values cluster by doc (time-ordered data) leave only boundary blocks to read. Empty: off, and
+    // turned off once most of the first blocks classified cross (values in no doc order), where
+    // classifying only adds to the value read it cannot save.
     std::span<uint8_t> blockRelations;
+    uint32_t blocksClassified = 0;
+    uint32_t blocksCrossing = 0;
 
     LUXIR_INLINE void observe(int32_t doc) {
 #ifndef NDEBUG
@@ -225,9 +229,12 @@ public:
           size_t block = (size_t)rank / IntColReader::BLOCK_SIZE;
           uint8_t relation = blockRelations[block];
           if (relation == 0) {
-            BlockRelation r = query.classifyBlock(reader, (int64_t)block).relation;
-            relation = r == BlockRelation::OUTSIDE ? 1 : r == BlockRelation::INSIDE ? 2 : 3;
+            NumBlockZone zone = reader.blockZone((int64_t)block);
+            relation = !query.intersects(zone.min, zone.max) ? 1
+                : query.covers(zone.min, zone.max) ? 2 : 3;
             blockRelations[block] = relation;
+            blocksCrossing += relation == 3;
+            if (++blocksClassified == 64 && blocksCrossing > 48) blockRelations = {};
           }
           if (relation == 1) return false;
           if (relation == 2) return true;
